@@ -1,0 +1,869 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SaylterOS · 任务承诺</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;600;700;800&family=Orbitron:wght@400;700;900&display=swap');
+
+  :root {
+    --bg: #0a0e17;
+    --bg-card: #111827cc;
+    --accent: #00ff88;
+    --accent2: #00d4ff;
+    --accent3: #ff00aa;
+    --text: #e5e7eb;
+    --text-dim: #9ca3af;
+    --border: #1f2937;
+    --glow: 0 0 20px rgba(0, 255, 136, 0.3);
+  }
+
+  html, body {
+    height: 100%;
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'JetBrains Mono', 'Consolas', monospace;
+    overflow-x: hidden;
+  }
+
+  #matrix-bg {
+    position: fixed;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    z-index: 0;
+    opacity: 0.15;
+    pointer-events: none;
+  }
+
+  .container {
+    position: relative;
+    z-index: 1;
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 40px 24px 80px;
+  }
+
+  .hero {
+    text-align: center;
+    padding: 60px 0 40px;
+  }
+
+  .ascii-logo {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    line-height: 1.15;
+    color: var(--accent);
+    text-shadow: 0 0 8px var(--accent);
+    white-space: pre;
+    display: inline-block;
+    margin-bottom: 24px;
+    animation: flicker 4s infinite;
+  }
+
+  @keyframes flicker {
+    0%, 19%, 21%, 23%, 25%, 54%, 56%, 100% { opacity: 1; }
+    20%, 24%, 55% { opacity: 0.6; }
+  }
+
+  .subtitle {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 14px;
+    letter-spacing: 8px;
+    color: var(--accent2);
+    text-transform: uppercase;
+    margin-bottom: 8px;
+  }
+
+  .tagline {
+    font-size: 18px;
+    color: var(--text-dim);
+    margin-bottom: 32px;
+  }
+
+  .status-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 20px;
+    background: linear-gradient(90deg, rgba(0,255,136,0.1), rgba(0,212,255,0.1));
+    border: 1px solid var(--accent);
+    border-radius: 999px;
+    font-size: 13px;
+    color: var(--accent);
+  }
+
+  .status-dot {
+    width: 8px; height: 8px;
+    background: var(--accent);
+    border-radius: 50%;
+    animation: pulse 1.5s infinite;
+  }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(0,255,136,0.7); }
+    50% { opacity: 0.5; box-shadow: 0 0 0 8px rgba(0,255,136,0); }
+  }
+
+  .terminal {
+    background: var(--bg-card);
+    backdrop-filter: blur(10px);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+    margin: 32px 0;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.5), var(--glow);
+  }
+
+  .terminal-header {
+    display: flex;
+    align-items: center;
+    padding: 12px 16px;
+    background: #1a2030;
+    border-bottom: 1px solid var(--border);
+    gap: 8px;
+  }
+
+  .dot { width: 12px; height: 12px; border-radius: 50%; }
+  .dot.red { background: #ff5f56; }
+  .dot.yellow { background: #ffbd2e; }
+  .dot.green { background: #27c93f; }
+
+  .terminal-title {
+    margin-left: 12px;
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+
+  .terminal-body {
+    padding: 20px;
+    font-size: 14px;
+    line-height: 1.8;
+  }
+
+  .prompt { color: var(--accent); }
+  .cmd { color: var(--accent2); }
+  .output { color: var(--text-dim); }
+  .success { color: var(--accent); }
+  .warn { color: #fbbf24; }
+  .danger { color: #ef4444; }
+  .cursor {
+    display: inline-block;
+    width: 8px; height: 16px;
+    background: var(--accent);
+    animation: blink 1s infinite;
+    vertical-align: middle;
+  }
+
+  @keyframes blink { 0%, 50% { opacity: 1; } 51%, 100% { opacity: 0; } }
+
+  section {
+    background: var(--bg-card);
+    backdrop-filter: blur(10px);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 32px;
+    margin-bottom: 24px;
+    transition: border-color 0.3s;
+  }
+
+  section:hover { border-color: var(--accent); }
+
+  h2 {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 22px;
+    color: var(--accent);
+    margin-bottom: 20px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+
+  h2::before {
+    content: '▸';
+    color: var(--accent2);
+  }
+
+  h3 {
+    font-size: 16px;
+    color: var(--accent2);
+    margin: 16px 0 12px;
+  }
+
+  p { font-size: 14px; line-height: 1.9; color: var(--text-dim); }
+
+  .timeline {
+    position: relative;
+    padding-left: 40px;
+    margin-top: 16px;
+  }
+
+  .timeline::before {
+    content: '';
+    position: absolute;
+    left: 14px;
+    top: 0; bottom: 0;
+    width: 2px;
+    background: linear-gradient(to bottom, var(--accent), var(--accent2), var(--accent3));
+  }
+
+  .phase {
+    position: relative;
+    padding: 16px 0 16px 16px;
+  }
+
+  .phase::before {
+    content: '';
+    position: absolute;
+    left: -33px;
+    top: 20px;
+    width: 14px; height: 14px;
+    border-radius: 50%;
+    background: var(--bg);
+    border: 2px solid var(--accent);
+    box-shadow: 0 0 10px var(--accent);
+  }
+
+  .phase.current::before {
+    background: var(--accent);
+    animation: pulse 1.5s infinite;
+  }
+
+  .phase-header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 8px;
+  }
+
+  .phase-badge {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 11px;
+    padding: 3px 10px;
+    border-radius: 4px;
+    background: var(--accent);
+    color: var(--bg);
+    font-weight: 700;
+  }
+
+  .phase-badge.pending { background: #374151; color: var(--text-dim); }
+  .phase-badge.active { background: var(--accent); }
+  .phase-badge.done { background: var(--accent2); color: var(--bg); }
+
+  .phase-title {
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--text);
+  }
+
+  .phase-desc {
+    font-size: 13px;
+    color: var(--text-dim);
+  }
+
+  .phase-tasks {
+    margin-top: 8px;
+    padding-left: 16px;
+  }
+
+  .phase-tasks li {
+    font-size: 13px;
+    color: var(--text-dim);
+    line-height: 1.8;
+    list-style: none;
+  }
+
+  .phase-tasks li::before {
+    content: '◆ ';
+    color: var(--accent2);
+    font-size: 10px;
+  }
+
+  .tech-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 12px;
+    margin-top: 16px;
+  }
+
+  .tech-item {
+    padding: 14px;
+    background: #0d1219;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    text-align: center;
+    transition: all 0.3s;
+  }
+
+  .tech-item:hover {
+    border-color: var(--accent2);
+    transform: translateY(-2px);
+    box-shadow: 0 6px 20px rgba(0,212,255,0.15);
+  }
+
+  .tech-icon { font-size: 24px; margin-bottom: 6px; }
+  .tech-name { font-size: 12px; color: var(--text); font-weight: 600; }
+  .tech-tag { font-size: 10px; color: var(--text-dim); margin-top: 2px; }
+
+  .pledge-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: 16px;
+    margin-top: 16px;
+  }
+
+  .pledge-card {
+    padding: 20px;
+    background: linear-gradient(135deg, #0d1219, #111a27);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    position: relative;
+    overflow: hidden;
+  }
+
+  .pledge-card::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0;
+    width: 3px; height: 100%;
+  }
+
+  .pledge-card.green::before { background: var(--accent); }
+  .pledge-card.blue::before { background: var(--accent2); }
+  .pledge-card.pink::before { background: var(--accent3); }
+
+  .pledge-icon { font-size: 20px; margin-bottom: 10px; }
+  .pledge-title { font-size: 14px; font-weight: 700; color: var(--text); margin-bottom: 6px; }
+  .pledge-text { font-size: 12px; color: var(--text-dim); line-height: 1.7; }
+
+  .signature-area {
+    text-align: center;
+    padding: 48px 32px;
+    background: var(--bg-card);
+    backdrop-filter: blur(10px);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    margin-bottom: 24px;
+  }
+
+  .sig-date {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 13px;
+    color: var(--accent2);
+    margin-bottom: 24px;
+    letter-spacing: 4px;
+  }
+
+  .sig-line {
+    border: none;
+    border-top: 1px dashed var(--border);
+    margin: 24px 0;
+  }
+
+  .sig-name {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 28px;
+    color: var(--accent);
+    letter-spacing: 6px;
+    text-shadow: 0 0 20px rgba(0,255,136,0.4);
+  }
+
+  .sig-label {
+    font-size: 12px;
+    color: var(--text-dim);
+    margin-top: 8px;
+    letter-spacing: 3px;
+  }
+
+  footer {
+    text-align: center;
+    padding: 40px 0;
+    color: var(--text-dim);
+    font-size: 12px;
+  }
+
+  footer .heart { color: var(--accent3); }
+
+  #boot-overlay {
+    position: fixed;
+    inset: 0;
+    background: var(--bg);
+    z-index: 100;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 16px;
+    transition: opacity 0.8s ease;
+  }
+
+  #boot-overlay.fade-out { opacity: 0; pointer-events: none; }
+
+  .boot-text {
+    font-family: 'JetBrains Mono', monospace;
+    color: var(--accent);
+    font-size: 14px;
+    text-align: center;
+    line-height: 2;
+  }
+
+  .boot-bar {
+    width: 240px;
+    height: 4px;
+    background: #1a2030;
+    border-radius: 2px;
+    overflow: hidden;
+  }
+
+  .boot-fill {
+    height: 100%;
+    background: var(--accent);
+    width: 0%;
+    transition: width 0.08s linear;
+    box-shadow: 0 0 10px var(--accent);
+  }
+
+  ::-webkit-scrollbar { width: 8px; }
+  ::-webkit-scrollbar-track { background: var(--bg); }
+  ::-webkit-scrollbar-thumb { background: #1f2937; border-radius: 4px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--accent); }
+
+  @media (max-width: 640px) {
+    .ascii-logo { font-size: 7px; }
+    section { padding: 20px; }
+    h2 { font-size: 18px; }
+    .sig-name { font-size: 20px; }
+  }
+</style>
+</head>
+<body>
+
+<div id="boot-overlay">
+  <div class="boot-text" id="boot-output"></div>
+  <div class="boot-bar"><div class="boot-fill" id="boot-fill"></div></div>
+</div>
+
+<canvas id="matrix-bg"></canvas>
+
+<div class="container">
+
+  <header class="hero">
+<pre class="ascii-logo">
+   _____              _ _          _____ _____ ______
+  / ____|            | | |        / ____| ____|  ____|
+ | (___   __ _  ___  | | |_ ___  | (___ | |__ | |__   
+  \___ \ / _` |/ _ \ | | __/ _ \  \___ \|  __||  __|  
+  ____) | (_| |  __/ | | || (_) | ____) | |___| |     
+ |_____/ \__,_|\___| |_|\__\___/ |_____/|_____|_|     
+</pre>
+    <div class="subtitle">SAYLTER · OPERATING · SYSTEM</div>
+    <div class="tagline">两天内把裸金属 x86 系统从引导到 Shell 和键盘交互跑起来</div>
+    <div class="status-badge">
+      <span class="status-dot"></span>
+      STATUS: BOOT + PM + SHELL + KEYBOARD LIVE (2 DAYS)
+    </div>
+  </header>
+
+  <div class="terminal">
+    <div class="terminal-header">
+      <span class="dot red"></span>
+      <span class="dot yellow"></span>
+      <span class="dot green"></span>
+      <span class="terminal-title">saylter@pledge — ~/SaylterOS</span>
+    </div>
+    <div class="terminal-body">
+      <div><span class="prompt">saylter@pledge</span>:<span class="cmd">~</span>$ cat MISSION.md</div>
+      <div class="output">
+        <br>
+        █ MISSION: SaylterOS — 从零构建一个 x86 裸金属操作系统<br>
+        █ TYPE: Real bare-metal OS, boots from raw floppy image<br>
+        █ ARCH: x86 32-bit protected mode -> future long mode<br>
+        █ START: 2026-10-17<br>
+        █ TOOLCHAIN: NASM + Mingw GCC + QEMU + PowerShell<br>
+        █ OUTPUT: bootable .img + shell + keyboard input<br>
+        <br>
+        <span class="success">[OK] 这不是“看教程做 demo”，而是真正从 BIOS → boot → PM → shell → input 一路跑起来了</span><br>
+        <span class="success">[OK] 在两天内完成引导链路、保护模式、TTY、PS/2 键盘状态机和 shell 交互</span><br>
+        <span class="warn">[!] 这不是最终版，但已经说明：裸机 OS 的最小可用闭环已形成</span><br>
+      </div>
+      <br>
+      <div><span class="prompt">saylter@pledge</span>:<span class="cmd">~</span>$ nasm -f bin boot.asm -o boot.bin &amp;&amp; qemu-system-i386</div>
+      <div class="success">[BOOT] BIOS 0x7C00: SaylterOS Stage 1 (512B MBR)</div>
+      <div class="success">[BOOT] int 0x13 AH=2: stage2 读入 0x7E00... OK</div>
+      <div class="success">[BOOT] jmp 0x7E00: 进入 Stage 2</div>
+      <div class="success">[S2] ASCII banner + VGA + memory/CPU 信息输出</div>
+      <div class="success">[PM] GDT + IDT + PIC 全部加载，进入保护模式</div>
+      <div class="success">[IRQ0] timer IRQ 触发正常</div>
+      <div class="success">[IRQ1] PS/2 keyboard scancode 进入 mailbox</div>
+      <div class="success">[TTY] shell prompt 已出现，并能回显字符</div>
+      <div class="success">[KBD] Shift / Caps / release code 状态机已接近正常键盘语义</div>
+      <div class="warn">[NOTE] 现在优先做的是：更稳的 shell / 时钟 / 键盘状态机。内存管理只在真正需要分页、堆和进程时再做，不盲目提前扩展</div>
+      <div><span class="prompt">saylter@pledge</span>:<span class="cmd">~</span>$ <span class="cursor"></span></div>
+    </div>
+  </div>
+
+  <section>
+    <h2>项目愿景</h2>
+    <p>
+      SaylterOS 是一个野心勃勃的自学项目 —— 我们要写一个真正能在现代 PC 上引导启动的操作系统。
+      不是跑在浏览器里的模拟环境，不是给 qemu 喂个内核镜像就完事的玩具，而是从 <strong style="color:var(--accent)">512 字节的引导扇区</strong> 开始，
+      一行汇编一行 C，构建出一个有自己的内核、中断处理、内存管理、进程调度、文件系统和 Shell 的完整 OS。
+    </p>
+    <br>
+    <p>
+      启动方式：BIOS Legacy MBR 引导（第一阶段），后续扩展到 UEFI。
+      测试环境：QEMU (i386-softmmu)，最终能跑在真实 PC 硬件上。
+      架构路线：先在 32 位保护模式跑通所有子系统，再平滑过渡到 x86-64 长模式。
+    </p>
+    <br>
+    <p>
+      目标很明确 —— 当这个项目完成的那天，我应该能不查任何资料，凭记忆讲清楚：
+      <strong style="color:var(--accent)">从按下电源键到 Shell 显示提示符的每一条 CPU 指令</strong>。
+    </p>
+  </section>
+
+  <section>
+    <h2>开发里程碑</h2>
+    <div class="timeline">
+
+      <div class="phase">
+        <div class="phase-header">
+          <span class="phase-badge done">PHASE 0</span>
+          <span class="phase-title">引导扇区 · MBR + Stage2</span>
+        </div>
+        <div class="phase-desc">任务承诺已完成：boot.bin(512B) + stage2.bin(2KB)，QEMU 跑通</div>
+        <ul class="phase-tasks">
+          <li>✅ NASM、MinGW-GCC、QEMU 工具链就绪</li>
+          <li>✅ 项目骨架：boot.bin / stage2.bin / pm.bin → saylter.img</li>
+          <li>✅ 512B MBR：int 0x13 读 16 扇区 → jmp 0x7E00</li>
+          <li>✅ Stage2 实模式：Banner + Memory/Drive/VGA/CPU 信息</li>
+          <li>✅ 这份 pledge.html 作为精神锚点</li>
+          <li>🐛 MBR CHS 参数陷阱：CH 柱面号必须显式赋值</li>
+          <li>🐛 数据必须放在 jmp start 之后，CPU 顺序执行会当指令解码</li>
+        </ul>
+      </div>
+
+      <div class="phase">
+        <div class="phase-header">
+          <span class="phase-badge done">PHASE 1</span>
+          <span class="phase-title">实模式 → 保护模式 · GDT</span>
+        </div>
+        <div class="phase-desc">CR0.PE 切换 + 远跳转 + 平坦内存模型</div>
+        <ul class="phase-tasks">
+          <li>✅ GDT (Null / Code / Data) 3 segments, Limit=4GB, Base=0</li>
+          <li>✅ CR0.PE 位 + 远跳转清空流水线 (jmp 0x08:pm_entry)</li>
+          <li>✅ 所有段寄存器 → Data Segment (0x10), esp=0x9FFFF</li>
+          <li>✅ BITS 16 → BITS 32 切换，NASM 语法正确</li>
+          <li>✅ VGA 直接写 0xB8000 清屏 + 彩色输出</li>
+        </ul>
+      </div>
+
+      <div class="phase">
+        <div class="phase-header">
+          <span class="phase-badge active">PHASE 2</span>
+          <span class="phase-title">中断与输入 · IRQ + shell + keyboard</span>
+        </div>
+        <div class="phase-desc">在两天内完成引导链路、保护模式、TTY 和 PS/2 键盘状态机，达到可交互系统原型</div>
+        <ul class="phase-tasks">
+          <li>✅ PIC 8259 重映射: IRQ0-7 → 0x20-0x27, IRQ8-15 → 0x28-0x2F</li>
+          <li>✅ IDT 256 entries + ISR stub + LIDTR + STI</li>
+          <li>✅ IRQ0 PIT timer 正常触发，不再污染屏幕</li>
+          <li>✅ IRQ1 keyboard mailbox 模式：扫描码完整进入 C 层</li>
+          <li>✅ TTY shell prompt 跑通，能回显输入和处理 Enter / backspace</li>
+          <li>✅ Shift / Caps / release code 状态机已补齐，接近真实键盘语义</li>
+          <li>✅ 0x7C00 -> 0x7E00 -> 0x8600 -> 0xA100 的引导链路已稳定</li>
+          <li>⭐ 这不是“理论 OS”，而是真正能在 QEMU 里启动并交互的 OS 原型</li>
+        </ul>
+      </div>
+
+      <div class="phase">
+        <div class="phase-header">
+          <span class="phase-badge pending">PHASE 3</span>
+          <span class="phase-title">内存管理（后续再做）</span>
+        </div>
+        <div class="phase-desc">只有在真正需要虚拟内存、堆、进程和用户态时才启用；当前最小可用目标不依赖它</div>
+        <ul class="phase-tasks">
+          <li>在应用层需要分页、堆和进程时，再做 BIOS 0xE820 物理内存检测</li>
+          <li>先稳定 shell / 键盘 / 中断，再设计物理帧管理器</li>
+          <li>仅在系统规模扩大时启用 x86 分页：CR3 + CR0.PG</li>
+          <li>避免在没有真实需求时提前做复杂内存结构，防止裸机地址错误导致直接炸机</li>
+        </ul>
+      </div>
+
+      <div class="phase">
+        <div class="phase-header">
+          <span class="phase-badge pending">PHASE 4</span>
+          <span class="phase-title">进程与调度</span>
+        </div>
+        <div class="phase-desc">PCB + TSS + 轮转调度 + 系统调用</div>
+      </div>
+
+      <div class="phase">
+        <div class="phase-header">
+          <span class="phase-badge pending">PHASE 5</span>
+          <span class="phase-title">文件系统</span>
+        </div>
+        <div class="phase-desc">ATA LBA + FAT16 + VFS 抽象</div>
+      </div>
+
+      <div class="phase">
+        <div class="phase-header">
+          <span class="phase-badge pending">PHASE 6</span>
+          <span class="phase-title">Shell 与用户态</span>
+        </div>
+        <div class="phase-desc">TTY + Shell + ELF loader</div>
+      </div>
+
+      <div class="phase">
+        <div class="phase-header">
+          <span class="phase-badge pending">PHASE 7</span>
+          <span class="phase-title">x86-64 迁移</span>
+        </div>
+        <div class="phase-desc">PAE + Long Mode + syscall/sysret</div>
+      </div>
+
+      <div class="phase">
+        <div class="phase-header">
+          <span class="phase-badge pending">PHASE ∞</span>
+          <span class="phase-title">无限扩展</span>
+        </div>
+        <div class="phase-desc">GUI / PCI / USB / 网络 / SMP / UEFI</div>
+      </div>
+
+    </div>
+  </section>
+
+  <section>
+    <h2>技术栈</h2>
+    <p>没有 JavaScript，没有 Electron，没有虚拟机层。直接和 CPU、内存、磁盘对话。</p>
+    <div class="tech-grid">
+      <div class="tech-item"><div class="tech-icon">🧠</div><div class="tech-name">C11</div><div class="tech-tag">内核主体</div></div>
+      <div class="tech-item"><div class="tech-icon">⚙️</div><div class="tech-name">NASM</div><div class="tech-tag">x86 汇编</div></div>
+      <div class="tech-item"><div class="tech-icon">🛠️</div><div class="tech-name">GCC Cross</div><div class="tech-tag">i686-elf-gcc</div></div>
+      <div class="tech-item"><div class="tech-icon">🔗</div><div class="tech-name">LD + linker.ld</div><div class="tech-tag">链接脚本</div></div>
+      <div class="tech-item"><div class="tech-icon">💾</div><div class="tech-name">QEMU</div><div class="tech-tag">i386-softmmu</div></div>
+      <div class="tech-item"><div class="tech-icon">📀</div><div class="tech-name">xorriso</div><div class="tech-tag">ISO 生成</div></div>
+      <div class="tech-item"><div class="tech-icon">📦</div><div class="tech-name">GNU Make</div><div class="tech-tag">构建系统</div></div>
+      <div class="tech-item"><div class="tech-icon">🐛</div><div class="tech-name">QEMU + GDB</div><div class="tech-tag">远程调试</div></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>我的承诺</h2>
+    <div class="pledge-grid">
+
+      <div class="pledge-card green">
+        <div class="pledge-icon">📚</div>
+        <div class="pledge-title">汇编优先</div>
+        <div class="pledge-text">bootloader、IDT 存根、上下文切换 —— 该用汇编的地方绝不偷懒。GDT 每条描述符的 8 个字节都是我亲手算出来的。</div>
+      </div>
+
+      <div class="pledge-card blue">
+        <div class="pledge-icon">🧩</div>
+        <div class="pledge-title">分层架构</div>
+        <div class="pledge-text">Bootloader → Kernel → Driver → VFS → Process → Shell。每层只通过清晰的接口和下一层对话。改一个驱动不影响内核主体。</div>
+      </div>
+
+      <div class="pledge-card pink">
+        <div class="pledge-icon">🔬</div>
+        <div class="pledge-title">先在 QEMU 跑通，再上真机</div>
+        <div class="pledge-text">每一个阶段都要能在 QEMU 里稳定运行，能通过 GDB 单步调试，确认无误后再烧到 U 盘上真实硬件测试。</div>
+      </div>
+
+      <div class="pledge-card green">
+        <div class="pledge-icon">🧠</div>
+        <div class="pledge-title">手写内核，不抄教程</div>
+        <div class="pledge-text">参考《Writing an OS in Rust》《OSDev Wiki》《xv6》，但每一行代码都是自己写的。看懂原理再动手，而不是复制粘贴。</div>
+      </div>
+
+      <div class="pledge-card blue">
+        <div class="pledge-icon">♻️</div>
+        <div class="pledge-title">能跑 > 能看</div>
+        <div class="pledge-text">先让打印 "Hello" 的 bootloader 能跑，再加 GDT，再加中断。一步一加，每一步都能引导启动、能调试、能截图。</div>
+      </div>
+
+      <div class="pledge-card pink">
+        <div class="pledge-icon">🎯</div>
+        <div class="pledge-title">交付即学习</div>
+        <div class="pledge-text">如果最终只写出了一个能打印 VGA 文本的 bootloader，那也不算失败 —— 因为我会比 99% 的程序员更懂 x86 启动流程。</div>
+      </div>
+
+    </div>
+  </section>
+
+  <section>
+    <h2>诚实的边界声明</h2>
+    <h3>✅ 我们能做到的：</h3>
+    <p>
+      一个真正能在 x86 PC 上引导启动的裸金属 OS。产物是可写入 U 盘的 .img 或可刻录的 .iso。
+      它有自己的 bootloader、GDT/IDT、中断处理、物理/虚拟内存管理、进程调度、文件系统、Shell。
+      启动后能看到我们自己画的界面，能响应键盘输入，能执行我们自己写的命令。
+    </p>
+    <br>
+    <h3>⚠️ 技术现实：</h3>
+    <p>
+      x86 裸金属 OS 开发是一个极其陡峭的学习曲线。没有 libc、没有操作系统 API、没有堆、
+      甚至 main 函数都不会被自动调用。每一步都可能卡住好几天。这很正常 —— 这就是学习本身。
+    </p>
+    <br>
+    <h3>🎯 真正的目标：</h3>
+    <p>
+      <strong style="color:var(--accent)">理解操作系统从按下电源键到 Shell 提示符出现的每一个字节、每一条指令、每一次中断。</strong>
+      到这个项目结束的那天，我应该能不查资料，凭记忆画出完整的启动链路和内存布局。
+    </p>
+  </section>
+
+  <div class="signature-area">
+    <div class="sig-date">EST. 2026 · 10 · 17</div>
+    <hr class="sig-line">
+    <div class="sig-name">RUANMINGZE</div>
+    <div class="sig-label">FOUNDER · SOLE ENGINEER · DREAMER</div>
+    <hr class="sig-line">
+    <p style="font-size:13px;color:var(--text-dim);font-style:italic;">
+      "成功了，太好了；没成功，也好极了 —— 毕竟付出那么多，肯定学到了东西。"
+    </p>
+  </div>
+
+<section>
+    <h2>项目结构 · 2026-10-18 中午</h2>
+    <pre style="background:#0d1219;border:1px solid var(--border);border-radius:8px;padding:16px;font-size:12px;color:var(--text-dim);line-height:1.8;">
+SaylterOS/
+├── pledge.html                     ← 项目纪念页 / 任务宣言
+├── linker.ld                       ← 内核链接脚本，内核装载地址 0xA100
+├── Makefile                        ← 仍可用，但当前更偏手工命令行构建
+├── src/
+│   ├── boot/
+│   │   ├── boot.asm                ← Stage 1: 512B MBR / 引导扇区
+│   │   ├── stage2.asm              ← Stage 2: 实模式输出 banner / 初始化环境
+│   │   ├── pm.asm                  ← Stage 3: GDT / IDT / PIC / IRQ / 把 scancode 放 mailbox
+│   │   ├── entry32.asm             ← 32-bit protected mode 入口
+│   │   └── pm.bin                  ← 当前构建出的保护模式中间态镜像
+│   └── kernel/
+│       ├── kernel.c                ← C 内核入口及初始化逻辑
+│       ├── tty.c                   ← VGA 文本模式 TTY / cursor / 清屏 / 输出
+│       ├── tty.h
+│       ├── shell.c                 ← shell prompt / 命令输入 / 回显 / Enter
+│       ├── shell.h
+│       ├── keyboard.c              ← PS/2 扫描码分析、Shift/Caps/Release 状态机
+│       └── keyboard.h
+├── build/
+│   ├── boot.bin                    ← 引导扇区二进制
+│   ├── stage2.bin                  ← Stage2 二进制
+│   ├── pm.bin                      ← 保护模式中间层二进制
+│   ├── kernel.bin                  ← 链接后内核二进制
+│   ├── kernel.elf                  ← ELF 目标文件
+│   ├── saylter.img                 ← 最终 raw floppy 镜像，QEMU 直接引导
+│   ├── saylter.iso                 ← xorriso 生成的 BIOS 可引导 ISO
+│   ├── iso_root/                   ← ISO 目录树，放 saylter.img
+│   └── qemu_boot.log               ← QEMU 串口日志
+├── .gitignore                      ← 构建产物忽略（如果存在）
+└── README (planned)               ← 后续整理开发文档 / 架构说明
+    </pre>
+    <h3>🗺️ 当前内存布局（已实际落地的 x86 运行模型）</h3>
+    <pre style="background:#0d1219;border:1px solid var(--border);border-radius:8px;padding:16px;font-size:12px;color:var(--accent2);line-height:1.8;">
+0x00000000 ─────────────────────────────
+  0x0000-0x03FF     BIOS/IDT 低地址区（后续会被我们重建）
+  0x0400-0x04FF     BIOS Data Area
+  0x0500-0x07BFF    工作区 / scratch / 可用低内存
+  0x07C00-0x07DFF   boot.bin (MBR / 引导扇区) ◀ BIOS 入口
+  0x07E00-0x085FF   stage2.bin (实模式阶段) ◀ boot.asm 载入
+  0x08600-0x0A000   pm.bin (受保护模式中间层) ◀ GDT / IDT / PIC / IRQ
+  0x0A000-0x0A001   键盘 mailbox
+                    [0xA000] = raw scancode
+                    [0xA001] = has_data flag
+  0x0A100-0x10000   kernel.bin 加载区 ◀ linker.ld 指定位置
+                    当前放置：TTY / shell / keyboard / kernel.c
+  0x9FFFF-0xA0000   内核栈顶附近（esp 向下增长）
+  0xB8000          VGA 文本缓冲区（80x25, 16 色）
+  0xF0000-0xFFFFF  BIOS ROM / 固件映射区
+0xFFFFFFFF ─────────────────────────────
+
+当前真实状态：
+- 引导链路：boot -> stage2 -> pm -> kernel 已经跑通了一大半
+- 实模式 -> 保护模式：已实现 GDT + IDT + PIC 流程
+- 中断：IRQ0 timer / IRQ1 keyboard 已经在设计中/部分跑通
+- 输入层：raw scancode 通过 mailbox 传递到 C 层做 Shift/Caps/Release 语义
+- 输出层：VGA 文本模式 + TTY + shell prompt 已经存在
+- 现在重点仍是：真实机兼容层、键盘协议和稳定输入
+    </pre>
+  </section>
+
+  <footer>
+    SaylterOS · Real bare-metal x86 OS · Built with <span class="heart">♥</span> and assembly · v0.2.0-phase2-debugging
+  </footer>
+
+</div>
+
+<script>
+const bootLines = [
+  '[BOOT] SaylterOS Pledge BIOS v0.0.1',
+  '[BOOT] CPU: Intel/AMD x86_64',
+  '[BOOT] Memory: 640K + extended',
+  '[BOOT] Boot pledge.html from HD0',
+  '[BOOT] Loading GDT... OK',
+  '[BOOT] Loading IDT... OK',
+  '[BOOT] Enabling protected mode... OK',
+  '[OK]  Welcome to SaylterOS. Let\'s write a real OS.',
+];
+
+let bi = 0;
+const bootEl = document.getElementById('boot-output');
+const fillEl = document.getElementById('boot-fill');
+const overlay = document.getElementById('boot-overlay');
+
+function typeLine(line) {
+  return new Promise(resolve => {
+    let i = 0;
+    const div = document.createElement('div');
+    bootEl.appendChild(div);
+    const timer = setInterval(() => {
+      div.textContent += line[i++];
+      fillEl.style.width = ((bi / bootLines.length) * 100 + (i / line.length / bootLines.length) * 100) + '%';
+      if (i >= line.length) { clearInterval(timer); setTimeout(resolve, 200); }
+    }, 20);
+  });
+}
+
+async function boot() {
+  for (const line of bootLines) await typeLine(line);
+  fillEl.style.width = '100%';
+  setTimeout(() => {
+    overlay.classList.add('fade-out');
+    setTimeout(() => overlay.remove(), 800);
+  }, 400);
+}
+
+boot();
+
+const canvas = document.getElementById('matrix-bg');
+const ctx = canvas.getContext('2d');
+let W, H, cols, drops;
+
+function resize() {
+  W = canvas.width = window.innerWidth;
+  H = canvas.height = window.innerHeight;
+  cols = Math.floor(W / 16);
+  drops = new Array(cols).fill(0).map(() => Math.random() * -50);
+}
+resize();
+window.addEventListener('resize', resize);
+
+function draw() {
+  ctx.fillStyle = 'rgba(10, 14, 23, 0.05)';
+  ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = '#00ff88';
+  ctx.font = '14px JetBrains Mono, monospace';
+  for (let i = 0; i < cols; i++) {
+    const ch = String.fromCharCode(0x30A0 + Math.random() * 96);
+    ctx.fillText(ch, i * 16, drops[i] * 16);
+    if (drops[i] * 16 > H && Math.random() > 0.975) drops[i] = 0;
+    drops[i]++;
+  }
+}
+setInterval(draw, 50);
+</script>
+
+</body>
+</html>
