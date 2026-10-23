@@ -1,0 +1,15 @@
+# Build artifacts
+build/
+*.o
+*.obj
+*.bin
+*.elf
+*.img
+*.iso
+
+# QEMU debug logs
+qemu.log
+serial.log
+
+# VS Code
+.vscode/
