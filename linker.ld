@@ -15,6 +15,8 @@ SECTIONS {
 
     .rodata ALIGN(4) : {
         *(.rodata*)
+        *(.rdata*)          /* MinGW const 大数组在这里 */
+        *(.rdata$*)         /* MinGW 子段 */
     }
 
     .data ALIGN(4) : {

@@ -3,25 +3,57 @@
 
 #include <stdint.h>
 
-#define VBE_WIDTH  1024
-#define VBE_HEIGHT 768
-#define VBE_BPP    32
-#define VBE_FB     0xE00000u
+/* VBE 结果由 bootloader (pm.asm) 存在 0x7DF0 */
+#define VBE_INFO_PTR   ((vbe_info_t *)0x7DF0)
+#define VBE_MAGIC_OK   0xA1B2
 
-typedef struct {
+typedef struct __attribute__((packed)) {
+    uint16_t magic;          /* 0xA1B2 = VBE OK */
+    uint32_t framebuffer;    /* 物理地址 */
     uint16_t width;
     uint16_t height;
     uint8_t  bpp;
-    uint32_t pitch;
-    uint32_t framebuffer;
-    uint8_t  enabled;
-} vbe_mode_info_t;
+    uint16_t pitch;          /* BytesPerScanLine */
+} vbe_info_t;   /* packed: 必须与 pm.asm 的紧凑写入布局一致 (pitch 在奇地址 0xB) */
 
-extern uint8_t vbe_bios_switch_mode(void);
+extern vbe_info_t vbe_current;
 
-void vbe_init_basic(void);
-uint8_t vbe_set_mode(uint16_t width, uint16_t height, uint8_t bpp);
+/* 读 bootloader 留下的 VBE 信息，填全局 vbe_current */
+void vbe_init(void);
+
+/* 全局填充 */
 void vbe_fill_color(uint32_t color);
-void vbe_fill_sky_blue(void);
+void vbe_fill_sky_blue(void);   /* 0x00BFE8FF */
+
+/* 双缓冲：把 backbuffer 一次性 blit 到 LFB */
+void vbe_swap(void);
+
+/* 脏矩形：只 blit (x,y) 起 w×h 区域到 LFB */
+void vbe_swap_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h);
+
+/* 单像素 */
+void vbe_put_pixel(uint16_t x, uint16_t y, uint32_t color);
+
+/* 实心矩形 */
+void vbe_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint32_t color);
+
+/* 光标双缓冲：保存/恢复矩形像素到内存 buf */
+void vbe_save_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint32_t *buf);
+void vbe_restore_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, const uint32_t *buf);
+
+/* 16×32 字符绘制 */
+void vbe_draw_char(uint16_t cx, uint16_t cy, char c, uint32_t fg, uint32_t bg);
+void vbe_draw_string(const char *s, uint16_t cx, uint16_t cy, uint32_t fg, uint32_t bg);
+
+/* 状态 */
+uint8_t vbe_is_enabled(void);
+
+/* 辅助：命中检测 */
+static inline uint8_t point_in_rect(int16_t px, int16_t py,
+                                    uint16_t rx, uint16_t ry,
+                                    uint16_t rw, uint16_t rh) {
+    return (px >= (int16_t)rx && px < (int16_t)(rx + rw) &&
+            py >= (int16_t)ry && py < (int16_t)(ry + rh));
+}
 
 #endif /* VBE_H */

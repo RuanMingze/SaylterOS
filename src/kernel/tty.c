@@ -108,6 +108,9 @@ static void tty_scroll(void) {
 void tty_putchar(char c) {
     uint16_t *video = (uint16_t *)VGA_MEM;
 
+    /* COM1 echo: 方便串口日志调试 */
+    outb(0x3F8, (uint8_t)c);
+
     if (c == '\n' || c == '\r') {
         tty_newline();
     } else if (c == '\b') {

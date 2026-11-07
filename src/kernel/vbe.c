@@ -1,66 +1,167 @@
 /* ============================================================
- * vbe.c - minimal VBE graphics backend
+ * vbe.c - 双缓冲 framebuffer 操作
  * ------------------------------------------------------------
- * 目的：
- *  1. 设定一个固定的 GUI 模式：1024x768x32
- *  2. 填充线性帧缓冲
- *  3. 作为后续真正 BIOS VBE 0x4F00 / 0x4F01 / 0x4F02 扩展的基础
+ * VBE BIOS 调用已在 bootloader (pm.asm, Real Mode) 完成
+ * 所有绘制写 off-screen backbuffer，vbe_swap() 一次 blit 到 LFB
  * ============================================================ */
 
-#include <stdint.h>
 #include "vbe.h"
+#include <stddef.h>
 
-static vbe_mode_info_t vbe_current = {
-    .width = VBE_WIDTH,
-    .height = VBE_HEIGHT,
-    .bpp = VBE_BPP,
-    .pitch = VBE_WIDTH * 4,
-    .framebuffer = VBE_FB,
-    .enabled = 0
-};
+vbe_info_t vbe_current;
 
-void vbe_init_basic(void) {
-    vbe_current.width = VBE_WIDTH;
-    vbe_current.height = VBE_HEIGHT;
-    vbe_current.bpp = VBE_BPP;
-    vbe_current.pitch = VBE_WIDTH * 4;
-    vbe_current.framebuffer = VBE_FB;
-    vbe_current.enabled = 1;
+/* ---- backbuffer ---- */
+/* 1024*768*4 = 3MB, 放在 2MB 物理地址 (QEMU 256MB RAM 下绝对安全) */
+#define BACKBUFFER_PHYS  0x00200000
+static uint32_t *back = NULL;
+static uint32_t back_pitch_bytes = 0;   /* 每行 stride (字节) */
+
+static inline uint32_t *back_ptr(uint16_t x, uint16_t y) {
+    return (uint32_t *)((uint8_t *)back + (uint32_t)y * back_pitch_bytes + (uint32_t)x * 4);
 }
 
-uint8_t vbe_set_mode(uint16_t width, uint16_t height, uint8_t bpp) {
-    if (width != VBE_WIDTH || height != VBE_HEIGHT || bpp != VBE_BPP) {
-        return 0;
+void vbe_init(void) {
+    vbe_info_t *src = VBE_INFO_PTR;
+    if (src->magic == VBE_MAGIC_OK) {
+        vbe_current = *src;
+        /* 初始化 backbuffer */
+        back = (uint32_t *)BACKBUFFER_PHYS;
+        back_pitch_bytes = vbe_current.pitch;
+    } else {
+        vbe_current.magic = 0;
+        back = NULL;
     }
-
-    if (!vbe_bios_switch_mode()) {
-        return 0;
-    }
-
-    vbe_current.width = width;
-    vbe_current.height = height;
-    vbe_current.bpp = bpp;
-    vbe_current.pitch = width * (bpp / 8);
-    vbe_current.framebuffer = VBE_FB;
-    vbe_current.enabled = 1;
-    return 1;
 }
 
-void vbe_fill_color(uint32_t color) {
-    if (!vbe_current.enabled) {
-        return;
-    }
+uint8_t vbe_is_enabled(void) {
+    return vbe_current.magic == VBE_MAGIC_OK && back != NULL;
+}
 
-    volatile uint32_t *fb = (volatile uint32_t *)vbe_current.framebuffer;
-    const uint32_t pitch = vbe_current.pitch / 4;
-
-    for (uint32_t y = 0; y < vbe_current.height; y++) {
-        for (uint32_t x = 0; x < vbe_current.width; x++) {
-            fb[y * pitch + x] = color;
+/* ---- 核心：把 backbuffer 全量 blit 到 LFB (DWORD 拷贝) ---- */
+void vbe_swap(void) {
+    if (!vbe_is_enabled()) return;
+    volatile uint32_t *fb32 = (volatile uint32_t *)vbe_current.framebuffer;
+    uint32_t width = vbe_current.width;
+    uint32_t height = vbe_current.height;
+    uint32_t lfb_stride = vbe_current.pitch / 4;
+    uint32_t back_stride = back_pitch_bytes / 4;
+    for (uint32_t y = 0; y < height; y++) {
+        volatile uint32_t *dst = fb32 + y * lfb_stride;
+        const uint32_t *src = back + y * back_stride;
+        for (uint32_t x = 0; x < width; x++) {
+            dst[x] = src[x];
         }
     }
 }
 
+/* ---- 脏矩形：只 blit 一个矩形区域 ---- */
+void vbe_swap_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
+    if (!vbe_is_enabled()) return;
+    if ((uint32_t)x + w > vbe_current.width) w = (uint16_t)(vbe_current.width - x);
+    if ((uint32_t)y + h > vbe_current.height) h = (uint16_t)(vbe_current.height - y);
+    if (w == 0 || h == 0) return;
+    volatile uint32_t *fb32 = (volatile uint32_t *)vbe_current.framebuffer;
+    uint32_t lfb_stride = vbe_current.pitch / 4;
+    uint32_t back_stride = back_pitch_bytes / 4;
+    for (uint16_t row = 0; row < h; row++) {
+        volatile uint32_t *dst = fb32 + (uint32_t)(y + row) * lfb_stride + x;
+        const uint32_t *src = back + (uint32_t)(y + row) * back_stride + x;
+        for (uint16_t col = 0; col < w; col++) {
+            dst[col] = src[col];
+        }
+    }
+}
+
+/* ---- 所有绘制都写 backbuffer ---- */
+
+void vbe_fill_color(uint32_t color) {
+    if (!vbe_is_enabled()) return;
+    /* 注意：rep stosl 需要 ES 寄存器指向正确段，GCC inline asm 里不一定安全
+       换回标准 C 循环 —— RAM 写本来就快，瓶颈是 MMIO swap */
+    uint32_t total = vbe_current.width * vbe_current.height;
+    uint32_t *p = back;
+    for (uint32_t i = 0; i < total; i++)
+        p[i] = color;
+}
+
 void vbe_fill_sky_blue(void) {
     vbe_fill_color(0x00BFE8FF);
+}
+
+void vbe_put_pixel(uint16_t x, uint16_t y, uint32_t color) {
+    if (!vbe_is_enabled()) return;
+    if (x >= vbe_current.width || y >= vbe_current.height) return;
+    *back_ptr(x, y) = color;
+}
+
+void vbe_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint32_t color) {
+    if (!vbe_is_enabled()) return;
+    if ((uint32_t)x + w > vbe_current.width) return;
+    if ((uint32_t)y + h > vbe_current.height) return;
+    for (uint16_t row = 0; row < h; row++) {
+        uint32_t *r = back_ptr(x, y + row);
+        for (uint16_t col = 0; col < w; col++) {
+            r[col] = color;
+        }
+    }
+}
+
+/* save/restore 保留 —— 纯 RAM 操作，还能用 */
+void vbe_save_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint32_t *buf) {
+    if (!vbe_is_enabled() || !buf) return;
+    uint32_t idx = 0;
+    for (uint16_t row = 0; row < h; row++) {
+        uint32_t *src = back_ptr(x, y + row);
+        for (uint16_t col = 0; col < w; col++) {
+            buf[idx++] = src[col];
+        }
+    }
+}
+
+void vbe_restore_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, const uint32_t *buf) {
+    if (!vbe_is_enabled() || !buf) return;
+    uint32_t idx = 0;
+    for (uint16_t row = 0; row < h; row++) {
+        uint32_t *dst = back_ptr(x, y + row);
+        for (uint16_t col = 0; col < w; col++) {
+            dst[col] = buf[idx++];
+        }
+    }
+}
+
+/* ============================================================
+ * 16x32 bitmap font
+ * ============================================================ */
+extern const uint8_t font16x32[256][32][2];
+#define FONT16_W  16
+#define FONT16_H  32
+
+void vbe_draw_char(uint16_t cx, uint16_t cy, char c, uint32_t fg, uint32_t bg) {
+    if (!vbe_is_enabled()) return;
+    uint16_t px = (uint16_t)(cx * FONT16_W);
+    uint16_t py = (uint16_t)(cy * FONT16_H);
+    const uint8_t (*glyph)[2] = font16x32[(uint8_t)c];
+    uint32_t back_stride = back_pitch_bytes / 4;
+    for (int row = 0; row < FONT16_H; row++) {
+        uint32_t *line = back + (uint32_t)(py + row) * back_stride + px;
+        uint8_t b0 = glyph[row][0];
+        uint8_t b1 = glyph[row][1];
+        for (int col = 0; col < 16; col++) {
+            uint8_t bit;
+            if (col < 8) {
+                bit = (b0 >> (7 - col)) & 1;
+            } else {
+                bit = (b1 >> (15 - col)) & 1;
+            }
+            line[col] = bit ? fg : bg;
+        }
+    }
+}
+
+void vbe_draw_string(const char *s, uint16_t cx, uint16_t cy, uint32_t fg, uint32_t bg) {
+    if (!vbe_is_enabled()) return;
+    while (*s) {
+        vbe_draw_char(cx, cy, *s++, fg, bg);
+        cx++;
+    }
 }

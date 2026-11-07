@@ -8,7 +8,14 @@
 #include "tty.h"
 #include "keyboard.h"
 #include "io.h"
+#ifdef SAYLTER_VBE
 #include "vbe.h"
+#include "mouse.h"
+#endif
+
+/* MinGW 栈探针 stub —— 裸内核没有 libgcc 的 ___chkstk_ms */
+void ___chkstk_ms(void) {}
+void __chkstk_ms(void)  {}
 
 /* 简易 delay —— 空循环 */
 static void delay(uint32_t count) {
@@ -269,17 +276,155 @@ static void cmd_help(void)  { for (int i = 0; help_text[i]; i++) printk("%s\n", 
 static void cmd_min(void)  { printk("help clear echo gui ps version uname whoami date mem reboot\n"); }
 static void cmd_clear(void){ tty_clear(); }
 static void cmd_echo(const char *args)  { printk("%s\n", args); }
-static void cmd_gui(void) {
+#ifdef SAYLTER_VBE
+/* --- 按钮定义 --- */
+#define BTN_X       432
+#define BTN_Y       320
+#define BTN_W       144
+#define BTN_H       64
+#define BTN_CX      28        /* 按钮中心504px → cx=27.5, 取28(偏右8px对称) */
+#define BTN_CY      10        /* 按钮中心352px → cy=10.5, 取10(偏上) → 视觉居中 */
+#define BTN_NORMAL  0xFF3366AA
+#define BTN_HOVER   0xFF224488
+#define BTN_TEXT    0xFFFFFFFF
+
+void gui_main(void) {
     tty_clear();
     tty_set_cursor(0, 0);
-    printk("[GUI] VBE mode init: 1024x768x32\n");
-    if (!vbe_set_mode(VBE_WIDTH, VBE_HEIGHT, VBE_BPP)) {
-        printk("[GUI] Unsupported mode.\n");
+    vbe_init();
+    if (!vbe_is_enabled()) {
+        printk("[GUI] VBE not available.\n");
         return;
     }
+    printk("[GUI] %ux%ux%u — poweroff to exit.\n",
+           vbe_current.width, vbe_current.height, vbe_current.bpp);
+
+    if (!ps2_mouse_init()) {
+        printk("[GUI] PS/2 mouse init failed.\n");
+        return;
+    }
+    int16_t mx = (int16_t)(vbe_current.width / 2);
+    int16_t my = (int16_t)(vbe_current.height - 100);
+    const int16_t max_x = (int16_t)(vbe_current.width - MOUSE_W);
+    const int16_t max_y = (int16_t)(vbe_current.height - MOUSE_HEIGHT);
+
+    int16_t prev_mx = mx, prev_my = my;
+    uint8_t prev_hit = 0;
+    uint8_t prev_buttons = 0;
+    uint32_t poll_fail = 0;
+    uint32_t click_count = 0;
+    uint32_t prev_click_count = 0;
+
+    /* ===== 第一帧：画全屏 + 全 swap ===== */
     vbe_fill_sky_blue();
-    printk("[GUI] Sky-blue desktop ready.\n");
+    vbe_draw_string("SaylterOS", 27, 8, 0xFF0000FF, 0x00BFE8FF);
+    vbe_draw_string("v0.3 - VGA ROM Font", 22, 12, 0xFFFF0000, 0x00BFE8FF);
+    vbe_fill_rect(BTN_X, BTN_Y, BTN_W, BTN_H, BTN_NORMAL);
+    vbe_draw_string("Click Me", BTN_CX, BTN_CY, BTN_TEXT, BTN_NORMAL);
+    vbe_draw_string("Clicks: 0", BTN_X/16, (BTN_Y + BTN_H) / 32 + 1, 0xFFFFFFFF, 0x00BFE8FF);
+    vbe_fill_rect((uint16_t)mx, (uint16_t)my, MOUSE_W, MOUSE_HEIGHT, 0xFF000000);
+    vbe_swap();
+
+    while (1) {
+        int8_t dx, dy;
+        uint8_t buttons;
+        if (ps2_mouse_poll(&dx, &dy, &buttons)) {
+            poll_fail = 0;
+            mx += dx; my += dy;
+            if (mx < 0) mx = 0;      if (my < 0) my = 0;
+            if (mx > max_x) mx = max_x; if (my > max_y) my = max_y;
+        } else {
+            poll_fail++;
+            if (poll_fail > 5000000) {
+                ps2_mouse_disable();
+                ps2_mouse_init();
+                poll_fail = 0;
+            }
+            continue;
+        }
+
+        uint8_t hit = point_in_rect(mx, my, BTN_X, BTN_Y, BTN_W, BTN_H);
+
+        if (!(prev_buttons & 1) && (buttons & 1) && hit) {
+            click_count++;
+        }
+        prev_buttons = buttons;
+
+        /* 静止不动 → 完全跳过重绘和 swap */
+        if (mx == prev_mx && my == prev_my && hit == prev_hit && click_count == prev_click_count) continue;
+
+        /* === 计算脏矩形 bounding box === */
+        uint16_t dx1 = prev_mx, dy1 = prev_my;
+        uint16_t dx2 = (uint16_t)(prev_mx + MOUSE_W - 1), dy2 = (uint16_t)(prev_my + MOUSE_HEIGHT - 1);
+        uint16_t nx1 = (uint16_t)mx, ny1 = (uint16_t)my;
+        uint16_t nx2 = (uint16_t)(mx + MOUSE_W - 1), ny2 = (uint16_t)(my + MOUSE_HEIGHT - 1);
+        uint16_t bbox_x1 = dx1 < nx1 ? dx1 : nx1;
+        uint16_t bbox_y1 = dy1 < ny1 ? dy1 : ny1;
+        uint16_t bbox_x2 = dx2 > nx2 ? dx2 : nx2;
+        uint16_t bbox_y2 = dy2 > ny2 ? dy2 : ny2;
+        /* hover 状态变了 → 整个按钮区域也要重绘 */
+        if (hit != prev_hit) {
+            if (BTN_X < bbox_x1) bbox_x1 = BTN_X;
+            if (BTN_Y < bbox_y1) bbox_y1 = BTN_Y;
+            if ((BTN_X + BTN_W - 1) > bbox_x2) bbox_x2 = BTN_X + BTN_W - 1;
+            if ((BTN_Y + BTN_H - 1) > bbox_y2) bbox_y2 = BTN_Y + BTN_H - 1;
+        }
+        /* click_count 变了 → counter 区域也要重绘（按钮下方一行） */
+        if (click_count != prev_click_count) {
+            uint16_t ccy = (BTN_Y + BTN_H) + 32; /* 按钮底 + 一行像素 32px */
+            uint16_t ccx1 = BTN_X;
+            uint16_t ccx2 = BTN_X + BTN_W - 1;
+            uint16_t ccy1 = ccy;
+            uint16_t ccy2 = ccy + 31;
+            if (ccx1 < bbox_x1) bbox_x1 = ccx1;
+            if (ccy1 < bbox_y1) bbox_y1 = ccy1;
+            if (ccx2 > bbox_x2) bbox_x2 = ccx2;
+            if (ccy2 > bbox_y2) bbox_y2 = ccy2;
+        }
+
+        prev_mx = mx; prev_my = my; prev_hit = hit; prev_click_count = click_count;
+
+        /* ===== 全量重绘 backbuffer（RAM 写，飞快） ===== */
+        vbe_fill_sky_blue();
+        vbe_draw_string("SaylterOS", 27, 8, 0xFF0000FF, 0x00BFE8FF);
+        vbe_draw_string("v0.3 - VGA ROM Font", 22, 12, 0xFFFF0000, 0x00BFE8FF);
+        uint32_t btn_color = hit ? BTN_HOVER : BTN_NORMAL;
+        vbe_fill_rect(BTN_X, BTN_Y, BTN_W, BTN_H, btn_color);
+        vbe_draw_string("Click Me", BTN_CX, BTN_CY, BTN_TEXT, btn_color);
+
+        /* counter */
+        char counter[16];
+        counter[0] = 'C'; counter[1] = 'l'; counter[2] = 'i'; counter[3] = 'c';
+        counter[4] = 'k'; counter[5] = 's'; counter[6] = ':'; counter[7] = ' ';
+        int pos = 8;
+        if (click_count == 0) {
+            counter[pos++] = '0';
+        } else {
+            char tmp[10]; int t = 0;
+            uint32_t c = click_count;
+            while (c) { tmp[t++] = '0' + (c % 10); c /= 10; }
+            while (t--) counter[pos++] = tmp[t];
+        }
+        counter[pos] = '\0';
+        int clen = pos;
+        int btn_chars_x = BTN_X / 16;
+        int btn_chars_w = BTN_W / 16;
+        int cx = btn_chars_x + (btn_chars_w - clen) / 2;
+        if (cx < 0) cx = 0;
+        int cy = (BTN_Y + BTN_H) / 32 + 1;
+        vbe_draw_string(counter, cx, cy, 0xFFFFFFFF, 0x00BFE8FF);
+
+        vbe_fill_rect((uint16_t)mx, (uint16_t)my, MOUSE_W, MOUSE_HEIGHT, 0xFF000000);
+
+        /* ===== 只 swap 脏矩形 bounding box（可能只有几百字节） ===== */
+        uint16_t bw = bbox_x2 - bbox_x1 + 1;
+        uint16_t bh = bbox_y2 - bbox_y1 + 1;
+        vbe_swap_rect(bbox_x1, bbox_y1, bw, bh);
+    }
+
+    ps2_mouse_disable();
 }
+#endif
 static void cmd_version(void) { printk("SaylterOS v0.3 (TTY shell)\n"); }
 static void cmd_uname(void)   { printk("SaylterOS i386 32-bit\n"); }
 static void cmd_whoami(void)  { printk("root\n"); }
@@ -303,7 +448,9 @@ static int exec_cmd(const char *cmd, char *args) {
     else if (cmd_strcmp(cmd, "clear") == 0) cmd_clear();
     else if (cmd_strcmp(cmd, "cls") == 0)   cmd_clear();
     else if (cmd_strcmp(cmd, "echo") == 0)  cmd_echo(args);
-    else if (cmd_strcmp(cmd, "gui") == 0)   cmd_gui();
+#ifdef SAYLTER_VBE
+    else if (cmd_strcmp(cmd, "gui") == 0)   gui_main();
+#endif
     else if (cmd_strcmp(cmd, "version") == 0) cmd_version();
     else if (cmd_strcmp(cmd, "uname") == 0) cmd_uname();
     else if (cmd_strcmp(cmd, "whoami") == 0) cmd_whoami();

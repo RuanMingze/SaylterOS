@@ -6,6 +6,10 @@
 #include <stddef.h>
 #include "tty.h"
 #include "shell.h"
+#include "io.h"
+#ifdef SAYLTER_VBE
+#include "vbe.h"
+#endif
 
 /* linker.ld 定义的 BSS 边界 */
 extern char _bss_start[];
@@ -90,6 +94,13 @@ void _bss_init(void) {
 }
 
 void kernel_main(void) {
+    /* --- 初始化 COM1 串口（QEMU serial log） --- */
+    outb(0x3F8 + 3, 0x80);   /* DLAB on */
+    outb(0x3F8 + 0, 115200 / 9600);    /* 9600 baud low */
+    outb(0x3F8 + 1, 0);                /* 9600 baud high */
+    outb(0x3F8 + 3, 0x03);   /* DLAB off, 8N1 */
+    outb(0x3F8 + 1, 0x00);   /* interrupts off */
+
     /* --- 清屏 --- */
     tty_clear();
 
@@ -104,8 +115,22 @@ void kernel_main(void) {
     printk("[KERNEL] Running in 32-bit protected mode\n");
     printk("[KERNEL] Interrupts enabled (PIC remapped to 0x20)\n");
 
-    /* --- 进入 Shell --- */
+    /* --- VBE 初始化 (bootloader 已在 RM 设好, 这里读结果) --- */
+#ifdef SAYLTER_VBE
+    vbe_init();
+    if (vbe_is_enabled()) {
+        printk("[KERNEL] VBE %dx%dx%d @ phys 0x%x\n",
+               vbe_current.width, vbe_current.height, vbe_current.bpp,
+               vbe_current.framebuffer);
+        gui_main();      /* VBE 版：直接进 GUI */
+    } else {
+        printk("[KERNEL] VBE not available\n");
+        shell_main();
+    }
+#else
+    printk("[KERNEL] TTY mode (no VBE)\n");
     shell_main();
+#endif
 
     /* shell_main 不应返回 */
     while (1) __asm__ volatile ("cli; hlt");

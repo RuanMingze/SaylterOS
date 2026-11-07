@@ -562,7 +562,7 @@
 
       <div class="phase">
         <div class="phase-header">
-          <span class="phase-badge active">PHASE 2</span>
+          <span class="phase-badge done">PHASE 2</span>
           <span class="phase-title">中断与输入 · IRQ + shell + keyboard</span>
         </div>
         <div class="phase-desc">在两天内完成引导链路、保护模式、TTY 和 PS/2 键盘状态机，达到可交互系统原型</div>
@@ -575,6 +575,26 @@
           <li>✅ Shift / Caps / release code 状态机已补齐，接近真实键盘语义</li>
           <li>✅ 0x7C00 -> 0x7E00 -> 0x8600 -> 0xA100 的引导链路已稳定</li>
           <li>⭐ 这不是“理论 OS”，而是真正能在 QEMU 里启动并交互的 OS 原型</li>
+        </ul>
+      </div>
+
+      <div class="phase">
+        <div class="phase-header">
+          <span class="phase-badge done">PHASE 2.5</span>
+          <span class="phase-title">GUI · VBE LFB + 鼠标 + 按钮 + 计数 + 不炸</span>
+        </div>
+        <div class="phase-desc">2026-11-07 里程碑：简易 GUI 画面，干净的脏矩形双缓冲，鼠标流畅移动，按钮 hover 变暗，点击触发计数，文字完整不乱</div>
+        <ul class="phase-tasks">
+          <li>✅ VBE BIOS 0x4F02 设模式 0x0143 (1024×768×32 LFB)</li>
+          <li>✅ backbuffer + vbe_swap_rect 脏矩形 swap（MMIO 带宽省 99%+）</li>
+          <li>✅ PS/2 鼠标驱动 + hover 命中检测 + 左键 click 沿触发</li>
+          <li>✅ vgarom-16x32 字体 C 数组（IBM VGA ROM，公共域，合法可分发）</li>
+          <li>✅ 初始帧全屏 swap + 后续增量脏矩形更新（铁律！第一帧不能跳过）</li>
+          <li>✅ Ctrl+Alt+G 失焦后 poll_fail 计数器自动 reinit 鼠标，回来恢复</li>
+          <li>🐛 linker.ld 丢 .rdata 段 → MinGW const 大数组在 .rdata，只收 .rodata → 小写字母全丢！</li>
+          <li>🐛 vbe_draw_char 直写 backbuffer 行指针（每像素 call put_pixel 太慢 → 每字符省 512 次 call）</li>
+          <li>🐛 btn_counter 画在屏幕最左（忘了加 BTN_X/16 绝对坐标偏移）→ 脏矩形 swap 完全不覆盖 → "只有鼠标滑过才更新"</li>
+          <li>🐛 -O3 优化在 MinGW 裸内核会偷偷插 SSE 指令 + ___chkstk_ms → 黑屏 #UD → 必须 -O0</li>
         </ul>
       </div>
 
