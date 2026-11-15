@@ -47,6 +47,8 @@
 #define SLOP_CLEAR          0x09
 #define SLOP_SET            0x0A
 #define SLOP_NOP            0x0B
+#define SLOP_ALLOC          0x0C
+#define SLOP_FREE           0x0D
 
 /* ============================================================
  * 编译器状态
@@ -254,6 +256,29 @@ static int compile_line(char *line) {
 
         emit_byte(SLOP_SET);
         emit_byte(v);
+        return 1;
+    }
+
+    /* alloc <bytes>：向宿主申请内存，失败时任务会被 OOM 回收 */
+    if (starts_with(line, "alloc ")) {
+        char *value = line + 6;
+        while (*value == ' ' || *value == '\t') value++;
+
+        char *end = NULL;
+        long bytes = strtol(value, &end, 10);
+        if (end == value || bytes <= 0 || bytes > 65535) {
+            error_at(g_line_no, "alloc expects a byte count between 1 and 65535");
+            return 0;
+        }
+
+        emit_byte(SLOP_ALLOC);
+        emit_byte((uint8_t)(bytes & 0xFF));
+        emit_byte((uint8_t)((bytes >> 8) & 0xFF));
+        return 1;
+    }
+
+    if (strcmp(line, "free") == 0) {
+        emit_byte(SLOP_FREE);
         return 1;
     }
 
@@ -480,6 +505,8 @@ static int vm_execute(const uint8_t *image, int size, const char *name) {
 
     uint32_t pc = entry;
     uint32_t steps = 0;
+    void *allocs[8];
+    int alloc_count = 0;
 
     while (pc < code_size) {
         if (++steps > SLYZ_MAX_STEPS) {
@@ -552,6 +579,25 @@ static int vm_execute(const uint8_t *image, int size, const char *name) {
                 if (pc + 1 > code_size) { fprintf(stderr, "%s: bad set\n", name); return 0; }
                 vm_last = code[pc++] ? 1 : 0;
                 break;
+
+            case SLOP_ALLOC: {
+                if (pc + 2 > code_size) { fprintf(stderr, "%s: bad alloc\n", name); return 0; }
+                uint16_t bytes = get_u16(code + pc);
+                pc += 2;
+                if (alloc_count >= 8) { fprintf(stderr, "%s: too many allocations\n", name); return 0; }
+                void *ptr = malloc(bytes ? bytes : 1);
+                if (!ptr) { fprintf(stderr, "%s: out of memory\n", name); return 0; }
+                allocs[alloc_count++] = ptr;
+                printf("[alloc] %u bytes\n", (unsigned)bytes);
+                break;
+            }
+
+            case SLOP_FREE: {
+                if (alloc_count <= 0) { fprintf(stderr, "%s: free without alloc\n", name); return 0; }
+                free(allocs[--alloc_count]);
+                printf("[free]\n");
+                break;
+            }
 
             default:
                 fprintf(stderr, "%s: unknown opcode 0x%02X at %u\n",
@@ -627,6 +673,17 @@ static int dump_image(const uint8_t *image, int size, const char *name) {
                 break;
             }
 
+            case SLOP_ALLOC: {
+                uint16_t bytes = get_u16(code + pc);
+                pc += 2;
+                printf("%04u  ALLOC %u\n", (unsigned)at, (unsigned)bytes);
+                break;
+            }
+
+            case SLOP_FREE:
+                printf("%04u  FREE\n", (unsigned)at);
+                break;
+
             default:
                 printf("%04u  DB    0x%02X\n", (unsigned)at, op);
                 break;
@@ -666,6 +723,8 @@ static void show_doc(void) {
         "echo <text>          输出一行文本\n"
         "ask <prompt>         询问 Y/N，结果写入 last\n"
         "set yes | set no     直接设置 last\n"
+        "alloc <bytes>        向系统申请内存（1..65535）\n"
+        "free                 释放最近一次 alloc\n"
         "if yes               last 为真时执行到 endif / else\n"
         "if no                last 为假时执行到 endif / else\n"
         "else                 分支切换\n"

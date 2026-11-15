@@ -42,6 +42,8 @@ endif
 | `echo <text>` | 输出一行 |
 | `ask <prompt>` | 询问 Y/N，结果写入 last |
 | `set yes` / `set no` | 直接设置 last |
+| `alloc <bytes>` | 向系统申请内存（1..65535） |
+| `free` | 释放最近一次 alloc |
 | `if yes` / `if no` | 条件分支，支持 `else` |
 | `endif` | 结束条件块 |
 | `run <script>` | 调用另一个脚本 |

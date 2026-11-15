@@ -13,6 +13,8 @@
 #include "acpi.h"
 #include "auth.h"
 #include "slyzvm.h"
+#include "mem.h"
+#include "task.h"
 
 /* ---- SlyzFS 目录项镜像结构 ----
  * 必须与 slyzfs.h 的 DirEntry 以及 bridge 层的 SlyzDirEntry 逐字节一致：
@@ -304,7 +306,7 @@ static const char *help_text[] = {
     "  cd <path>                       Change directory (supports .. and /)",
     "  mkdir <path>                    Create a SlyzFS directory",
     "  rmdir <path>                    Remove an empty SlyzFS directory",
-    "  run <file.slyz>                 Execute a SLYZ script by name",
+    "  run <file>                      Execute a SLYZ image or text script",
     "  nano <file> / edit <file>       Full-screen editor (Ctrl+S save, Ctrl+X exit)",
     "  cat <file>                      Print file contents",
     "  ask <prompt>                    Prompt for yes/no input",
@@ -316,7 +318,8 @@ static const char *help_text[] = {
     "  uname                           Show kernel info",
     "  whoami                          Show current user",
     "  date                            Show fake system date",
-    "  mem                             Show static memory summary",
+    "  mem                             Show kernel heap statistics",
+    "  ps                              Show tasks, quotas and memory usage",
     "  reboot                          Reset the machine via 8042",
     "  poweroff / shutdown [n]         ACPI S5 shutdown (optional SLP_TYP 0..7)",
     "  acpi                            Show ACPI / PM1 status",
@@ -460,6 +463,8 @@ static void readline(char *buf, int maxlen, uint16_t prompt_x) {
                 printk(" ");
                 redraw_line(buf, len, pos, prompt_x);
             }
+            /* 空闲时让出 CPU：后台脚本任务在这里获得执行机会 */
+            task_yield();
             delay(50000);
             continue;
         }
@@ -918,10 +923,14 @@ static void cmd_rmdir(const char *args) {
 
 static void cmd_run(const char *args) {
     if (!args || !*args) {
-        printk("usage: run <file.slyz>\n");
+        printk("usage: run <file>\n");
         return;
     }
-    if (try_run_slyz_by_name(args)) {
+
+    int rc = try_run_slyz_by_name(args);
+    if (rc == 1) return;
+    if (rc == 2) {
+        printk("run: %s terminated abnormally\n", args);
         return;
     }
     printk("run: %s not found\n", args);
@@ -1104,6 +1113,54 @@ static int slyz_op_run(const char *line) {
     return exec_cmd(cmd, args) != 0;
 }
 
+/* 脚本的内存申请走任务配额：超出配额时 OOM 直接杀掉当前脚本任务。
+ * 内核任务（id 0）没有配额，失败只返回 0，由 VM 终止脚本。 */
+static void *slyz_op_alloc(uint32_t bytes) {
+    struct Task *t = task_current();
+    void *ptr = task_alloc(bytes);
+    if (ptr) return ptr;
+
+    if (t && t->id != 0) {
+        task_oom_kill(bytes);   /* 不返回 */
+    }
+    return 0;
+}
+
+static void slyz_op_free(void *ptr) {
+    task_free(ptr);
+}
+
+static void slyz_op_tick(void) {
+    task_account_step();
+}
+
+static const struct SlyzVmOps slyz_vm_ops = {
+    slyz_op_print,
+    slyz_op_ask,
+    slyz_op_run,
+    cmd_clear,
+    cmd_help,
+    slyz_op_alloc,
+    slyz_op_free,
+    slyz_op_tick
+};
+
+/* 脚本作为独立任务执行时的镜像副本。任务运行期间 shell 在 task_wait 中
+ * 让出 CPU，因此这块缓冲不会被其他 run 复用。 */
+static uint8_t slyz_task_image[SLYZVM_MAX_FILE];
+static int slyz_task_size = 0;
+static char slyz_task_name[SHELL_PATH_MAX];
+
+static void slyz_task_entry(void) {
+    struct Task *t = task_current();
+    if (!t) {
+        task_exit(-1);
+        return;
+    }
+    int rc = slyzvm_run(slyz_task_image, slyz_task_size, &slyz_vm_ops, slyz_task_name);
+    task_exit(rc ? 0 : 1);
+}
+
 static int try_run_slyz_by_name(const char *name) {
     if (!name || *name == '\0') return 0;
     if (slyz_depth >= 2) {
@@ -1149,16 +1206,38 @@ static int try_run_slyz_by_name(const char *name) {
 
     /* 二进制镜像：交给字节码虚拟机执行 */
     if (slyzvm_is_binary(image, got)) {
-        static const struct SlyzVmOps vm_ops = {
-            slyz_op_print,
-            slyz_op_ask,
-            slyz_op_run,
-            cmd_clear,
-            cmd_help
-        };
-        slyz_depth++;
-        int rc = slyzvm_run(image, got, &vm_ops, path);
-        slyz_depth--;
+        struct Task *cur = task_current();
+
+        /* 已经在脚本任务里：直接在当前任务中执行，避免嵌套覆盖任务镜像缓冲。
+         * 此时内存申请仍走该任务的配额。 */
+        if (cur && cur->id != 0) {
+            slyz_depth++;
+            int rc = slyzvm_run(image, got, &slyz_vm_ops, path);
+            slyz_depth--;
+            return rc ? 1 : 2;
+        }
+
+        /* shell 任务：把脚本放进独立任务，便于配额记账与 OOM 回收 */
+        for (int i = 0; i < got; i++) {
+            slyz_task_image[i] = image[i];
+        }
+        slyz_task_size = got;
+        cmd_strncpy(slyz_task_name, path, sizeof(slyz_task_name));
+
+        int tid = task_spawn(path, slyz_task_entry, TASK_QUOTA_DEFAULT);
+        if (tid < 0) {
+            printk("run: no free task slot\n");
+            return 0;
+        }
+
+        task_wait(tid);
+
+        struct Task *t = task_by_id(tid);
+        int rc = 2;
+        if (t) {
+            rc = (t->exit_code == 0) ? 1 : 2;
+            if (t->state == TASK_DEAD) t->state = TASK_FREE;
+        }
         return rc;
     }
 
@@ -1226,7 +1305,7 @@ static int try_run_slyz_by_name(const char *name) {
         return 1;
     }
 
-    return parse_block(0, line_count);
+    return parse_block(0, line_count) ? 1 : 2;
 }
 
 static void cmd_help(void)  { for (int i = 0; help_text[i]; i++) printk("%s\n", help_text[i]); }
@@ -1629,7 +1708,20 @@ static void cmd_date(void) {
     pad2(MO, mo); pad2(D, d); pad2(H, h); pad2(MI, mi); pad2(S, s);
     printk("%s-%s-%s %s:%s:%s UTC\n", Y, MO, D, H, MI, S);
 }
-static void cmd_mem(void)     { printk("kernel @ 0xA100, conventional 640KB\n"); }
+static void cmd_mem(void) {
+    uint32_t total = 0, used = 0, peak = 0, allocs = 0, frees = 0, failed = 0;
+    mem_stats(&total, &used, &peak, &allocs, &frees, &failed);
+
+    printk("kernel heap @ 0x%x  total %u bytes\n",
+           mem_heap_base(), (unsigned int)total);
+    printk("  used   : %u\n", (unsigned int)used);
+    printk("  free   : %u\n", (unsigned int)mem_free_bytes());
+    printk("  peak   : %u\n", (unsigned int)peak);
+    printk("  allocs : %u   frees: %u   failed: %u\n",
+           (unsigned int)allocs, (unsigned int)frees, (unsigned int)failed);
+    printk("  tasks  : %u alive, %u bytes accounted\n",
+           (unsigned int)task_count_alive(), (unsigned int)task_total_used());
+}
 /* 真实硬件复位：走 8042 键盘控制器的 0xFE 命令拉 CPU RESET#。
  * 旧实现只是 cli;hlt，等于关机，必须手动断电才能恢复。 */
 static void cmd_reboot(void)  {
@@ -1803,7 +1895,7 @@ static void cmd_chown(const char *args) {
         printk("chown: permission denied (root only) or not found\n");
     }
 }
-static void cmd_ps(void)      { printk("PID  STATE  NAME\n  0  RUN     idle\n  1  RUN     shell\n"); }
+static void cmd_ps(void)      { task_dump(); }
 
 /* 执行命令，返回 1 表示执行了，0 表示未找到 */
 static int exec_cmd(const char *cmd, char *args) {
@@ -1870,6 +1962,11 @@ static int read_yes_no(void) {
 /* ---------- Shell 主循环 ---------- */
 
 void shell_main(void) {
+    /* 内核堆与任务系统必须最先就绪：之后的文件系统、账户库、
+     * 脚本执行都可能申请内存或依赖任务上下文。 */
+    mem_init();
+    task_init();
+
     /* 启动页静默挂载 SlyzFS：
      * 先把 bridge 的画面日志关掉，挂载/格式化完成后再打印 banner，
      * 启动画面因此不会被 [SlyzFS] 探测信息占满，进入 shell 时文件系统已就绪。 */

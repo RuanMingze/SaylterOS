@@ -92,11 +92,18 @@ int slyzvm_run(const uint8_t *data, int size,
     int last = 0;
     uint32_t steps = 0;
 
+    /* ALLOC 的返回指针按栈式记录，FREE 释放最近一次。
+     * 最多同时持有 8 块，超出时报错终止脚本，避免内存泄漏。 */
+    void *allocs[8];
+    int alloc_count = 0;
+
     while (pc < code_size) {
         if (++steps > SLYZVM_MAX_STEPS) {
             printk("%s: runaway script aborted\n", name);
             return 0;
         }
+
+        if (ops->tick) ops->tick();
 
         uint8_t op = code[pc++];
 
@@ -176,6 +183,42 @@ int slyzvm_run(const uint8_t *data, int size,
             case SLOP_SET: {
                 if (pc + 1 > code_size) goto bad_image;
                 last = code[pc++] ? 1 : 0;
+                break;
+            }
+
+            case SLOP_ALLOC: {
+                if (pc + 2 > code_size) goto bad_image;
+                uint16_t bytes = vm_rd16(code + pc);
+                pc += 2;
+
+                if (alloc_count >= 8) {
+                    printk("%s: too many live allocations (max 8)\n", name);
+                    return 0;
+                }
+                if (bytes == 0 || !ops->alloc) {
+                    printk("%s: cannot allocate %u bytes\n", name, (unsigned int)bytes);
+                    return 0;
+                }
+
+                void *ptr = ops->alloc(bytes);
+                if (!ptr) {
+                    /* 配额或物理内存不足：由宿主决定是否已经杀掉任务 */
+                    printk("%s: allocation of %u bytes failed\n",
+                           name, (unsigned int)bytes);
+                    return 0;
+                }
+                allocs[alloc_count++] = ptr;
+                break;
+            }
+
+            case SLOP_FREE: {
+                if (alloc_count <= 0) {
+                    printk("%s: free without matching alloc\n", name);
+                    return 0;
+                }
+                alloc_count--;
+                if (ops->free) ops->free(allocs[alloc_count]);
+                allocs[alloc_count] = 0;
                 break;
             }
 

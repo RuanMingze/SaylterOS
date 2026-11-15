@@ -46,6 +46,16 @@ endif
 
 `if yes` 在 `last == 0` 时跳过整个分支；`if no` 在 `last != 0` 时跳过。`else` 可选。
 
+### alloc / free
+
+```slyz
+alloc 4096
+echo 4KB allocated
+free
+```
+
+`alloc` 从当前任务的内存配额中申请（默认 64 KB），返回指针由 VM 内部保存；`free` 释放最近一次申请。同一脚本最多同时持有 8 块，超出会报错终止。配额耗尽时任务会被内核 OOM 回收。
+
 ### run
 
 ```slyz

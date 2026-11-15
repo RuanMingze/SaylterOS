@@ -33,6 +33,8 @@
  *   0x09 CLEAR
  *   0x0A SET    u8 value        写 last
  *   0x0B NOP
+ *   0x0C ALLOC  u16 bytes       向宿主申请内存
+ *   0x0D FREE                   释放最近一次 ALLOC
  * ============================================================ */
 
 #ifndef SLYZVM_H
@@ -73,6 +75,8 @@
 #define SLOP_CLEAR   0x09
 #define SLOP_SET     0x0A
 #define SLOP_NOP     0x0B
+#define SLOP_ALLOC   0x0C
+#define SLOP_FREE    0x0D
 
 /* 宿主回调：VM 自身不做任何 I/O，全部由 shell 注入 */
 struct SlyzVmOps {
@@ -81,6 +85,11 @@ struct SlyzVmOps {
     int  (*run_line)(const char *line);    /* 执行一行 shell 命令，成功返回 1 */
     void (*clear)(void);
     void (*help)(void);
+    /* 内存申请：返回 0 表示失败（配额或物理内存不足），VM 会终止脚本 */
+    void *(*alloc)(uint32_t bytes);
+    void  (*free)(void *ptr);
+    /* 每执行一条指令调用一次，用于任务步数统计与协作式调度；可为 0 */
+    void (*tick)(void);
 };
 
 /* 只检查 8 字节魔数，用于区分二进制与文本脚本 */

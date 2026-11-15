@@ -14,10 +14,10 @@ ORG 0x7C00
 COM1        equ 0x3F8
 STAGE2_ADDR equ 0x7E00
 IMG_LBA_BASE equ 1      ; 镜像第一个被加载的扇区（Stage2 起点）
-IMG_TAIL_SECTORS equ 128 ; 第三段总扇区数: LBA66..193，装载到 0x20000
-                        ; 当前 .text+.rodata+.data 结束于 0x178A0，预留约 34KB 增长空间；
-                        ; 上限受 64KB 段边界约束（0x20000 是段 0x1000 的结束地址，
-                        ; 再往上会回卷到 0x10000），因此拆成两次 64 扇区读取。
+IMG_TAIL_SECTORS equ 192 ; 第三段总扇区数: LBA66..257，装载到 0x28000
+                        ; 当前 .text+.rodata+.data 结束于 0x1F1B8，预留约 36KB；
+                        ; 0x20000 是段 0x1000 的结束地址，往上会回卷，
+                        ; 因此按每 64 扇区（32KB）一段继续加载到 0x28000。
 
 ; ============================================================
 ; 入口
@@ -87,8 +87,8 @@ start:
     ;   段2: LBA 64..65  → 0x0000:0xFC00 (0xFC00..0x10000) 恰好到 64KB 边界
     ;   段3: LBA 66..129 → 0x1000:0x0000 (0x10000..0x18000) 64 扇区
     ;   段4: LBA 130..193→ 0x1800:0x0000 (0x18000..0x20000) 64 扇区
-    ; 拆成两个 64 扇区的原因是部分 BIOS 对单次 AH=42h 传输有 127 扇区的上限，
-    ; 且每段 32KB 都不跨越 64KB 边界。
+    ;   段5: LBA 194..257→ 0x2000:0x0000 (0x20000..0x28000) 64 扇区
+    ; 每段 32KB，既不跨越 64KB 段边界，也低于部分 BIOS 单次 127 扇区的上限。
     mov eax, IMG_LBA_BASE
     mov cx, 63
     mov dx, 0x0000
@@ -104,15 +104,22 @@ start:
     jc .fail
 
     mov eax, 66
-    mov cx, IMG_TAIL_SECTORS / 2
+    mov cx, 64
     mov dx, 0x1000
     mov bx, 0x0000
     call lba_read
     jc .fail
 
-    mov eax, 66 + IMG_TAIL_SECTORS / 2
-    mov cx, IMG_TAIL_SECTORS / 2
+    mov eax, 130
+    mov cx, 64
     mov dx, 0x1800
+    mov bx, 0x0000
+    call lba_read
+    jc .fail
+
+    mov eax, 194
+    mov cx, 64
+    mov dx, 0x2000
     mov bx, 0x0000
     call lba_read
     jc .fail
