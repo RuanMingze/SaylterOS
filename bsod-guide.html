@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SaylterOS 蓝屏恢复指南</title>
+<style>
+  :root {
+    --bg: #05080f;
+    --panel: #0b1220;
+    --panel-2: #0f1a2e;
+    --line: #1c2b45;
+    --text: #d7e2f2;
+    --muted: #8a9bb5;
+    --accent: #4da3ff;
+    --green: #43d17a;
+    --amber: #f0b429;
+    --red: #ff5d5d;
+    --mono: "Cascadia Code", "JetBrains Mono", Consolas, "Courier New", monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background:
+      radial-gradient(1200px 600px at 15% -10%, #102a4d 0%, transparent 60%),
+      radial-gradient(900px 500px at 100% 0%, #1a1030 0%, transparent 55%),
+      var(--bg);
+    color: var(--text);
+    font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+    line-height: 1.7;
+  }
+  .wrap { max-width: 1040px; margin: 0 auto; padding: 56px 24px 96px; }
+  header { border-bottom: 1px solid var(--line); padding-bottom: 28px; margin-bottom: 44px; }
+  .kicker {
+    display: inline-block; font-family: var(--mono); font-size: 12px;
+    letter-spacing: .18em; color: var(--accent); text-transform: uppercase;
+    border: 1px solid #1e3a5f; background: #0a1a2e; padding: 6px 12px; border-radius: 999px;
+  }
+  h1 { font-size: 38px; margin: 18px 0 10px; letter-spacing: -.5px; }
+  h1 span { color: var(--accent); }
+  .lede { color: var(--muted); max-width: 760px; margin: 0; }
+  h2 {
+    font-size: 22px; margin: 52px 0 18px;
+    display: flex; align-items: center; gap: 10px;
+  }
+  h2::before {
+    content: ""; width: 4px; height: 22px; background: var(--accent); border-radius: 2px;
+  }
+  .card {
+    background: linear-gradient(180deg, var(--panel-2), var(--panel));
+    border: 1px solid var(--line); border-radius: 14px;
+    padding: 22px 26px; margin: 16px 0;
+  }
+  .steps { counter-reset: step; list-style: none; padding: 0; margin: 0; }
+  .steps li {
+    position: relative; padding: 16px 0 16px 56px; border-bottom: 1px dashed var(--line);
+  }
+  .steps li:last-child { border-bottom: 0; }
+  .steps li::before {
+    counter-increment: step; content: counter(step);
+    position: absolute; left: 0; top: 14px;
+    width: 34px; height: 34px; border-radius: 50%;
+    background: #0d2340; border: 1px solid #1e4a7a; color: var(--accent);
+    font-family: var(--mono); font-size: 14px;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .steps strong { color: #fff; }
+  code {
+    font-family: var(--mono); font-size: 13px;
+    background: #0a1524; border: 1px solid #17263c; border-radius: 6px;
+    padding: 2px 7px; color: #9fd0ff; white-space: nowrap;
+  }
+  pre {
+    background: #060d18; border: 1px solid var(--line); border-radius: 12px;
+    padding: 18px 20px; overflow-x: auto; font-family: var(--mono); font-size: 13px;
+    color: #b9cde6; margin: 14px 0;
+  }
+  pre .stop { color: var(--red); font-weight: 600; }
+  pre .ok { color: var(--green); }
+  table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 14px; }
+  th, td { text-align: left; padding: 12px 14px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; letter-spacing: .08em; text-transform: uppercase; }
+  tbody tr:hover { background: #0b1626; }
+  .code-cell { font-family: var(--mono); color: #9fd0ff; white-space: nowrap; }
+  .tag {
+    display: inline-block; font-size: 11px; font-family: var(--mono);
+    padding: 2px 8px; border-radius: 999px; letter-spacing: .04em;
+  }
+  .tag.live { color: var(--green); border: 1px solid #1e5a3a; background: #0a2418; }
+  .tag.plan { color: var(--amber); border: 1px solid #5a4620; background: #241c0a; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 20px; }
+  .panel h3 { margin: 0 0 8px; font-size: 16px; color: #fff; }
+  .panel p { margin: 0; color: var(--muted); font-size: 14px; }
+  .note {
+    border-left: 3px solid var(--amber); background: #1a1408;
+    padding: 14px 18px; border-radius: 0 10px 10px 0; color: #d8c79a; font-size: 14px;
+  }
+  footer { margin-top: 64px; padding-top: 22px; border-top: 1px solid var(--line); color: var(--muted); font-size: 13px; }
+  @media (max-width: 640px) {
+    h1 { font-size: 28px; }
+    .wrap { padding: 36px 16px 64px; }
+    table { font-size: 13px; }
+    th, td { padding: 10px; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <span class="kicker">SAYLTER OS · RECOVERY</span>
+    <h1>蓝屏之后<span>怎么恢复</span></h1>
+    <p class="lede">
+      SaylterOS 的蓝屏不是装饰。进入蓝屏后系统会关闭中断、屏蔽 8259 全部 IRQ、停止所有任务，
+      并且不再执行任何磁盘写入。CPU 冻结在 <code>cli; hlt</code> 循环里，只能靠电源键或复位离开。
+      这份文档说明恢复步骤、错误码含义，以及未来会出现的蓝屏类型该怎么处理。
+    </p>
+  </header>
+
+  <section>
+    <h2>恢复步骤</h2>
+    <div class="card">
+      <ol class="steps">
+        <li><strong>先记录 STOP 码和 Reason</strong><br>屏幕第 7、9 行分别是 <code>*** STOP: 0x........</code> 和 <code>Reason: ...</code>，拍照或抄下来。</li>
+        <li><strong>查看串口日志</strong><br>始终会输出一行 <code>[BSOD] stop=0x........ reason=...</code>，比屏幕更容易复制。</li>
+        <li><strong>重启机器</strong><br>实机按电源键或复位；QEMU 关闭窗口即可，也可以在 monitor 里执行 <code>system_reset</code>。</li>
+        <li><strong>对照错误码处理</strong><br>按下表定位原因；如果是配置类问题，只在下次启动前处理。</li>
+        <li><strong>反复蓝屏时回看最近改动</strong><br>优先检查新加的模块是否让 <code>.data</code> 越过加载上界、是否引入了 SSE 指令、是否在中断里切栈。</li>
+      </ol>
+    </div>
+  </section>
+
+  <section>
+    <h2>屏幕长什么样</h2>
+    <pre>SAYLTER OS  v0.3
+
+A fatal exception has occurred. The system has been halted.
+
+<span class="stop">*** STOP: 0x00000000</span>
+
+Reason: kernel task terminated by user request
+
+Hardware state protection:
+  - interrupts disabled, 8259 fully masked
+  - all tasks frozen, no further scheduling
+  - no disk writes performed after this point
+
+Heap: 0 / 1048576 bytes used, tasks alive: 1
+
+Press the power button or reset the machine to restart.
+If this persists, check the serial log for the crash reason.</pre>
+  </section>
+
+  <section>
+    <h2>错误码对照表</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>STOP 码</th>
+          <th>名称</th>
+          <th>含义与触发场景</th>
+          <th>怎么处理</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="code-cell">0x00000000</td>
+          <td>KERNEL_KILLED <span class="tag live">已实现</span></td>
+          <td>执行 <code>kill 0</code> 并二次确认后主动触发。内核任务不可被正常终止，因此走崩溃处理。</td>
+          <td>重启即可，不涉及数据损坏。它同时是蓝屏流程的自检入口。</td>
+        </tr>
+        <tr>
+          <td class="code-cell">0x00000001</td>
+          <td>HEAP_EXHAUSTED <span class="tag plan">规划</span></td>
+          <td>内核堆（1MB）在回收之后仍无法满足分配请求。</td>
+          <td>减少同时运行的脚本、降低 <code>alloc</code> 大小；重启可清空堆。</td>
+        </tr>
+        <tr>
+          <td class="code-cell">0x00000002</td>
+          <td>TASK_QUOTA_EXCEEDED <span class="tag plan">规划</span></td>
+          <td>脚本申请内存超过任务配额。当前实现只杀任务并打印 <code>[OOM]</code>，不进蓝屏。</td>
+          <td>看到 <code>[OOM] task ... killed</code> 说明任务已被回收，无需重启；修改脚本或调大配额。</td>
+        </tr>
+        <tr>
+          <td class="code-cell">0x00000003</td>
+          <td>KERNEL_STACK_OVERFLOW <span class="tag plan">规划</span></td>
+          <td>内核栈越过守护页（需要先实现栈保护）。</td>
+          <td>减少深层递归与大的栈上数组；检查最近新增模块的局部变量。</td>
+        </tr>
+        <tr>
+          <td class="code-cell">0x00000004</td>
+          <td>PAGE_FAULT <span class="tag plan">规划</span></td>
+          <td>分页启用后访问未映射页或权限不符（#PF）。</td>
+          <td>检查页表映射与 CR3；确认 VBE 帧缓冲、内核镜像已正确映射。</td>
+        </tr>
+        <tr>
+          <td class="code-cell">0x00000005</td>
+          <td>GENERAL_PROTECTION <span class="tag plan">规划</span></td>
+          <td>段选择子非法或越权访问（#GP）。</td>
+          <td>检查 GDT 描述符、段寄存器加载顺序，以及 iret 返回的 CS。</td>
+        </tr>
+        <tr>
+          <td class="code-cell">0x00000006</td>
+          <td>TRIPLE_FAULT <span class="tag plan">规划</span></td>
+          <td>异常处理过程中再次异常，CPU 直接复位。蓝屏可能来不及显示。</td>
+          <td>用 QEMU <code>-d int</code> 抓复位前现场；重点查 IDT 与 ISR 的 error code 处理。</td>
+        </tr>
+        <tr>
+          <td class="code-cell">0x00000007</td>
+          <td>ACPI_TABLE_INVALID <span class="tag plan">规划</span></td>
+          <td>RSDP/FADT/MADT 校验失败或字段越界，主动停机以避免写坏 PM 寄存器。</td>
+          <td>换回上一个内核；或启动参数里跳过 ACPI，只保留 8042 重启。</td>
+        </tr>
+        <tr>
+          <td class="code-cell">0x00000008</td>
+          <td>SMP_AP_BOOT_FAILED <span class="tag plan">规划</span></td>
+          <td>INIT-SIPI-SIPI 后 AP 未在超时内上线。</td>
+          <td>QEMU 下检查 <code>-smp</code> 参数；实机可先限制为单核启动。</td>
+        </tr>
+      </tbody>
+    </table>
+    <div class="note">
+      标 <span class="tag plan">规划</span> 的条目是错误码表的设计占位：内核还没有实现对应检测。
+      先把编号和处置方式定下来，等分页、SMP、栈保护落地时直接接入，不必再改文档结构。
+    </div>
+  </section>
+
+  <section>
+    <h2>为什么蓝屏必须冻结系统</h2>
+    <div class="grid">
+      <div class="panel">
+        <h3>关中断 + 屏蔽 8259</h3>
+        <p>崩溃后键盘、时钟、串口中断全部停止，避免在处理函数里再次触发异常，把可诊断的蓝屏变成三重故障复位。</p>
+      </div>
+      <div class="panel">
+        <h3>不写磁盘</h3>
+        <p>FAT 缓存可能处于脏状态。崩溃后继续回写会产生半写目录项，把一次可恢复的故障变成文件系统损坏。</p>
+      </div>
+      <div class="panel">
+        <h3>hlt 冻结 CPU</h3>
+        <p>不再执行任何指令，寄存器与内存保持崩溃瞬间的状态，便于配合串口日志或 GDB 复盘。</p>
+      </div>
+      <div class="panel">
+        <h3>只留一条串口摘要</h3>
+        <p>不逐字符刷屏，避免 9600 波特率下输出拖慢冻结过程；完整诊断由屏幕承担。</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>触发蓝屏自检</h2>
+    <div class="card">
+      <p>想确认蓝屏流程与冻结是否正常，用 root 登录后执行：</p>
+      <pre>root@os:~# kill 0
+kill: the kernel task cannot be terminated normally.
+Trigger the crash handler and show BSOD? [y/N] y
+
+[BSOD] stop=0x00000000 reason=kernel task terminated by user request</pre>
+      <p>屏幕会立刻切成蓝底白字并冻结。此时键盘无响应是预期行为，重启即可恢复。</p>
+    </div>
+  </section>
+
+  <footer>
+    SaylterOS v0.0.3-Alpha3 · 蓝屏恢复指南 · 与 <code>src/kernel/bsod.c</code> 同步维护
+  </footer>
+
+</div>
+</body>
+</html>

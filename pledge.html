@@ -600,40 +600,66 @@
 
       <div class="phase">
         <div class="phase-header">
-          <span class="phase-badge pending">PHASE 3</span>
-          <span class="phase-title">内存管理（后续再做）</span>
+          <span class="phase-badge done">PHASE 3</span>
+          <span class="phase-title">内存管理 · 内核堆 + 任务配额</span>
         </div>
-        <div class="phase-desc">只有在真正需要虚拟内存、堆、进程和用户态时才启用；当前最小可用目标不依赖它</div>
+        <div class="phase-desc">2026-11-15：1MB 内核堆、每任务配额与 OOM 回收；硬件分页留到真正需要地址隔离时再做</div>
         <ul class="phase-tasks">
-          <li>在应用层需要分页、堆和进程时，再做 BIOS 0xE820 物理内存检测</li>
-          <li>先稳定 shell / 键盘 / 中断，再设计物理帧管理器</li>
-          <li>仅在系统规模扩大时启用 x86 分页：CR3 + CR0.PG</li>
-          <li>避免在没有真实需求时提前做复杂内存结构，防止裸机地址错误导致直接炸机</li>
+          <li>✅ 1MB 内核堆固定在 0x100000，不占用 .bss</li>
+          <li>✅ first-fit 分配 + 相邻空闲块合并 + 总量/已用/峰值统计</li>
+          <li>✅ 任务配额默认 64KB，申请超出即失败</li>
+          <li>✅ OOM：超配额任务被标记 DEAD 并回收全部内存</li>
+          <li>✅ mem 命令可观测堆状态与任务记账</li>
+          <li>⏳ 分页、页帧管理器、CR3 + CR0.PG 仍待实现</li>
         </ul>
       </div>
 
       <div class="phase">
         <div class="phase-header">
-          <span class="phase-badge pending">PHASE 4</span>
-          <span class="phase-title">进程与调度</span>
+          <span class="phase-badge done">PHASE 4</span>
+          <span class="phase-title">任务与调度 · 协作式 + kill + 蓝屏</span>
         </div>
-        <div class="phase-desc">PCB + TSS + 轮转调度 + 系统调用</div>
+        <div class="phase-desc">2026-11-15：4 个任务槽位、独立内核栈、协作式切换；kill 可终止后台任务，内核崩溃进入蓝屏并冻结硬件</div>
+        <ul class="phase-tasks">
+          <li>✅ 状态机 FREE/READY/RUNNING/DEAD，每任务 8KB 独立栈</li>
+          <li>✅ 上下文切换只保存 callee-saved + esp，切换点固定在 yield/exit</li>
+          <li>✅ bg 后台任务 + SLYZ WAIT 指令，可被 ps 观察</li>
+          <li>✅ kill 终止任务并回收内存；内核任务拒绝终止</li>
+          <li>✅ kill 0 → 蓝屏：cli + 屏蔽 8259 + 冻结 hlt，不写盘</li>
+          <li>⏳ 抢占式调度、per-CPU 运行队列待 SMP 阶段</li>
+        </ul>
       </div>
 
       <div class="phase">
         <div class="phase-header">
-          <span class="phase-badge pending">PHASE 5</span>
-          <span class="phase-title">文件系统</span>
+          <span class="phase-badge done">PHASE 5</span>
+          <span class="phase-title">文件系统 · SlyzFS</span>
         </div>
-        <div class="phase-desc">ATA LBA + FAT16 + VFS 抽象</div>
+        <div class="phase-desc">2026-11-15：自研 FAT 风格文件系统接入 Shell，目录、文件、权限全部落地</div>
+        <ul class="phase-tasks">
+          <li>✅ 超级块 + FAT(64 扇区) + 根目录(256 扇区) + 4 扇区簇</li>
+          <li>✅ 目录条目 71 字节：type/name/cluster/size/时间/mode/uid/gid</li>
+          <li>✅ ls / pwd / cd / cat / nano / run 全部走文件系统</li>
+          <li>✅ 权限在文件系统层强制：open、list_dir、mkdir、rmdir、remove</li>
+          <li>✅ chmod / chown，root 绕过检查</li>
+          <li>🐛 目录条目尺寸 64 vs 71 导致逐项错位；static scratch 重入覆盖 fh</li>
+        </ul>
       </div>
 
       <div class="phase">
         <div class="phase-header">
-          <span class="phase-badge pending">PHASE 6</span>
-          <span class="phase-title">Shell 与用户态</span>
+          <span class="phase-badge done">PHASE 6</span>
+          <span class="phase-title">Shell、用户与工具链</span>
         </div>
-        <div class="phase-desc">TTY + Shell + ELF loader</div>
+        <div class="phase-desc">2026-11-15：登录、账户、权限、编辑器、二进制脚本与 ACPI 电源管理全部接入</div>
+        <ul class="phase-tasks">
+          <li>✅ 动态提示符 root@os:~# / user@os:path$，底部安全区</li>
+          <li>✅ etc/passwd + etc/shadow，口令 SHA-256 加盐存储</li>
+          <li>✅ useradd / passwd / su / logout / chmod / chown</li>
+          <li>✅ nano 全屏编辑器（Ctrl+S/X/K、方向键、PgUp/PgDn）</li>
+          <li>✅ SLYZBIN v1：Windows 编译 → SlyzFS → 内核 VM 执行</li>
+          <li>✅ ACPI：FADT 解析、S5 关机、电源键轮询；reboot 走 8042</li>
+        </ul>
       </div>
 
       <div class="phase">
@@ -646,10 +672,24 @@
 
       <div class="phase">
         <div class="phase-header">
+          <span class="phase-badge pending">PHASE 8</span>
+          <span class="phase-title">SMP 多核 · MADT + APIC + INIT-SIPI</span>
+        </div>
+        <div class="phase-desc">下一阶段：先扩 ACPI（MADT/MCFG/HPET），再启用 local APIC 唤醒 AP，任务队列加锁、per-CPU 调度</div>
+        <ul class="phase-tasks">
+          <li>⏳ 解析 MADT 枚举 LAPIC ID 与 IOAPIC</li>
+          <li>⏳ IA32_APIC_BASE MSR 启用 local APIC</li>
+          <li>⏳ INIT-SIPI-SIPI + 0x7000 trampoline 唤醒 AP</li>
+          <li>⏳ 任务队列自旋锁 + per-CPU current + IPI 负载均衡</li>
+        </ul>
+      </div>
+
+      <div class="phase">
+        <div class="phase-header">
           <span class="phase-badge pending">PHASE ∞</span>
           <span class="phase-title">无限扩展</span>
         </div>
-        <div class="phase-desc">GUI / PCI / USB / 网络 / SMP / UEFI</div>
+        <div class="phase-desc">分页与虚拟内存 / PCI / USB / 网络 / UEFI / x86-64</div>
       </div>
 
     </div>
