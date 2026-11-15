@@ -13,11 +13,11 @@ ORG 0x7C00
 ; ============================================================
 COM1        equ 0x3F8
 STAGE2_ADDR equ 0x7E00
-STAGE2_CYL  equ 0
-STAGE2_HEAD equ 0
-STAGE2_SEC  equ 2       ; 扇区 1 是 MBR，从扇区 2 开始读
-STAGE2_CNT  equ 63      ; int 0x13 AH=2 单次上限 63 扇区!
-                        ; stage2(2KB)+pm(2KB)+kernel(15KB) ≈ 40 扇区, 留余量
+IMG_LBA_BASE equ 1      ; 镜像第一个被加载的扇区（Stage2 起点）
+IMG_TAIL_SECTORS equ 128 ; 第三段总扇区数: LBA66..193，装载到 0x20000
+                        ; 当前 .text+.rodata+.data 结束于 0x178A0，预留约 34KB 增长空间；
+                        ; 上限受 64KB 段边界约束（0x20000 是段 0x1000 的结束地址，
+                        ; 再往上会回卷到 0x10000），因此拆成两次 64 扇区读取。
 
 ; ============================================================
 ; 入口
@@ -76,19 +76,45 @@ start:
     mov si, str_load
     call puts
 
-    ; --- 读 Stage 2 ---
-    ; BIOS int 0x13 / AH=2 参数：
-    ;   CH = 柱面低 8 位, CL = 扇区号(低6位) + 柱面高2位
-    ;   DH = 磁头, DL = 驱动器号, AL = 扇区数
-    ;   ES:BX = 目标缓冲区
-    mov ah, 2           ; BIOS 读扇区功能号
-    mov al, STAGE2_CNT  ; 扇区数量
-    mov ch, STAGE2_CYL  ; ★ 关键：显式设 CH = 柱面号！
-    mov cl, STAGE2_SEC  ; 扇区号
-    mov dh, STAGE2_HEAD ; 磁头
-    mov dl, byte [drive_num]  ; ★ 用 BIOS 传入的启动驱动器号
-    mov bx, STAGE2_ADDR ; ES:BX = 0x0000:0x7E00
-    call read_sectors
+    ; --- 分段加载镜像（LBA 扩展读 int 13h AH=42h） ---
+    ; 为什么必须分段：
+    ;   1) BIOS 单次读扇区有上限（CHS 方式 63，且不能跨磁道）
+    ;   2) 目标缓冲区不能跨越 64KB 段边界
+    ; 镜像布局: LBA1..4=stage2(2KB), LBA5..18=pm(7KB), LBA19+=kernel
+    ; 需装入的部分: .text+.rodata+.data = 0x159C0-0xA200 = 47040B = 92 扇区
+    ; 因此从 LBA1 起共需 110 扇区 → 0x7E00 .. 0x15A00
+    ;   段1: LBA 1..63   → 0x0000:0x7E00 (0x7E00..0xFC00)
+    ;   段2: LBA 64..65  → 0x0000:0xFC00 (0xFC00..0x10000) 恰好到 64KB 边界
+    ;   段3: LBA 66..129 → 0x1000:0x0000 (0x10000..0x18000) 64 扇区
+    ;   段4: LBA 130..193→ 0x1800:0x0000 (0x18000..0x20000) 64 扇区
+    ; 拆成两个 64 扇区的原因是部分 BIOS 对单次 AH=42h 传输有 127 扇区的上限，
+    ; 且每段 32KB 都不跨越 64KB 边界。
+    mov eax, IMG_LBA_BASE
+    mov cx, 63
+    mov dx, 0x0000
+    mov bx, STAGE2_ADDR
+    call lba_read
+    jc .fail
+
+    mov eax, 64
+    mov cx, 2
+    mov dx, 0x0000
+    mov bx, 0xFC00
+    call lba_read
+    jc .fail
+
+    mov eax, 66
+    mov cx, IMG_TAIL_SECTORS / 2
+    mov dx, 0x1000
+    mov bx, 0x0000
+    call lba_read
+    jc .fail
+
+    mov eax, 66 + IMG_TAIL_SECTORS / 2
+    mov cx, IMG_TAIL_SECTORS / 2
+    mov dx, 0x1800
+    mov bx, 0x0000
+    call lba_read
     jc .fail
 
     mov si, str_ok
@@ -160,16 +186,27 @@ puts:
     ret
 
 ; ============================================================
-; read_sectors : BIOS int 0x13 / AH=2
-; 重试 5 次
+; lba_read : BIOS int 0x13 / AH=0x42 扩展 LBA 读取（带 5 次重试）
+; 入参: EAX = LBA(低 32 位), CX = 扇区数, DX = 目标段, BX = 目标偏移
+; 出参: CF = 0 成功 / CF = 1 失败
+; 说明: 使用 DAP 使得不受 CHS 几何限制，且调用方控制段:偏移
+;       以保证单次传输不跨越 64KB 段边界
 ; ============================================================
-read_sectors:
+lba_read:
     pusha
-    mov si, 5
+    mov [dap + 2], cx          ; 扇区数
+    mov [dap + 4], bx          ; 偏移
+    mov [dap + 6], dx          ; 段
+    mov [dap + 8], eax         ; LBA 低 32 位
+    mov dword [dap + 12], 0    ; LBA 高 32 位 = 0
+    mov bp, 5                  ; 重试次数
 .retry:
+    mov ah, 0x42
+    mov dl, byte [drive_num]
+    mov si, dap
     int 0x13
     jnc .done
-    dec si
+    dec bp
     jnz .retry
     popa
     stc
@@ -185,8 +222,17 @@ read_sectors:
 com_buf:        db 0        ; COM 发送临时缓冲
 drive_num:      db 0        ; BIOS 传入的启动驱动器号
 
+; ---- Disk Address Packet (AH=42h 用) ----
+dap:
+    db 0x10                 ; DAP 结构大小 = 16
+    db 0x00                 ; 保留
+    dw 0                    ; 扇区数（运行时填）
+    dw 0                    ; 目标偏移（运行时填）
+    dw 0                    ; 目标段（运行时填）
+    dq 0                    ; 64 位 LBA（运行时填低 32 位）
+
 str_boot:       db '[MBR] SaylterOS Stage1 booting...', 13, 10, 0
-str_load:       db '[MBR] Reading Stage2 (4 sectors @ cyl 0 head 0 sec 2)...', 13, 10, 0
+str_load:       db '[MBR] Reading Stage2 (4 sectors @ cyl 0 head 0 sec 1)...', 13, 10, 0
 str_ok:         db '[MBR] Stage2 loaded OK. Jumping to 0x7E00...', 13, 10, 0
 str_fail:       db '[MBR] FATAL: Disk read failed. Halting.', 13, 10, 0
 

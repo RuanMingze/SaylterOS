@@ -1,0 +1,51 @@
+{
+  "name": "saylter-slyz",
+  "displayName": "Saylter SLYZ",
+  "description": "Syntax highlighting and validation for SaylterOS SLYZ scripts.",
+  "version": "0.1.0",
+  "publisher": "saylter-os",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/RuanMingze/SaylterOS.git"
+  },
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Linters"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onLanguage:slyz"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "slyz",
+        "aliases": ["SLYZ", "slyz"],
+        "extensions": [".slyz"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "slyz",
+        "scopeName": "source.slyz",
+        "path": "./syntaxes/slyz.tmLanguage.json"
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "npx @vscode/vsce package --out saylter-slyz.vsix"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.12",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^3.2.1",
+    "typescript": "^5.5.4"
+  }
+}

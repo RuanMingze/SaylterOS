@@ -37,6 +37,10 @@ static void tty_newline(void);
 static uint16_t cursor_x = 0;
 static uint16_t cursor_y = 0;
 static uint8_t  tty_color = COLOR_DEFAULT;
+/* 滚动上限行：只有 0..scroll_limit 参与滚动，其下的行是保留区（安全区），
+ * 用于固定显示 shell 提示符，避免大量输出把 prompt 顶出屏幕。
+ * shell 会根据当前 prompt 的实际显示宽度动态设置该值。 */
+static uint16_t scroll_limit = VGA_ROWS - 1;
 
 uint16_t tty_get_cursor_x(void) {
     return cursor_x;
@@ -44,6 +48,46 @@ uint16_t tty_get_cursor_x(void) {
 
 uint16_t tty_get_cursor_y(void) {
     return cursor_y;
+}
+
+/* 设置滚动区底部（含）。row 为保留区上方最后一行。
+ * 例：保留底部 2 行时传 VGA_ROWS - 1 - 2 = 22。 */
+void tty_set_scroll_limit(uint16_t row) {
+    if (row >= VGA_ROWS) row = VGA_ROWS - 1;
+    scroll_limit = row;
+    if (cursor_y > scroll_limit) cursor_y = scroll_limit;
+}
+
+uint16_t tty_get_scroll_limit(void) {
+    return scroll_limit;
+}
+
+/* 提交保留区：把 scroll_limit 下方的每一行依次搬到滚动区末行并滚动一次。
+ * 效果等同于终端里"这一行输入已经敲定了"：
+ *   - 历史 prompt + 命令进入可滚动区域，不再被下一次 prompt 覆盖；
+ *   - 保留区清空，避免上一轮输入残留字符；
+ *   - 光标停在滚动区最后一行，命令输出从这里开始写。 */
+void tty_commit_reserved(void) {
+    uint16_t *video = (uint16_t *)VGA_MEM;
+    uint16_t rows = (uint16_t)(VGA_ROWS - 1 - scroll_limit);
+
+    for (uint16_t r = 0; r < rows; r++) {
+        for (int col = 0; col < VGA_COLS; col++) {
+            video[scroll_limit * VGA_COLS + col] =
+                video[(scroll_limit + 1 + r) * VGA_COLS + col];
+        }
+        tty_scroll();
+    }
+
+    for (uint16_t row = (uint16_t)(scroll_limit + 1); row < VGA_ROWS; row++) {
+        for (int col = 0; col < VGA_COLS; col++) {
+            video[row * VGA_COLS + col] = (uint16_t)((tty_color << 8) | ' ');
+        }
+    }
+
+    cursor_x = 0;
+    cursor_y = scroll_limit;
+    tty_update_hw_cursor();
 }
 
 void tty_set_cursor(uint16_t x, uint16_t y) {
@@ -79,37 +123,36 @@ static void tty_update_hw_cursor(void) {
 static void tty_newline(void) {
     cursor_x = 0;
     cursor_y++;
-    if (cursor_y >= VGA_ROWS) {
+    if (cursor_y > scroll_limit) {
         tty_scroll();
     }
 }
 
 /* ------------------------------------------------------------
- * 向上滚动 1 行 (最上面丢掉, 最下面空出来)
+ * 在滚动区内向上滚动 1 行（保留区不受影响）
  * ------------------------------------------------------------ */
 static void tty_scroll(void) {
     uint16_t *video = (uint16_t *)VGA_MEM;
-    /* 从第 2 行开始拷贝到第 1 行位置 */
-    for (int row = 1; row < VGA_ROWS; row++) {
+    for (int row = 1; row <= (int)scroll_limit; row++) {
         for (int col = 0; col < VGA_COLS; col++) {
             video[(row - 1) * VGA_COLS + col] = video[row * VGA_COLS + col];
         }
     }
-    /* 最底行清空 */
     for (int col = 0; col < VGA_COLS; col++) {
-        video[(VGA_ROWS - 1) * VGA_COLS + col] = (tty_color << 8) | ' ';
+        video[scroll_limit * VGA_COLS + col] = (tty_color << 8) | ' ';
     }
-    cursor_y = VGA_ROWS - 1;
+    cursor_y = scroll_limit;
 }
 
 /* ------------------------------------------------------------
- * 写单个字符到 VGA
+ * 只写 VGA 的字符输出（不回显串口）
+ * ------------------------------------------------------------
+ * 供 cat 这类大块文本输出使用：9600 波特率下把十几 KB 内容同时
+ * 回显到 COM1 需要十几秒，屏幕会被拖成幻灯片。串口那边由调用方
+ * 在结束时补一行摘要即可。
  * ------------------------------------------------------------ */
-void tty_putchar(char c) {
+static void tty_vga_putc(char c) {
     uint16_t *video = (uint16_t *)VGA_MEM;
-
-    /* COM1 echo: 方便串口日志调试 */
-    outb(0x3F8, (uint8_t)c);
 
     if (c == '\n' || c == '\r') {
         tty_newline();
@@ -123,10 +166,25 @@ void tty_putchar(char c) {
         if (cursor_x >= VGA_COLS) {
             cursor_x = 0;
             cursor_y++;
-            if (cursor_y >= VGA_ROWS) tty_scroll();
+            if (cursor_y > scroll_limit) tty_scroll();
         }
     }
     tty_update_hw_cursor();
+}
+
+void tty_putchar_vga(char c) {
+    tty_vga_putc(c);
+}
+
+/* ------------------------------------------------------------
+ * 写单个字符到 VGA + 串口
+ * ------------------------------------------------------------ */
+void tty_putchar(char c) {
+    /* COM1 echo: 等 TX buffer 空再写, 否则 printk 快速输出时丢字节 */
+    while ((inb(0x3FD) & 0x20) == 0) {}
+    outb(0x3F8, (uint8_t)c);
+
+    tty_vga_putc(c);
 }
 
 /* ------------------------------------------------------------
@@ -145,6 +203,7 @@ void tty_clear(void) {
         video[i] = (tty_color << 8) | ' ';
     cursor_x = 0;
     cursor_y = 0;
+    scroll_limit = VGA_ROWS - 1;
     tty_update_hw_cursor();
 }
 
@@ -156,7 +215,7 @@ void tty_set_color(uint8_t color) {
 }
 
 /* ------------------------------------------------------------
- * 简易 vsprintf (仅支持 %s, %d, %x, %c)
+ * 简易 vsprintf (支持 %s, %d, %u, %x, %c)
  * ------------------------------------------------------------ */
 static int tty_vsprintf(char *buf, const char *fmt, va_list args) {
     int len = 0;
@@ -175,6 +234,14 @@ static int tty_vsprintf(char *buf, const char *fmt, va_list args) {
                     if (v < 0) { buf[len++] = '-'; v = -v; }
                     if (v == 0) tmp[i++] = '0';
                     while (v) { tmp[i++] = '0' + v % 10; v /= 10; }
+                    while (i--) buf[len++] = tmp[i];
+                    break;
+                }
+                case 'u': {
+                    uint32_t v = va_arg(args, uint32_t);
+                    char tmp[12]; int i = 0;
+                    if (v == 0) tmp[i++] = '0';
+                    while (v) { tmp[i++] = '0' + (v % 10); v /= 10; }
                     while (i--) buf[len++] = tmp[i];
                     break;
                 }

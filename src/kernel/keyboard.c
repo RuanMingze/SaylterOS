@@ -15,6 +15,7 @@
 #define KB_LED_SCROLL 0x01
 
 static uint8_t shift_pressed = 0;
+static uint8_t ctrl_pressed = 0;
 static uint8_t caps_lock = 0;
 static uint8_t num_lock = 0;
 static uint8_t scroll_lock = 0;
@@ -163,26 +164,48 @@ char kb_read_char(void) {
         if (sc & 0x80) return 0;
 
         switch (code) {
+            case 0x48: return (char)0xF6; /* up arrow */
             case 0x4B: return (char)0xF1; /* left arrow */
             case 0x4D: return (char)0xF2; /* right arrow */
+            case 0x50: return (char)0xF7; /* down arrow */
             case 0x52: return (char)0xF0; /* insert */
             case 0x53: return (char)0xF5; /* delete */
             case 0x47: return (char)0xF3; /* home */
             case 0x4F: return (char)0xF4; /* end */
+            case 0x49: return (char)0xF8; /* page up */
+            case 0x51: return (char)0xF9; /* page down */
             default:   return 0;
         }
     }
 
     if (sc & 0x80) {
-        if (code == 0x2A || code == 0x36) {
+        if (code == 0x1D) {
+            ctrl_pressed = 0;
+        } else if (code == 0x2A || code == 0x36) {
             shift_pressed = 0;
         }
+        return 0;
+    }
+
+    if (code == 0x1D) {
+        ctrl_pressed = 1;
         return 0;
     }
 
     if (code == 0x2A || code == 0x36) {
         shift_pressed = 1;
         return 0;
+    }
+
+    /* Ctrl + 字母 → ASCII 控制码（Ctrl+A=1 ... Ctrl+Z=26）。
+     * 编辑器依赖这套通用映射实现 Ctrl+S 保存 / Ctrl+X 退出等快捷键；
+     * shell 的 readline 会把除 Ctrl+C 之外的控制字符当作不可打印输入忽略，
+     * 因此扩充映射不会改变现有命令行行为。 */
+    if (ctrl_pressed) {
+        char base = normal_map[code];
+        if (base >= 'a' && base <= 'z') {
+            return (char)(base - 'a' + 1);
+        }
     }
 
     if (code == 0x3A) {
@@ -198,6 +221,20 @@ char kb_read_char(void) {
     }
 
     if (code >= 0x47 && code <= 0x53) {
+        if (!num_lock) {
+            switch (code) {
+                case 0x47: return (char)0xF3; /* home */
+                case 0x48: return (char)0xF6; /* up */
+                case 0x4B: return (char)0xF1; /* left */
+                case 0x4D: return (char)0xF2; /* right */
+                case 0x4F: return (char)0xF4; /* end */
+                case 0x50: return (char)0xF7; /* down */
+                case 0x52: return (char)0xF0; /* insert */
+                case 0x53: return (char)0xF5; /* delete */
+                default:   return 0;
+            }
+        }
+
         char num_char = apply_num_lock_state(code);
         if (num_char != 0) {
             return num_char;
@@ -230,12 +267,16 @@ char scancode_to_char(uint8_t sc) {
         if (sc & 0x80) return 0;
 
         switch (code) {
+            case 0x48: return (char)0xF6;
             case 0x4B: return (char)0xF1;
             case 0x4D: return (char)0xF2;
+            case 0x50: return (char)0xF7;
             case 0x52: return (char)0xF0;
             case 0x53: return (char)0xF5;
             case 0x47: return (char)0xF3;
             case 0x4F: return (char)0xF4;
+            case 0x49: return (char)0xF8;
+            case 0x51: return (char)0xF9;
             default:   return 0;
         }
     }
@@ -243,13 +284,33 @@ char scancode_to_char(uint8_t sc) {
     if (code > 0x5F) return 0;
 
     if (sc & 0x80) {
-        if (code == 0x2A || code == 0x36) shift_pressed = 0;
+        if (code == 0x1D) {
+            ctrl_pressed = 0;
+        } else if (code == 0x2A || code == 0x36) {
+            shift_pressed = 0;
+        }
+        return 0;
+    }
+
+    if (code == 0x1D) {
+        ctrl_pressed = 1;
         return 0;
     }
 
     if (code == 0x2A || code == 0x36) {
         shift_pressed = 1;
         return 0;
+    }
+
+    /* Ctrl + 字母 → ASCII 控制码（Ctrl+A=1 ... Ctrl+Z=26）。
+     * 编辑器依赖这套通用映射实现 Ctrl+S 保存 / Ctrl+X 退出等快捷键；
+     * shell 的 readline 会把除 Ctrl+C 之外的控制字符当作不可打印输入忽略，
+     * 因此扩充映射不会改变现有命令行行为。 */
+    if (ctrl_pressed) {
+        char base = normal_map[code];
+        if (base >= 'a' && base <= 'z') {
+            return (char)(base - 'a' + 1);
+        }
     }
 
     if (code == 0x3A) {
@@ -265,6 +326,20 @@ char scancode_to_char(uint8_t sc) {
     }
 
     if (code >= 0x47 && code <= 0x53) {
+        if (!num_lock) {
+            switch (code) {
+                case 0x47: return (char)0xF3;
+                case 0x48: return (char)0xF6;
+                case 0x4B: return (char)0xF1;
+                case 0x4D: return (char)0xF2;
+                case 0x4F: return (char)0xF4;
+                case 0x50: return (char)0xF7;
+                case 0x52: return (char)0xF0;
+                case 0x53: return (char)0xF5;
+                default:   return 0;
+            }
+        }
+
         char num_char = apply_num_lock_state(code);
         if (num_char != 0) {
             return num_char;

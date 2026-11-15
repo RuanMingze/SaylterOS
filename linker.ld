@@ -6,7 +6,7 @@
 ENTRY(_start)
 
 SECTIONS {
-    . = 0xA100;
+    . = 0xA200;
 
     .text ALIGN(4) : {
         *(.multiboot)

@@ -1,0 +1,9 @@
+echo Batch-style prompt demo
+ask "Do you want to continue?"
+if yes
+echo You said yes!
+endif
+if no
+echo You said no.
+endif
+exit

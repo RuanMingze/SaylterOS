@@ -27,9 +27,16 @@ pm_start:
     or eax, 1
     mov cr0, eax
 
-    jmp 0x08:pm_entry
+    ; 显式编码 far jump (BITS 16 下必须是 5 字节: EA + 2+2)
+    ; dw 是 16-bit 偏移，CPU 在实模式下读取后切到保护模式
+    db 0xEA
+    dw pm_entry
+    dw 0x0008
 
 [BITS 32]
+; NASM -f bin + ORG 会自动把 label 值设为 ORG + 文件内偏移（即物理地址）
+; 所以所有 label 已经是正确的物理地址，直接使用即可，不能再 ！
+
 pm_entry:
     mov ax, 0x10
     mov ds, ax
@@ -72,7 +79,7 @@ pm_entry:
     mov al, 0xFF          ; Slave: 全屏蔽
     out 0xA1, al
 
-    mov esi, msg_pic_ok
+    mov esi, msg_pic_ok 
     mov edi, 0xB8000 + 2 * 160
     mov ah, 0x2F
     call print_at
@@ -82,14 +89,14 @@ pm_entry:
     ; ========================================
     call build_idt
 
-    mov esi, msg_idt_ok
+    mov esi, msg_idt_ok 
     mov edi, 0xB8000 + 4 * 160
     mov ah, 0x2F
     call print_at
 
-    lidt [idtr]
+    lidt [idtr ]
 
-    mov esi, msg_idtr_ok
+    mov esi, msg_idtr_ok 
     mov edi, 0xB8000 + 6 * 160
     mov ah, 0x2F
     call print_at
@@ -99,14 +106,18 @@ pm_entry:
     ; ========================================
     sti
 
-    mov esi, msg_sti_ok
+    mov esi, msg_sti_ok 
     mov edi, 0xB8000 + 9 * 160
     mov ah, 0x0F
     call print_at
 
-    ; --- 跳到 C kernel entry (0xA100) ---
-    ; kernel 链接在 0xA100, 给 pm.bin (6.5KB) 留足空间
-    jmp 0xA100
+    ; --- 跳到 C kernel entry (0xA200) ---
+    ; 这里必须用 far jump，而不是 nasm 的 near jump imm32。
+    ; 否则 jmp 0xA200 会被编码成相对跳转，不会跳到 0xA200。
+    ; LBA 19 → 0x7E00 + 18*512 = 0xA200
+    db 0xEA
+    dd 0xA200
+    dw 0x0008
 
 ; ============================================================
 ; 辅助：VGA 打印
@@ -129,11 +140,11 @@ print_at:
 ; ============================================================
 build_idt:
     pusha
-    lea edi, [idt_entries]
+    lea edi, [idt_entries ]
     ; 🔥 关键修复：所有 256 项先填 default handler
     mov ecx, 256
 .fill_default:
-    mov eax, isr_default
+    mov eax, isr_default 
     mov [edi], ax               ; offset low
     mov word [edi + 2], 0x08    ; CS
     mov byte [edi + 4], 0
@@ -146,13 +157,13 @@ build_idt:
     jnz .fill_default
 
     ; 覆盖 IRQ0 (IDT 0x20): Timer
-    lea edi, [idt_entries + 0x20 * 8]
-    lea esi, [isr_timer]
+    lea edi, [idt_entries  + 0x20 * 8]
+    lea esi, [isr_timer ]
     call set_idt_entry
 
     ; 覆盖 IRQ1 (IDT 0x21): Keyboard
-    lea edi, [idt_entries + 0x21 * 8]
-    lea esi, [isr_keyboard]
+    lea edi, [idt_entries  + 0x21 * 8]
+    lea esi, [isr_keyboard ]
     call set_idt_entry
     popa
     ret

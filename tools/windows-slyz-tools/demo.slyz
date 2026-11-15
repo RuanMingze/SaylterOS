@@ -1,0 +1,8 @@
+echo Hello from SLYZ on Windows
+ask Continue?
+if yes
+  echo continue path
+endif
+if no
+  echo stop path
+endif

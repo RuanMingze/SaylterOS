@@ -1,4 +1,9 @@
-# Build artifacts
+# ============================================================
+# SaylterOS .gitignore
+# 只保留源码、构建脚本与文档；所有可再生成/调试产物一律忽略。
+# ============================================================
+
+# ---- 构建产物 ----
 build/
 *.o
 *.obj
@@ -6,10 +11,38 @@ build/
 *.elf
 *.img
 *.iso
+*.map
+*.lst
+*.lst2
+*.exe
+*.vsix
+# 历史构建误落在源码目录里的 pm.bin 副本
+/src/boot/pm
 
-# QEMU debug logs
-qemu.log
-serial.log
+# ---- 调试与运行日志 ----
+*.log
+*.pid
+*.ppm
 
-# VS Code
+# ---- Python 工具缓存 ----
+__pycache__/
+*.pyc
+
+# ---- Node.js ----
+node_modules/
+slyz-vscode-extension/node_modules/
+
+# ---- 编辑器 / 工具临时目录 ----
 .vscode/
+.workbuddy/
+.trae/
+.hintrc
+
+# ---- 操作系统垃圾文件 ----
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# ---- 本地临时脚本（需要入库时用 git add -f 强制添加） ----
+/local-*.ps1
+/local-*.slyz

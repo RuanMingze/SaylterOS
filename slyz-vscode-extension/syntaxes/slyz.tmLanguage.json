@@ -1,0 +1,58 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vscode-tmgrammar-test/master/syntaxes/README.md",
+  "name": "SLYZ",
+  "scopeName": "source.slyz",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#keywords" },
+    { "include": "#numbers" },
+    { "include": "#commands" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "match": "#.*$",
+          "name": "comment.line.number-sign.slyz"
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "match": "\"(?:\\\\.|[^\\\"])*\"",
+          "name": "string.quoted.double.slyz"
+        },
+        {
+          "match": "'(?:\\\\.|[^\\'])*'",
+          "name": "string.quoted.single.slyz"
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "match": "\\b(if|else|endif|yes|no|echo|ask|run|dir|ls|exit|quit|write|read|remove|help|clear|version|uname|whoami|date|mem|reboot|gui|ps)\\b",
+          "name": "keyword.control.slyz"
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "match": "\\b\\d+\\b",
+          "name": "constant.numeric.slyz"
+        }
+      ]
+    },
+    "commands": {
+      "patterns": [
+        {
+          "match": "^\\s*[A-Za-z_][A-Za-z0-9_]*",
+          "name": "entity.name.function.slyz"
+        }
+      ]
+    }
+  }
+}

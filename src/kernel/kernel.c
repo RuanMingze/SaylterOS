@@ -7,6 +7,7 @@
 #include "tty.h"
 #include "shell.h"
 #include "io.h"
+#include "acpi.h"
 #ifdef SAYLTER_VBE
 #include "vbe.h"
 #endif
@@ -75,7 +76,7 @@ static void kernel_loading_anim(void) {
     for (int i = 0; i < 16; i++) {
         tty_set_cursor(spin_x, base_row);
         tty_putchar(frames[i % 4]);
-        kernel_delay(20000000);
+        kernel_delay(1000000);
 
         if (i + 1 < 16) {
             tty_set_cursor(spin_x, base_row);
@@ -87,9 +88,11 @@ static void kernel_loading_anim(void) {
     tty_set_cursor(0, base_row + 1);
 }
 
-/* 在 asm _start 之前调用，清 BSS */
+/* 在 asm _start 之前调用，清 BSS — 4 字节对齐快速清零 */
 void _bss_init(void) {
-    for (char *p = _bss_start; p < _bss_end; p++)
+    uint32_t *p = (uint32_t *)((uintptr_t)_bss_start & ~(uintptr_t)3);
+    uint32_t *end = (uint32_t *)((uintptr_t)_bss_end & ~(uintptr_t)3);
+    for (; p < end; p++)
         *p = 0;
 }
 
@@ -114,6 +117,11 @@ void kernel_main(void) {
     printk("\n[KERNEL] SaylterOS C Kernel v0.3 booted!\n");
     printk("[KERNEL] Running in 32-bit protected mode\n");
     printk("[KERNEL] Interrupts enabled (PIC remapped to 0x20)\n");
+
+    /* --- ACPI：只做固定表解析，拿到 PM1 后即可支持 S5 与电源键 --- */
+    int acpi_ready = acpi_init();
+    printk("[KERNEL] ACPI %s\n",
+           acpi_ready ? "PM1 ready (S5 + power button)" : "not available");
 
     /* --- VBE 初始化 (bootloader 已在 RM 设好, 这里读结果) --- */
 #ifdef SAYLTER_VBE
