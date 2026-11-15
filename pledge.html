@@ -471,36 +471,40 @@
       <span class="dot red"></span>
       <span class="dot yellow"></span>
       <span class="dot green"></span>
-      <span class="terminal-title">saylter@pledge — ~/SaylterOS</span>
+      <span class="terminal-title">root@saylter — ~/SaylterOS</span>
     </div>
     <div class="terminal-body">
-      <div><span class="prompt">saylter@pledge</span>:<span class="cmd">~</span>$ cat MISSION.md</div>
+      <div><span class="prompt">root@saylter</span>:<span class="cmd">~</span>$ cat MISSION.md</div>
       <div class="output">
         <br>
         █ MISSION: SaylterOS — 从零构建一个 x86 裸金属操作系统<br>
-        █ TYPE: Real bare-metal OS, boots from raw floppy image<br>
-        █ ARCH: x86 32-bit protected mode -> future long mode<br>
+        █ TYPE: Real bare-metal OS, MBR → protected mode → C/C++ kernel<br>
+        █ ARCH: x86 32-bit protected mode → future long mode + SMP<br>
         █ START: 2026-10-17<br>
-        █ TOOLCHAIN: NASM + Mingw GCC + QEMU + PowerShell<br>
-        █ OUTPUT: bootable .img + shell + keyboard input<br>
+        █ TOOLCHAIN: NASM + MinGW GCC/G++ + PowerShell + QEMU<br>
+        █ OUTPUT: saylter.img / saylter-tty.img / saylter-ide.img<br>
         <br>
-        <span class="success">[OK] 这不是“看教程做 demo”，而是真正从 BIOS → boot → PM → shell → input 一路跑起来了</span><br>
-        <span class="success">[OK] 在两天内完成引导链路、保护模式、TTY、PS/2 键盘状态机和 shell 交互</span><br>
-        <span class="warn">[!] 这不是最终版，但已经说明：裸机 OS 的最小可用闭环已形成</span><br>
+        <span class="success">[OK] SlyzFS：自研 FAT 风格文件系统，目录 / 文件 / 权限全部在文件系统层强制</span><br>
+        <span class="success">[OK] 用户系统：etc/passwd + etc/shadow，SHA-256 加盐，root 默认无密码</span><br>
+        <span class="success">[OK] 内存与任务：1MB 内核堆、per-task 配额、OOM 回收、bg / kill</span><br>
+        <span class="success">[OK] ACPI：FADT 解析、S5 关机、电源键；reboot 走 8042 硬件复位</span><br>
+        <span class="success">[OK] SLYZBIN v1：Windows 编译的二进制字节码可直接在系统里 run</span><br>
       </div>
       <br>
-      <div><span class="prompt">saylter@pledge</span>:<span class="cmd">~</span>$ nasm -f bin boot.asm -o boot.bin &amp;&amp; qemu-system-i386</div>
-      <div class="success">[BOOT] BIOS 0x7C00: SaylterOS Stage 1 (512B MBR)</div>
-      <div class="success">[BOOT] int 0x13 AH=2: stage2 读入 0x7E00... OK</div>
-      <div class="success">[BOOT] jmp 0x7E00: 进入 Stage 2</div>
-      <div class="success">[S2] ASCII banner + VGA + memory/CPU 信息输出</div>
-      <div class="success">[PM] GDT + IDT + PIC 全部加载，进入保护模式</div>
-      <div class="success">[IRQ0] timer IRQ 触发正常</div>
-      <div class="success">[IRQ1] PS/2 keyboard scancode 进入 mailbox</div>
-      <div class="success">[TTY] shell prompt 已出现，并能回显字符</div>
-      <div class="success">[KBD] Shift / Caps / release code 状态机已接近正常键盘语义</div>
-      <div class="warn">[NOTE] 现在优先做的是：更稳的 shell / 时钟 / 键盘状态机。内存管理只在真正需要分页、堆和进程时再做，不盲目提前扩展</div>
-      <div><span class="prompt">saylter@pledge</span>:<span class="cmd">~</span>$ <span class="cursor"></span></div>
+      <div><span class="prompt">root@saylter</span>:<span class="cmd">~</span>$ powershell -NoProfile -File build.ps1</div>
+      <div class="success">[BUILD] VBE kernel = 649412B  → build/saylter.img</div>
+      <div class="success">[BUILD] TTY kernel = 583780B  → build/saylter-tty.img</div>
+      <div class="success">[BUILD] SlyzFS @ LBA2048   → build/saylter-ide.img (32MB)</div>
+      <div><span class="prompt">root@saylter</span>:<span class="cmd">~</span>$ powershell -NoProfile -File run-ide.ps1</div>
+      <div class="success">[BOOT] MBR 0x7C00：分段加载 LBA1..257 → 0x7E00 / 0x10000 / 0x18000 / 0x20000</div>
+      <div class="success">[PM] GDT + IDT + PIC 就绪，进入 32 位保护模式</div>
+      <div class="success">[KERNEL] ACPI PM1 ready (S5 + power button)</div>
+      <div class="success">[FS] SlyzFS mounted: N root entries</div>
+      <div class="success">[INIT] kernel heap @ 0x100000 (1MB), task 0 running</div>
+      <div class="success">SaylterOS login: root</div>
+      <div class="success">root@os:~# </div>
+      <div class="warn">[NOTE] 内存管理与协作式任务已经落地；下一步是扩展 ACPI（MADT / MCFG / HPET）并实现 SMP：启用 local APIC、INIT-SIPI-SIPI 唤醒 AP、任务队列加锁与 per-CPU 调度。硬件分页与虚拟内存仍留到真正需要地址隔离时再做</div>
+      <div><span class="prompt">root@saylter</span>:<span class="cmd">~</span>$ <span class="cursor"></span></div>
     </div>
   </div>
 
