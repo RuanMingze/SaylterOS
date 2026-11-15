@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SaylterOS</title>
+<style>
+  :root {
+    --bg: #05080f;
+    --panel: #0b1220;
+    --line: #1c2b45;
+    --text: #d7e2f2;
+    --muted: #8a9bb5;
+    --accent: #4da3ff;
+    --mono: "Cascadia Code", Consolas, "Courier New", monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh;
+    display: flex; align-items: center; justify-content: center;
+    background:
+      radial-gradient(1100px 560px at 15% -10%, #102a4d 0%, transparent 60%),
+      radial-gradient(900px 480px at 100% 0%, #1a1030 0%, transparent 55%),
+      var(--bg);
+    color: var(--text);
+    font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+    padding: 40px 20px;
+  }
+  .wrap { width: 100%; max-width: 880px; }
+  .kicker {
+    display: inline-block; font-family: var(--mono); font-size: 12px;
+    letter-spacing: .18em; color: var(--accent);
+    border: 1px solid #1e3a5f; background: #0a1a2e;
+    padding: 6px 12px; border-radius: 999px;
+  }
+  h1 { font-size: 40px; margin: 20px 0 8px; letter-spacing: -.5px; }
+  h1 span { color: var(--accent); }
+  p.lede { color: var(--muted); margin: 0 0 36px; max-width: 640px; line-height: 1.7; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 18px; }
+  a.card {
+    display: block; text-decoration: none; color: inherit;
+    background: linear-gradient(180deg, #0f1a2e, var(--panel));
+    border: 1px solid var(--line); border-radius: 16px;
+    padding: 26px 26px 24px; transition: transform .18s ease, border-color .18s ease, box-shadow .18s ease;
+  }
+  a.card:hover {
+    transform: translateY(-3px);
+    border-color: #2b5f96;
+    box-shadow: 0 16px 40px rgba(13, 60, 120, .28);
+  }
+  .card .tag {
+    font-family: var(--mono); font-size: 11px; letter-spacing: .12em;
+    color: var(--accent); text-transform: uppercase;
+  }
+  .card h2 { font-size: 22px; margin: 10px 0 8px; }
+  .card p { margin: 0; color: var(--muted); font-size: 14px; line-height: 1.65; }
+  .card .go {
+    margin-top: 18px; font-family: var(--mono); font-size: 13px; color: var(--accent);
+  }
+  footer { margin-top: 40px; color: #5f6f88; font-size: 12px; font-family: var(--mono); }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <span class="kicker">SAYLTER OS · v0.0.3-ALPHA3</span>
+    <h1>选择要看的<span>文档</span></h1>
+    <p class="lede">一个从 512 字节引导扇区写起的 x86 裸金属操作系统。下面是项目自述与故障恢复指南。</p>
+
+    <div class="grid">
+      <a class="card" href="pledge.html">
+        <div class="tag">PROJECT</div>
+        <h2>项目自述与里程碑</h2>
+        <p>愿景、开发阶段、技术栈、内存布局，以及一路踩过的坑。</p>
+        <div class="go">进入 pledge.html →</div>
+      </a>
+
+      <a class="card" href="bsod-guide.html">
+        <div class="tag">RECOVERY</div>
+        <h2>蓝屏恢复指南</h2>
+        <p>STOP 码含义、恢复步骤，以及蓝屏为什么要冻结中断与磁盘写入。</p>
+        <div class="go">进入 bsod-guide.html →</div>
+      </a>
+    </div>
+
+    <footer>SaylterOS · Real bare-metal x86 OS</footer>
+  </div>
+</body>
+</html>
