@@ -30,6 +30,10 @@ uint16_t acpi_pm1a_evt_port(void);
 uint16_t acpi_pm1a_cnt_port(void);
 uint16_t acpi_pm1b_cnt_port(void);
 
+/* FADT 的 SCI 中断号（通常是 IRQ9；0 表示不可用）。
+ * 中断层用它把硬件 IRQ 转发给 ACPICA 的 SCI 分发器。 */
+uint16_t acpi_sci_irq(void);
+
 /* 轮询 PM1_STS.PWRBTN_STS。
  * 命中时写 1 清除该状态位并返回 1，否则返回 0。
  * 不依赖 SCI 中断路由，可在忙等循环里周期调用。 */
@@ -50,5 +54,9 @@ uint8_t acpi_get_s5_slp_typ(void);
 
 /* 打印 ACPI 摘要（shell 的 acpi 命令使用） */
 void acpi_dump(void);
+
+/* 在 EBDA 与 0xE0000..0xFFFFF 中查找 RSDP，返回其物理地址（0 = 未找到）。
+ * ACPICA 的 AcpiOsGetRootPointer 直接复用这个结果。 */
+uint32_t acpi_find_rsdp_phys(void);
 
 #endif /* ACPI_H */

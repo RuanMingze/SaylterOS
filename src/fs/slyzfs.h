@@ -258,6 +258,14 @@ public:
     /* 解析目录路径并返回其条目副本（根目录返回合成的 uid 0 / 0755 条目）。 */
     bool resolve_dir_entry(const char* path, DirEntry* out);
 
+    /* ---- 容量统计 ---- */
+
+    /* 统计卷容量：total_clusters 为数据区总簇数（受超级块与 FAT 条目数双重约束），
+     * used_clusters 为 FAT 中已分配（非 FAT_FREE）的簇数，cluster_bytes 为每簇字节数。
+     * 任一出参可为 nullptr。未挂载或 FAT 未加载时返回 false。 */
+    bool usage(uint32_t* total_clusters, uint32_t* used_clusters,
+               uint32_t* cluster_bytes) const;
+
     /* ---- 调试 ---- */
 
     /* 打印 FAT 非空闲条目（调试用）。 */

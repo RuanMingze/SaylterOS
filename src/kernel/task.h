@@ -7,6 +7,8 @@
  *   - 状态机 FREE / READY / RUNNING / DEAD
  *   - 可被 OOM 回收：配额超限时任务被标记 DEAD 并释放全部内存
  * 调度为协作式：任务在 VM 循环、shell 空闲处主动 task_yield()。
+ * 每个任务持有独立的内核栈（x86_64 Win64 调用约定），切换点只在
+ * task_yield / task_exit 中，不在中断里切栈。
  * 真正的硬件分页与地址空间隔离尚未实现，见 README 的已知限制。
  * ============================================================ */
 
@@ -33,7 +35,7 @@ struct Task {
     int      id;
     int      state;
     char     name[TASK_NAME_MAX];
-    uint32_t esp;
+    uint64_t rsp;
     void   (*entry)(void);
 
     /* 内存配额与记账 */

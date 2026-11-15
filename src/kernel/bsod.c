@@ -14,15 +14,13 @@
 #include "io.h"
 #include "task.h"
 #include "mem.h"
+#include "tty.h"
 
-#define BSOD_COLS 80
-#define BSOD_ROWS 25
 #define BSOD_ATTR 0x1F          /* 蓝底亮白 */
+#define BSOD_LINE_MAX 128
 
 extern void kserial_puts(const char *s);
 extern void kserial_hex32(uint32_t v);
-
-static uint16_t *const bsod_vga = (uint16_t *)0xB8000;
 
 static int bsod_strlen(const char *s) {
     int n = 0;
@@ -59,12 +57,16 @@ static int bsod_append_hex8(char *dst, int pos, uint32_t v) {
 }
 
 static void bsod_text(int row, int col, const char *text) {
-    if (row < 0 || row >= BSOD_ROWS) return;
-    int i = 0;
-    while (text[i] && col + i < BSOD_COLS) {
-        bsod_vga[row * BSOD_COLS + col + i] =
-            (uint16_t)(((uint16_t)BSOD_ATTR << 8) | (uint8_t)text[i]);
-        i++;
+    if (row < 0 || row >= (int)tty_get_rows()) return;
+    int cols = (int)tty_get_cols();
+    if (col < 0) col = 0;
+    tty_set_color(BSOD_ATTR);
+    tty_set_cursor((uint16_t)col, (uint16_t)row);
+    /* 走 tty 单元格接口：图形/文本后端都能正确落字，
+     * 且不回显串口（崩溃现场只需要一次摘要）。 */
+    while (*text && col < cols) {
+        tty_putchar_vga(*text++);
+        col++;
     }
 }
 
@@ -74,7 +76,7 @@ void bsod(uint32_t stop_code, const char *reason) {
     outb(0x21, 0xFF);           /* 主 PIC 全部屏蔽 */
     outb(0xA1, 0xFF);           /* 从 PIC 全部屏蔽 */
 
-    /* 2. 关闭硬件光标 */
+    /* 2. 关闭光标：tty 自己管理图形/文本光标，这里只需把文本硬件光标关掉 */
     outb(0x3D4, 0x0A);
     outb(0x3D5, 0x20);
 
@@ -86,11 +88,10 @@ void bsod(uint32_t stop_code, const char *reason) {
     kserial_puts("\r\n");
 
     /* 4. 整屏蓝底 */
-    for (int i = 0; i < BSOD_COLS * BSOD_ROWS; i++) {
-        bsod_vga[i] = (uint16_t)(((uint16_t)BSOD_ATTR << 8) | ' ');
-    }
+    tty_set_color(BSOD_ATTR);
+    tty_clear();
 
-    char line[BSOD_COLS + 1];
+    char line[BSOD_LINE_MAX];
 
     int pos = 0;
     pos = bsod_append(line, pos, "SAYLTER OS  v0.3");

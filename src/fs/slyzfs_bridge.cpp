@@ -184,7 +184,7 @@ extern "C" int slyzfs_format_and_mount(void) {
     uint32_t total = ata_total_sectors();
     slog_u32("format: ata_total_sectors = ", total);
     if (total == 0) {
-        FS_PRINTK("[SlyzFS] no disk — cannot format\n");
+        FS_PRINTK("[SlyzFS] no disk - cannot format\n");
         slog("format FAIL: total=0");
         return 0;
     }
@@ -273,15 +273,34 @@ extern "C" int slyzfs_list_dir(const char* path, struct SlyzDirEntry* out, int o
     static slyzfs::DirEntry scratch[256];
     int n = slyzfs::g_fs->list_dir(path ? path : "", scratch, 256);
     if (n < 0) {
+        /* 必须把"路径不存在 / 无读权限"与"空目录"区分开：
+         * 两者都返回 0 会让 shell 把 `dir 不存在` 显示成 (empty directory)，
+         * 用户无法判断是自己敲错了名字还是目录真的为空。 */
         FS_PRINTK("[SlyzFS] list_dir: path not found\n");
         slog("list_dir FAIL: path not found");
-        return 0;
+        return -1;
     }
     int copy = n < out_max ? n : out_max;
     for (int i = 0; i < copy; i++) {
         slyzfs::slyz_memcpy(&out[i], &scratch[i], sizeof(slyzfs::DirEntry));
     }
     return copy;
+}
+
+/* ======================= 容量统计 ======================= */
+
+extern "C" int slyzfs_usage(uint32_t* total_clusters, uint32_t* used_clusters,
+                            uint32_t* cluster_bytes) {
+    if (!slyzfs::g_inited) slyzfs_bridge_init();
+    uint32_t total = 0, used = 0, bytes = 0;
+    if (!slyzfs::g_fs->usage(&total, &used, &bytes)) {
+        slog("usage FAIL: filesystem not mounted");
+        return 0;
+    }
+    if (total_clusters) *total_clusters = total;
+    if (used_clusters)  *used_clusters = used;
+    if (cluster_bytes)  *cluster_bytes = bytes;
+    return 1;
 }
 
 /* ======================= 文件操作 ======================= */

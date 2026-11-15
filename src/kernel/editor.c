@@ -23,14 +23,11 @@
 #include "keyboard.h"
 #include "acpi.h"
 
-/* ---- 屏幕布局 ---- */
-#define ED_COLS        80
-#define ED_ROWS        25
-#define ED_ROW_TITLE   0
-#define ED_ROW_FIRST   1
-#define ED_VIEW_ROWS   22          /* 行 1..22 为编辑区 */
-#define ED_ROW_STATUS  23
-#define ED_ROW_HINT    24
+/* ---- 屏幕布局 ----
+ * 终端行列由 tty 决定（VBE 图形终端通常大于 80x25）：
+ *   第 0 行标题 / 第 1..rows-3 行编辑区 / 倒数第 2 行状态 / 最后一行提示。
+ * ED_MAX_COLS 只用于静态缓冲区定尺寸。 */
+#define ED_MAX_COLS    128
 
 /* ---- VGA 颜色属性（高 4 位背景，低 4 位前景） ---- */
 #define ED_ATTR_TITLE   0x1F       /* 蓝底亮白 */
@@ -56,8 +53,10 @@ static int  ed_hscroll = 0;       /* 水平滚动偏移（字符列） */
 static int  ed_desired_col = 0;   /* 上下移动时保持的目标列 */
 static int  ed_dirty = 0;
 static char ed_path[256];
-static char ed_msg[ED_COLS + 1];
+static char ed_msg[ED_MAX_COLS + 1];
 static int  ed_msg_is_error = 0;
+
+static int ed_view_rows(void);
 
 /* ============================================================
  * 基础工具
@@ -101,8 +100,10 @@ static int ed_append_uint(char *dst, int pos, unsigned int v) {
 }
 
 static void ed_set_msg(const char *text, int is_error) {
+    int limit = (int)tty_get_cols();
+    if (limit > ED_MAX_COLS) limit = ED_MAX_COLS;
     int i = 0;
-    while (text[i] && i < ED_COLS) {
+    while (text[i] && i < limit) {
         ed_msg[i] = text[i];
         i++;
     }
@@ -255,7 +256,7 @@ static void ed_move_vertical(int dir) {
 static void ed_scroll_view(int dir) {
     int total = ed_line_count();
     int line = ed_line_of(ed_cursor);
-    int target_line = line + dir * ED_VIEW_ROWS;
+    int target_line = line + dir * ed_view_rows();
     if (target_line < 0) target_line = 0;
     if (target_line >= total) target_line = total - 1;
 
@@ -268,22 +269,35 @@ static void ed_scroll_view(int dir) {
 }
 
 /* ============================================================
- * VGA 直接绘制
+ * 屏幕绘制 —— 统一走 tty 的单元格接口
+ * ------------------------------------------------------------
+ * 不再直接写 0xB8000：VBE 图形终端下字符要经 16x32 字模渲染，
+ * 只有 tty 知道当前后端与字符栅格。整屏重绘包在 batch 里，
+ * 所有单元格画完后只做一次帧缓冲回写。
  * ============================================================ */
 
-static void ed_put(int row, int col, char ch, uint8_t attr) {
-    if (row < 0 || row >= ED_ROWS || col < 0 || col >= ED_COLS) return;
-    uint16_t *video = (uint16_t *)0xB8000;
-    video[row * ED_COLS + col] = (uint16_t)(((uint16_t)attr << 8) | (uint8_t)ch);
+static int ed_view_rows(void) {
+    int r = (int)tty_get_rows() - 3;   /* 标题 1 行 + 状态 1 行 + 提示 1 行 */
+    return (r > 0) ? r : 1;
+}
+
+static int ed_status_row(void) {
+    int r = (int)tty_get_rows() - 2;
+    return (r > 0) ? r : 0;
+}
+
+static int ed_hint_row(void) {
+    int r = (int)tty_get_rows() - 1;
+    return (r > 0) ? r : 0;
 }
 
 static void ed_fill_row(int row, uint8_t attr) {
-    for (int c = 0; c < ED_COLS; c++) ed_put(row, c, ' ', attr);
+    tty_clear_row((uint16_t)row, attr);
 }
 
 static int ed_put_str(int row, int col, const char *s, uint8_t attr, int limit) {
     while (*s && col < limit) {
-        ed_put(row, col, *s, attr);
+        tty_put_at((uint16_t)col, (uint16_t)row, *s, attr);
         col++;
         s++;
     }
@@ -294,58 +308,68 @@ static void ed_draw(void) {
     int cur_line = ed_line_of(ed_cursor);
     int cur_col = ed_col_of(ed_cursor);
     int total = ed_line_count();
+    int cols = (int)tty_get_cols();
+    int view_rows = ed_view_rows();
+    int status_row = ed_status_row();
+    int hint_row = ed_hint_row();
 
     /* 视口跟随光标 */
     if (cur_line < ed_top_line) ed_top_line = cur_line;
-    if (cur_line >= ed_top_line + ED_VIEW_ROWS) {
-        ed_top_line = cur_line - ED_VIEW_ROWS + 1;
+    if (cur_line >= ed_top_line + view_rows) {
+        ed_top_line = cur_line - view_rows + 1;
     }
     if (ed_top_line > total - 1) ed_top_line = total - 1;
     if (ed_top_line < 0) ed_top_line = 0;
 
     /* 水平滚动跟随 */
     if (cur_col < ed_hscroll) ed_hscroll = cur_col;
-    if (cur_col >= ed_hscroll + ED_COLS) {
-        ed_hscroll = cur_col - ED_COLS + 1;
+    if (cur_col >= ed_hscroll + cols) {
+        ed_hscroll = cur_col - cols + 1;
     }
     if (ed_hscroll < 0) ed_hscroll = 0;
 
+    tty_begin_batch();
+
     /* 标题栏 */
-    ed_fill_row(ED_ROW_TITLE, ED_ATTR_TITLE);
+    ed_fill_row(0, ED_ATTR_TITLE);
     int x = 1;
-    x = ed_put_str(ED_ROW_TITLE, x, " SAYLTER NANO  ", ED_ATTR_TITLE, ED_COLS);
-    x = ed_put_str(ED_ROW_TITLE, x, ed_path, ED_ATTR_TITLE, ED_COLS - 13);
+    x = ed_put_str(0, x, " SAYLTER NANO  ", ED_ATTR_TITLE, cols);
+    int path_limit = cols - 13;
+    if (path_limit < x) path_limit = x;
+    x = ed_put_str(0, x, ed_path, ED_ATTR_TITLE, path_limit);
     if (ed_dirty) {
-        ed_put_str(ED_ROW_TITLE, x, " [Modified]", ED_ATTR_TITLE, ED_COLS);
+        ed_put_str(0, x, " [Modified]", ED_ATTR_TITLE, cols);
     }
 
     /* 编辑区 */
-    for (int r = 0; r < ED_VIEW_ROWS; r++) {
-        ed_fill_row(ED_ROW_FIRST + r, ED_ATTR_TEXT);
+    for (int r = 0; r < view_rows; r++) {
+        int row = 1 + r;
+        if (row >= status_row) break;
+        ed_fill_row(row, ED_ATTR_TEXT);
         int line = ed_top_line + r;
         if (line >= total) continue;
 
         int start = ed_line_start(line);
         int end = ed_line_end(line);
         int col = 0;
-        for (int i = start + ed_hscroll; i < end && col < ED_COLS; i++) {
+        for (int i = start + ed_hscroll; i < end && col < cols; i++) {
             char ch = ed_buf[i];
             if (ch == '\t') {
                 int stop = (col / 4 + 1) * 4;
-                while (col < stop && col < ED_COLS) {
-                    ed_put(ED_ROW_FIRST + r, col, ' ', ED_ATTR_TEXT);
+                while (col < stop && col < cols) {
+                    tty_put_at((uint16_t)col, (uint16_t)row, ' ', ED_ATTR_TEXT);
                     col++;
                 }
             } else {
-                ed_put(ED_ROW_FIRST + r, col, ch, ED_ATTR_TEXT);
+                tty_put_at((uint16_t)col, (uint16_t)row, ch, ED_ATTR_TEXT);
                 col++;
             }
         }
     }
 
     /* 状态栏 */
-    ed_fill_row(ED_ROW_STATUS, ED_ATTR_STATUS);
-    char bar[ED_COLS + 1];
+    ed_fill_row(status_row, ED_ATTR_STATUS);
+    char bar[ED_MAX_COLS + 1];
     int p = 0;
     p = ed_append(bar, p, " Line ");
     p = ed_append_uint(bar, p, (unsigned int)(cur_line + 1));
@@ -357,27 +381,29 @@ static void ed_draw(void) {
     p = ed_append_uint(bar, p, (unsigned int)ed_len);
     p = ed_append(bar, p, " bytes ");
     if (ed_dirty) p = ed_append(bar, p, " *");
-    ed_put_str(ED_ROW_STATUS, 1, bar, ED_ATTR_STATUS, ED_COLS);
+    ed_put_str(status_row, 1, bar, ED_ATTR_STATUS, cols);
 
     /* 提示栏 */
     uint8_t hint_attr = ed_msg_is_error ? 0x4F : ED_ATTR_HINT;
-    ed_fill_row(ED_ROW_HINT, hint_attr);
+    ed_fill_row(hint_row, hint_attr);
     if (ed_msg[0]) {
-        ed_put_str(ED_ROW_HINT, 1, ed_msg, hint_attr, ED_COLS);
+        ed_put_str(hint_row, 1, ed_msg, hint_attr, cols);
     } else {
-        ed_put_str(ED_ROW_HINT, 1,
+        ed_put_str(hint_row, 1,
                    "^S Save   ^X Exit   ^K Delete line   Arrows/Home/End/PgUp/PgDn move",
-                   hint_attr, ED_COLS);
+                   hint_attr, cols);
     }
 
-    /* 硬件光标跟随文本光标 */
-    int screen_row = ED_ROW_FIRST + (cur_line - ed_top_line);
+    /* 光标跟随文本光标（图形终端会自动渲染方块/下划线光标） */
+    int screen_row = 1 + (cur_line - ed_top_line);
     int screen_col = cur_col - ed_hscroll;
-    if (screen_row < ED_ROW_FIRST) screen_row = ED_ROW_FIRST;
-    if (screen_row > ED_ROW_STATUS - 1) screen_row = ED_ROW_STATUS - 1;
+    if (screen_row < 1) screen_row = 1;
+    if (screen_row > status_row - 1) screen_row = status_row - 1;
     if (screen_col < 0) screen_col = 0;
-    if (screen_col >= ED_COLS) screen_col = ED_COLS - 1;
+    if (screen_col >= cols) screen_col = cols - 1;
     tty_set_cursor((uint16_t)screen_col, (uint16_t)screen_row);
+
+    tty_end_batch();
 }
 
 /* ============================================================
@@ -429,7 +455,7 @@ static int ed_save(void) {
     }
 
     ed_dirty = 0;
-    char msg[ED_COLS + 1];
+    char msg[ED_MAX_COLS + 1];
     int p = 0;
     p = ed_append(msg, p, "Saved ");
     p = ed_append_uint(msg, p, (unsigned int)ed_len);
@@ -477,12 +503,15 @@ int editor_run(const char *path) {
 
     ed_strcpy(ed_path, path);
     ed_load();
+    /* 编辑器恒为插入模式：光标用半高实心块，与 shell 的覆盖模式区分 */
+    tty_set_cursor_shape(0x0F, 0x0F);
     ed_draw();
 
     int running = 1;
     while (running) {
         char c = kb_read_char();
         if (c == 0) {
+            tty_tick();
             /* 编辑状态下主机按电源键同样应触发 S5，否则用户会以为系统死了 */
             if (acpi_poll_power_button()) {
                 tty_clear();

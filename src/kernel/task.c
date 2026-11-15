@@ -1,9 +1,10 @@
 /* ============================================================
  * task.c - 任务、内存配额与协作式调度
  * ------------------------------------------------------------
- * 上下文切换只保存 callee-saved 寄存器（ebp/ebx/esi/edi）与 esp，
- * 因为调用约定保证其余寄存器由调用者保存。切换点固定在 task_yield /
- * task_exit 里，不会在中断处理中切栈，避免与 PIC/IDT 状态纠缠。
+ * 上下文切换只保存 Windows x64 ABI 的 callee-saved 寄存器
+ * （rbp/rbx/rdi/rsi/r12-r15）与 rsp，因为调用约定保证其余寄存器
+ * 由调用者保存。切换点固定在 task_yield / task_exit 里，
+ * 不会在中断处理中切栈，避免与 PIC/IDT 状态纠缠。
  * ============================================================ */
 
 #include "task.h"
@@ -11,33 +12,44 @@
 #include "tty.h"
 
 static struct Task g_tasks[TASK_MAX];
-static uint8_t g_stacks[TASK_MAX][TASK_STACK_SIZE];
+static uint8_t g_stacks[TASK_MAX][TASK_STACK_SIZE] __attribute__((aligned(16)));
 static int g_initialized = 0;
 static int g_current = -1;
 static uint32_t g_switch_count = 0;
 
 /* ============================================================
- * 上下文切换（AT&T 语法，-fno-leading-underscore 下符号为 task_switch）
+ * 上下文切换（AT&T 语法，x86_64 符号无前导下划线）
+ * 入参：rcx = &old_rsp，rdx = new_rsp
+ *
+ * 保存顺序（压栈）：rbp rbx rdi rsi r12 r13 r14 r15
+ * 因此 esp 指向 r15，恢复时反向弹出，最后 ret 回到切换点。
  * ============================================================ */
 __asm__(
     ".globl task_switch\n"
     ".text\n"
     "task_switch:\n"
-    "    pushl %ebp\n"
-    "    pushl %ebx\n"
-    "    pushl %esi\n"
-    "    pushl %edi\n"
-    "    movl 20(%esp), %eax\n"     /* old_esp */
-    "    movl %esp, (%eax)\n"
-    "    movl 24(%esp), %esp\n"     /* new_esp */
-    "    popl %edi\n"
-    "    popl %esi\n"
-    "    popl %ebx\n"
-    "    popl %ebp\n"
+    "    pushq %rbp\n"
+    "    pushq %rbx\n"
+    "    pushq %rdi\n"
+    "    pushq %rsi\n"
+    "    pushq %r12\n"
+    "    pushq %r13\n"
+    "    pushq %r14\n"
+    "    pushq %r15\n"
+    "    movq %rsp, (%rcx)\n"      /* old_rsp = rsp */
+    "    movq %rdx, %rsp\n"       /* rsp = new_rsp */
+    "    popq %r15\n"
+    "    popq %r14\n"
+    "    popq %r13\n"
+    "    popq %r12\n"
+    "    popq %rsi\n"
+    "    popq %rdi\n"
+    "    popq %rbx\n"
+    "    popq %rbp\n"
     "    ret\n"
 );
 
-extern void task_switch(uint32_t *old_esp, uint32_t new_esp);
+extern void task_switch(uint64_t *old_rsp, uint64_t new_rsp);
 
 /* ============================================================
  * 内部工具
@@ -80,7 +92,7 @@ void task_init(void) {
     for (int i = 0; i < TASK_MAX; i++) {
         g_tasks[i].id = i;
         g_tasks[i].state = TASK_FREE;
-        g_tasks[i].esp = 0;
+        g_tasks[i].rsp = 0;
         g_tasks[i].entry = 0;
         g_tasks[i].quota = TASK_QUOTA_DEFAULT;
         g_tasks[i].used = 0;
@@ -150,14 +162,23 @@ int task_spawn(const char *name, void (*entry)(void), uint32_t quota) {
     }
     t->name[i] = '\0';
 
-    /* 构造初始栈帧：pop edi/esi/ebx/ebp 之后 ret 到 trampoline */
-    uint32_t *top = (uint32_t *)(g_stacks[id] + TASK_STACK_SIZE);
-    *(--top) = (uint32_t)(uintptr_t)task_trampoline;   /* ret 目标 */
-    *(--top) = 0;                                       /* ebp */
-    *(--top) = 0;                                       /* ebx */
-    *(--top) = 0;                                       /* esi */
-    *(--top) = 0;                                       /* edi */
-    t->esp = (uint32_t)(uintptr_t)top;
+    /* 构造初始栈帧（高 -> 低）：
+     *   pad, trampoline, rbp, rbx, rdi, rsi, r12, r13, r14, r15
+     * task_switch 恢复时依次 pop r15..rbp，最后 ret 跳到 trampoline；
+     * 多垫一个 qword 让 trampoline 入口 rsp % 16 == 8，
+     * 符合 Win64 函数入口约定（返回地址占 8 字节）。 */
+    uint64_t *top = (uint64_t *)(g_stacks[id] + TASK_STACK_SIZE);
+    *(--top) = 0;                                       /* pad */
+    *(--top) = (uint64_t)(uintptr_t)task_trampoline;    /* ret 目标 */
+    *(--top) = 0;                                       /* rbp */
+    *(--top) = 0;                                       /* rbx */
+    *(--top) = 0;                                       /* rdi */
+    *(--top) = 0;                                       /* rsi */
+    *(--top) = 0;                                       /* r12 */
+    *(--top) = 0;                                       /* r13 */
+    *(--top) = 0;                                       /* r14 */
+    *(--top) = 0;                                       /* r15 */
+    t->rsp = (uint64_t)(uintptr_t)top;
 
     return id;
 }
@@ -176,7 +197,7 @@ void task_yield(void) {
     g_tasks[next].state = TASK_RUNNING;
     g_switch_count++;
 
-    task_switch(&g_tasks[prev].esp, g_tasks[next].esp);
+    task_switch(&g_tasks[prev].rsp, g_tasks[next].rsp);
 
     /* 切回本任务后恢复中断 */
     __asm__ volatile ("sti");
@@ -208,7 +229,7 @@ void task_exit(int code) {
     g_current = next;
     g_tasks[next].state = TASK_RUNNING;
     g_switch_count++;
-    task_switch(&t->esp, g_tasks[next].esp);
+    task_switch(&t->rsp, g_tasks[next].rsp);
 
     /* DEAD 任务不会再被调度，永远不会回到这里 */
     for (;;) {
@@ -303,7 +324,7 @@ void task_oom_kill(uint32_t requested) {
     __asm__ volatile ("cli");
     g_current = next;
     g_tasks[next].state = TASK_RUNNING;
-    task_switch(&t->esp, g_tasks[next].esp);
+    task_switch(&t->rsp, g_tasks[next].rsp);
 
     for (;;) {
         __asm__ volatile ("cli; hlt");

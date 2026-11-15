@@ -363,6 +363,8 @@ void auth_read_line(char *buf, int max) {
     while (1) {
         char c = kb_read_char();
         if (c == 0) {
+            /* 空闲等待时驱动光标闪烁 */
+            tty_tick();
             auth_pause();
             continue;
         }
@@ -393,6 +395,8 @@ void auth_read_password(char *buf, int max) {
     while (1) {
         char c = kb_read_char();
         if (c == 0) {
+            /* 空闲等待时驱动光标闪烁 */
+            tty_tick();
             auth_pause();
             continue;
         }

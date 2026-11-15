@@ -339,7 +339,7 @@ uint16_t SlyzFS::alloc_cluster() {
         }
     }
 
-    SLYZ_FPRINTF(stderr, "[SlyzFS] disk full — no free cluster\n");
+    SLYZ_FPRINTF(stderr, "[SlyzFS] disk full - no free cluster\n");
     return FAT_END;
 }
 
@@ -1334,6 +1334,31 @@ DirEntry* SlyzFS::stat(const char* path) {
     DirEntry* de = find_entry_in_dir(parent_cluster, name);
     if (!de || de->type == DIR_DELETED) return nullptr;
     return de;
+}
+
+/* ======================= 容量统计 ======================= */
+
+bool SlyzFS::usage(uint32_t* total_clusters, uint32_t* used_clusters,
+                   uint32_t* cluster_bytes) const {
+    if (!mounted_ || !fat_) return false;
+
+    /* 有效簇号区间是 [2, sb_.total_clusters + 2)：簇号 N 对应
+     * data_start_sector + (N - 2) * cluster_size，因此数据区最后一个簇号是
+     * total_clusters + 1。FAT 尾部超出该区间的条目虽然存在，但不对应任何磁盘扇区，
+     * 统计时必须按超级块上界裁剪，否则剩余空间会被高估。 */
+    uint32_t limit = sb_.total_clusters + 2u;
+    if (limit > fat_size_) limit = fat_size_;
+    if (limit < 2u) limit = 2u;
+
+    uint32_t used = 0;
+    for (uint32_t i = 2; i < limit; i++) {
+        if (fat_[i] != FAT_FREE) used++;
+    }
+
+    if (total_clusters) *total_clusters = limit - 2u;
+    if (used_clusters)  *used_clusters = used;
+    if (cluster_bytes)  *cluster_bytes = (uint32_t)sb_.cluster_size * SLYZ_SECTOR_SIZE;
+    return true;
 }
 
 /* ======================= 调试 ======================= */

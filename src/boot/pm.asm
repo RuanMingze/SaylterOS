@@ -1,8 +1,61 @@
 ; ============================================================
-; SaylterOS pm.asm - Phase 2 完整版
-; GDT ✅ (已验证) → PIC → IDT → ISR → STI → IRQ0+IRQ1
+; SaylterOS pm.asm - 实模式 -> 32 位 -> 64 位长模式
+; ------------------------------------------------------------
+; 职责：
+;   1. 实模式：VBE BIOS 模式设置（int 0x10），结果写到 0x7DF0
+;   2. 16 -> 32 位保护模式（GDT 0x08 代码 / 0x10 数据）
+;   3. 建 4GB 恒等映射页表（PML4 + PDPT + 4 x PD，2MB 大页）
+;   4. 32 -> 64 位长模式（CR4.PAE / CR3 / EFER.LME / CR0.PG）
+;   5. 建 64 位 IDT + PIC remap + 开中断
+;   6. 跳到内核入口 0x10000
+;
+; 物理内存布局（与 boot.asm / linker.ld 保持一致）：
+;   0x06000 - 0x06FFF : 64 位 IDT（256 x 16B）
+;   0x07000 - 0x075FF : 页表（PML4 0x70000, PDPT 0x71000, 4 x PD 0x72000..）
+;   0x07DF0           : VBE 结果结构（C 层读取）
+;   0x08600 - ...     : 本文件（pm.bin，由 stage2 从 0x7E00 跳入）
+;   0x09C00 / 0x09E00 : VBE 查询缓冲区（仅实模式使用）
+;   0x100000 - ...    : 内核映像（本文件在 32 位模式下用 ATA PIO 搬运）
+;   0x3FF000          : 内核初始栈顶（向下增长到内核镜像之上）
+;
+; 注意：本文件必须以 -f bin 汇编，且代码+数据长度必须小于
+;       0x9C00 - 0x8600 = 0x1600 字节（build.ps1 会自检），
+;       否则会覆盖 VBE 实模式缓冲区。
+;
+; 为什么内核改由 ATA PIO 搬运：内核带 AML 解释器后会超过 640KB，
+; BIOS int 13h 的实模式段:偏移寻址无法可靠写入 1MB 以上，
+; 而 32 位保护模式下 ATA PIO 可以直接写任意物理地址。
 ; ============================================================
+
 ORG 0x8600
+
+KERNEL_ENTRY   equ 0x100000
+KERNEL_LBA     equ 19          ; 内核起始扇区（与 build.ps1 的 SECTOR_KERNEL 一致）
+STACK_TOP      equ 0x3FF000    ; 内核初始栈顶（< 内核堆基址 0x400000）
+
+; 内核占用扇区数，由 build.ps1 按 kernel.bin 实际大小计算后 -D 传入
+%ifndef KERNEL_SECTORS
+%define KERNEL_SECTORS 900
+%endif
+
+IDT_BASE       equ 0x60000
+idt_entries    equ IDT_BASE     ; 256 x 16B，运行时由 build_idt64 填充
+PML4_BASE      equ 0x70000
+PDPT_BASE      equ 0x71000
+PD_BASE        equ 0x72000
+VBE_RESULT     equ 0x7DF0
+VBE_CTL_BUF    equ 0x9C00   ; 0x9C00 - 0x9DFF (512B)
+VBE_MODE_BUF   equ 0x9E00   ; 0x9E00 - 0x9EFF (256B)
+
+; SCI 回调地址（内核在 ACPICA 初始化完成后写入，0 = 未安装）。
+; 放在 VBE_RESULT 之前的 8 字节空隙，避免与引导参数结构冲突。
+; ISR 直接间接调用它：SCI 是电平触发，必须在中断上下文里清掉 GPE，
+; 否则 EOI 之后电平仍有效会立刻重入，形成中断风暴。
+SCI_CALLBACK_ADDR equ 0x7DE8
+
+; ============================================================
+; 实模式入口
+; ============================================================
 [BITS 16]
 
 pm_start:
@@ -11,315 +64,894 @@ pm_start:
     mov ds, ax
     mov es, ax
     mov ss, ax
-    mov sp, 0x8000
+    mov sp, 0x7000
 
-    ; ========================================
-    ; VBE BIOS 初始化 (Real Mode, 切 PM 之前)
-    ; SAYLTER_VBE 宏开启 (-DSAYLTER_VBE=1)
-    ; ========================================
-%ifdef SAYLTER_VBE
+    ; SCI 回调尚未注册
+    mov dword [SCI_CALLBACK_ADDR], 0
+    mov dword [SCI_CALLBACK_ADDR + 4], 0
+
+    ; 键盘环形缓冲头尾清零（ISR 在进入长模式后才会写）
+    mov word [0xA000], 0
+    mov word [0xA002], 0
+
+    ; A20 必须打开：内核镜像搬到 1MB 以上，ATA PIO 直接写高地址
+    call enable_a20_16
+
+    ; --- VBE BIOS 模式设置：终端统一走图形模式 ---
+    ; 失败时 magic = 0，C 层自动回退到 80x25 文本终端。
+    ; BIOS 的 VBE 调用可能改写 UART 的 LCR/DLAB，导致后续串口日志丢失，
+    ; 因此调用前后各重初始化一次 COM1。
+    call serial_init16
     call vbe_init
-%endif
+    call serial_init16
 
+    cmp word [VBE_RESULT], 0xA1B2
+    jne .vbe_failed
+    mov si, msg_vbe_ok
+    call serial_puts16
+    jmp .vbe_done
+.vbe_failed:
+    mov si, msg_vbe_fail
+    call serial_puts16
+.vbe_done:
+
+    ; --- 进入 32 位保护模式 ---
     lgdt [gdt_descriptor]
 
     mov eax, cr0
     or eax, 1
     mov cr0, eax
 
-    ; 显式编码 far jump (BITS 16 下必须是 5 字节: EA + 2+2)
-    ; dw 是 16-bit 偏移，CPU 在实模式下读取后切到保护模式
+    ; 远跳：EA + 16 位偏移 + 16 位选择子（实模式下编码）
     db 0xEA
     dw pm_entry
     dw 0x0008
 
+; ============================================================
+; 打开 A20（Fast A20 Gate，端口 0x92 bit1）
+; 保留 bit0（原为快速复位位，写 1 会复位机器）
+; ============================================================
+enable_a20_16:
+    in al, 0x92
+    test al, 0x02
+    jnz .done
+    or al, 0x02
+    and al, 0xFE
+    out 0x92, al
+.done:
+    ret
+
+; ============================================================
+; 16 位串口初始化：COM1 9600 8N1，DTR/RTS/OUT1/OUT2 置位
+; 破坏：ax, dx
+; ============================================================
+serial_init16:
+    push ax
+    push dx
+    mov dx, 0x3F8 + 3    ; LCR: DLAB=1
+    mov al, 0x83
+    out dx, al
+    mov dx, 0x3F8 + 0    ; divisor low = 12 (115200 / 9600)
+    mov al, 12
+    out dx, al
+    mov dx, 0x3F8 + 1    ; divisor high = 0
+    xor al, al
+    out dx, al
+    mov dx, 0x3F8 + 3    ; LCR: DLAB=0, 8N1
+    mov al, 0x03
+    out dx, al
+    mov dx, 0x3F8 + 4    ; MCR: DTR|RTS|OUT1|OUT2
+    mov al, 0x0F
+    out dx, al
+    pop dx
+    pop ax
+    ret
+
+; ============================================================
+; 16 位串口输出（带等待超时，避免 LSR 异常时死循环）
+; 入参：AL = 字符
+; ============================================================
+serial_putc16:
+    push ax
+    push dx
+    push cx
+    mov ah, al
+    mov cx, 0
+.wait:
+    mov dx, 0x3FD
+    in al, dx
+    test al, 0x20
+    jnz .ready
+    loop .wait
+.ready:
+    mov dx, 0x3F8
+    mov al, ah
+    out dx, al
+    pop cx
+    pop dx
+    pop ax
+    ret
+
+; 入参：SI = 0 结尾字符串
+serial_puts16:
+    push ax
+    push si
+.loop:
+    lodsb
+    test al, al
+    jz .done
+    call serial_putc16
+    jmp .loop
+.done:
+    pop si
+    pop ax
+    ret
+
+; ============================================================
+; 32 位保护模式入口
+; ============================================================
 [BITS 32]
-; NASM -f bin + ORG 会自动把 label 值设为 ORG + 文件内偏移（即物理地址）
-; 所以所有 label 已经是正确的物理地址，直接使用即可，不能再 ！
 
 pm_entry:
     mov ax, 0x10
     mov ds, ax
     mov es, ax
     mov ss, ax
-    mov esp, 0x9FFFF
+    mov esp, 0x09FFF0
+    cld
 
-    ; --- 清屏 ---
-    mov edi, 0xB8000
-    mov ecx, 2000
-    mov eax, 0x0720
-    rep stosw
+    mov esi, msg_pm32
+    call serial_puts32
 
-    ; --- VGA 打印辅助 (esi=字符串, edi=VGA地址, ah=颜色) ---
-    ; 复用 ax, esi, edi, 会被覆盖
-    ; 调用前设置好 esi, edi, ah
+    ; ---------- ATA PIO：把内核从 LBA19 搬到 0x100000 ----------
+    mov esi, msg_load
+    call serial_puts32
 
-    ; ========================================
-    ; Step 1: PIC 8259 重映射
-    ; ========================================
-    mov al, 0x11          ; ICW1: edge-triggered, cascade, need ICW4
-    out 0x20, al
-    mov al, 0x20          ; ICW2: IRQ0-7 → IDT 0x20-0x27
-    out 0x21, al
-    mov al, 0x04          ; ICW3: master 上 IRQ2 连 slave
-    out 0x21, al
-    mov al, 0x01          ; ICW4: 8086 mode
-    out 0x21, al
-    mov al, 0xFC          ; IMR: 开 IRQ0(timer) + IRQ1(keyboard)
-    out 0x21, al
+    mov eax, KERNEL_LBA
+    mov ebp, KERNEL_SECTORS
+    mov edi, KERNEL_ENTRY
+    call ata_load_kernel32
+    jc .load_failed
 
-    mov al, 0x11          ; Slave PIC
-    out 0xA0, al
-    mov al, 0x28          ; ICW2: IRQ8-15 → IDT 0x28-0x2F
-    out 0xA1, al
-    mov al, 0x02          ; ICW3: slave 接 master IRQ2
-    out 0xA1, al
-    mov al, 0x01          ; ICW4
-    out 0xA1, al
-    mov al, 0xFF          ; Slave: 全屏蔽
-    out 0xA1, al
+    mov esi, msg_loaded
+    call serial_puts32
+    jmp .load_done
 
-    mov esi, msg_pic_ok 
-    mov edi, 0xB8000 + 2 * 160
-    mov ah, 0x2F
-    call print_at
+.load_failed:
+    mov esi, msg_load_fail
+    call serial_puts32
+.halt_load:
+    cli
+    hlt
+    jmp .halt_load
 
-    ; ========================================
-    ; Step 2: 构建 IDT
-    ; ========================================
-    call build_idt
+.load_done:
+    call build_page_tables
 
-    mov esi, msg_idt_ok 
-    mov edi, 0xB8000 + 4 * 160
-    mov ah, 0x2F
-    call print_at
+    mov esi, msg_paging
+    call serial_puts32
 
-    lidt [idtr ]
+    ; ---------- 打开 PAE + 装入 PML4 ----------
+    mov eax, cr4
+    or eax, 0x20
+    mov cr4, eax
 
-    mov esi, msg_idtr_ok 
-    mov edi, 0xB8000 + 6 * 160
-    mov ah, 0x2F
-    call print_at
+    mov eax, PML4_BASE
+    mov cr3, eax
 
-    ; ========================================
-    ; Step 3: 开中断 + 跳到 C kernel
-    ; ========================================
-    sti
+    ; ---------- EFER.LME = 1 ----------
+    mov ecx, 0xC0000080
+    rdmsr
+    or eax, 0x100
+    wrmsr
 
-    mov esi, msg_sti_ok 
-    mov edi, 0xB8000 + 9 * 160
-    mov ah, 0x0F
-    call print_at
+    ; ---------- CR0.PG = 1，正式进入长模式 ----------
+    mov eax, cr0
+    or eax, 0x80000000
+    mov cr0, eax
 
-    ; --- 跳到 C kernel entry (0xA200) ---
-    ; 这里必须用 far jump，而不是 nasm 的 near jump imm32。
-    ; 否则 jmp 0xA200 会被编码成相对跳转，不会跳到 0xA200。
-    ; LBA 19 → 0x7E00 + 18*512 = 0xA200
+    ; 远跳进 64 位代码段（0x18，L=1）：EA + 32 位偏移 + 16 位选择子
     db 0xEA
-    dd 0xA200
-    dw 0x0008
+    dd long_mode_entry
+    dw 0x0018
 
 ; ============================================================
-; 辅助：VGA 打印
-; 入参: esi=字符串, edi=VGA地址, ah=颜色
-; 破坏: al, esi, edi
+; ATA PIO 读取内核镜像到指定物理地址
+; 入参：EAX = 起始 LBA，EBP = 扇区数，EDI = 目标物理地址
+; 出参：CF = 0 成功 / CF = 1 失败
+; 说明：只用主通道（0x1F0），28 位 LBA，PIO 单扇区读，
+;       与 SlyzFS 的磁盘访问方式一致（同一块 IDE 盘）。
+; 破坏：eax/ebx/ecx/edx/esi/edi/ebp
 ; ============================================================
-print_at:
-    mov al, [esi]
+ata_load_kernel32:
+    push eax
+    push ebx
+    push ecx
+    push edx
+    push esi
+    push edi
+
+    mov esi, eax                 ; ESI = 当前 LBA
+
+    ; 探测：主通道状态寄存器全 1 表示总线无设备
+    mov dx, 0x1F7
+    in al, dx
+    cmp al, 0xFF
+    je .fail
+
+.next_sector:
+    test ebp, ebp
+    jz .ok
+
+    ; 等 BSY 清除（轮询上限约 2M 次）
+    mov ecx, 0x200000
+.wait_bsy:
+    mov dx, 0x1F7
+    in al, dx
+    test al, 0x80
+    jz .bsy_clear
+    dec ecx
+    jnz .wait_bsy
+    jmp .fail
+.bsy_clear:
+
+    ; 驱动器/磁头：主盘 + LBA 高 4 位（0xE0 = LBA 模式）
+    mov ebx, esi
+    shr ebx, 24
+    and ebx, 0x0F
+    or ebx, 0xE0
+    mov dx, 0x1F6
+    mov al, bl
+    out dx, al
+
+    ; 扇区计数 = 1
+    mov dx, 0x1F2
+    mov al, 1
+    out dx, al
+
+    ; LBA[7:0]
+    mov ebx, esi
+    mov dx, 0x1F3
+    mov al, bl
+    out dx, al
+
+    ; LBA[15:8]
+    mov ebx, esi
+    shr ebx, 8
+    mov dx, 0x1F4
+    mov al, bl
+    out dx, al
+
+    ; LBA[23:16]
+    mov ebx, esi
+    shr ebx, 16
+    mov dx, 0x1F5
+    mov al, bl
+    out dx, al
+
+    ; READ SECTORS = 0x20
+    mov dx, 0x1F7
+    mov al, 0x20
+    out dx, al
+
+    ; 等 DRQ 置位
+    mov ecx, 0x200000
+.wait_drq:
+    mov dx, 0x1F7
+    in al, dx
+    test al, 0x80
+    jnz .drq_retry
+    test al, 0x08
+    jnz .drq_ready
+    test al, 0x01
+    jnz .fail
+.drq_retry:
+    dec ecx
+    jnz .wait_drq
+    jmp .fail
+
+.drq_ready:
+    ; rep insw 会自动推进 EDI（256 个 word = 512 字节）
+    mov ecx, 256
+    mov dx, 0x1F0
+    rep insw
+
+    inc esi
+    dec ebp
+    jmp .next_sector
+
+.ok:
+    pop edi
+    pop esi
+    pop edx
+    pop ecx
+    pop ebx
+    pop eax
+    clc
+    ret
+
+.fail:
+    pop edi
+    pop esi
+    pop edx
+    pop ecx
+    pop ebx
+    pop eax
+    stc
+    ret
+
+; ============================================================
+; 建 4GB 恒等映射页表，2MB 大页
+;   PML4[0]  -> PDPT
+;   PDPT[0..3] -> 4 个 PD（每个覆盖 1GB）
+;   每个 PD 512 项，每项 2MB
+; 破坏：eax/ecx/edx/edi（已用 pushad 保护）
+; ============================================================
+build_page_tables:
+    pushad
+    cld
+
+    ; 清零 5 个页（PML4 + PDPT + 4 个 PD = 0x70000..0x75FFF）
+    mov edi, PML4_BASE
+    xor eax, eax
+    mov ecx, (5 * 4096) / 4
+    rep stosd
+
+    ; PML4[0] = PDPT | P | RW
+    mov dword [PML4_BASE], (PDPT_BASE + 0x03)
+
+    ; PDPT[0..3] = 4 个 PD | P | RW
+    mov edi, PDPT_BASE
+    mov eax, PD_BASE
+    mov ecx, 4
+.pdpt_loop:
+    mov edx, eax
+    or edx, 0x03
+    mov [edi], edx
+    add edi, 8
+    add eax, 0x1000
+    dec ecx
+    jnz .pdpt_loop
+
+    ; 4 x 512 项：phys N*2MB | P | RW | PS
+    mov edi, PD_BASE
+    mov eax, 0x00000083
+    mov ecx, 2048
+.pd_loop:
+    mov edx, eax
+    mov [edi], edx
+    mov dword [edi + 4], 0
+    add edi, 8
+    add eax, 0x200000
+    dec ecx
+    jnz .pd_loop
+
+    popad
+    ret
+
+; ============================================================
+; 32 位串口输出
+; ============================================================
+serial_putc32:
+    push eax
+    push edx
+    push ecx
+    mov ah, al
+    mov ecx, 0x10000
+.wait:
+    mov dx, 0x3FD
+    in al, dx
+    test al, 0x20
+    jnz .ready
+    dec ecx
+    jnz .wait
+.ready:
+    mov dx, 0x3F8
+    mov al, ah
+    out dx, al
+    pop ecx
+    pop edx
+    pop eax
+    ret
+
+; 入参：ESI = 0 结尾字符串
+serial_puts32:
+    push eax
+    push esi
+.loop:
+    lodsb
     test al, al
     jz .done
-    mov [edi], ax
-    inc esi
-    add edi, 2
-    jmp print_at
+    call serial_putc32
+    jmp .loop
 .done:
+    pop esi
+    pop eax
     ret
 
 ; ============================================================
-; 构建 IDT 表
+; 64 位长模式入口
 ; ============================================================
-build_idt:
-    pusha
-    lea edi, [idt_entries ]
-    ; 🔥 关键修复：所有 256 项先填 default handler
-    mov ecx, 256
-.fill_default:
-    mov eax, isr_default 
-    mov [edi], ax               ; offset low
-    mov word [edi + 2], 0x08    ; CS
-    mov byte [edi + 4], 0
-    mov byte [edi + 5], 0x8E    ; P=1, DPL=0, interrupt gate
-    shr eax, 16
-    mov [edi + 6], ax           ; offset high
-    mov byte [edi + 7], 0
-    add edi, 8
+[BITS 64]
+default abs
+
+long_mode_entry:
+    mov ax, 0x20
+    mov ds, ax
+    mov es, ax
+    mov ss, ax
+    mov rsp, STACK_TOP
+    cld
+
+    mov rsi, msg_long
+    call serial_puts64
+
+    call build_idt64
+    lidt [idtr64]
+
+    mov rsi, msg_idt
+    call serial_puts64
+
+    call pic_remap64
+
+    mov rsi, msg_irq
+    call serial_puts64
+
+    sti
+
+    mov rax, KERNEL_ENTRY
+    jmp rax
+
+; ============================================================
+; 64 位串口输出
+; ============================================================
+serial_putc64:
+    push rax
+    push rdx
+    push rcx
+    mov ah, al
+    mov ecx, 0x10000
+.wait:
+    mov dx, 0x3FD
+    in al, dx
+    test al, 0x20
+    jnz .ready
     dec ecx
-    jnz .fill_default
-
-    ; 覆盖 IRQ0 (IDT 0x20): Timer
-    lea edi, [idt_entries  + 0x20 * 8]
-    lea esi, [isr_timer ]
-    call set_idt_entry
-
-    ; 覆盖 IRQ1 (IDT 0x21): Keyboard
-    lea edi, [idt_entries  + 0x21 * 8]
-    lea esi, [isr_keyboard ]
-    call set_idt_entry
-    popa
+    jnz .wait
+.ready:
+    mov dx, 0x3F8
+    mov al, ah
+    out dx, al
+    pop rcx
+    pop rdx
+    pop rax
     ret
 
-; EDI = entry addr, ESI = handler addr
-set_idt_entry:
-    mov eax, esi
-    mov [edi], ax          ; offset low 16
-    mov word [edi + 2], 0x08    ; CS = Code Segment
-    mov byte [edi + 4], 0        ; reserved
-    mov byte [edi + 5], 0x8E     ; P=1, DPL=0, S=1 (interrupt gate 32-bit)
-    shr eax, 16
-    mov [edi + 6], ax          ; offset high 16
+; 入参：RSI = 0 结尾字符串
+serial_puts64:
+    push rax
+    push rsi
+.loop:
+    lodsb
+    test al, al
+    jz .done
+    call serial_putc64
+    jmp .loop
+.done:
+    pop rsi
+    pop rax
     ret
 
 ; ============================================================
-; ISR 存根
+; 构建 256 项 64 位 IDT（16B/项，位于 0x60000）
+;   - 0..31   : 异常诊断入口（打印向量号后停机）
+;   - 0x20    : PIT 定时器
+;   - 0x21    : PS/2 键盘
+;   - 其余    : 忽略型默认门（EOI 双 PIC + iretq）
 ; ============================================================
+build_idt64:
+    push rdi
+    push rsi
+    push rcx
+    push rdx
+    push rax
+
+    lea rdi, [idt_entries]
+    mov ecx, 256
+.fill:
+    mov rax, isr_default
+    call set_gate64
+    add rdi, 16
+    dec ecx
+    jnz .fill
+
+    ; 32 个异常入口（地址表在 exc_table）
+    lea rsi, [exc_table]
+    xor ecx, ecx
+.exc:
+    mov rax, [rsi + rcx * 8]
+    mov rdi, rcx
+    shl rdi, 4
+    add rdi, idt_entries
+    call set_gate64
+    inc ecx
+    cmp ecx, 32
+    jb .exc
+
+    ; IRQ0 / IRQ1
+    mov rax, isr_timer
+    mov rdi, idt_entries + 0x20 * 16
+    call set_gate64
+
+    mov rax, isr_keyboard
+    mov rdi, idt_entries + 0x21 * 16
+    call set_gate64
+
+    ; IRQ9 = SCI（从片 IRQ1 → 主片 IRQ2 级联 → 向量 0x29）
+    mov rax, isr_sci
+    mov rdi, idt_entries + 0x29 * 16
+    call set_gate64
+
+    pop rax
+    pop rdx
+    pop rcx
+    pop rsi
+    pop rdi
+    ret
+
+; ============================================================
+; 写一个中断门
+; 入参：RAX = handler 地址，RDI = 门结构地址
+; 破坏：RAX
+; ============================================================
+set_gate64:
+    mov [rdi], ax
+    mov word [rdi + 2], 0x0018      ; CS = 64 位代码段
+    mov byte [rdi + 4], 0           ; IST = 0
+    mov byte [rdi + 5], 0x8E        ; P=1, DPL=0, 64 位中断门
+    shr rax, 16
+    mov [rdi + 6], ax
+    shr rax, 16
+    mov [rdi + 8], eax
+    mov dword [rdi + 12], 0
+    ret
+
+; ============================================================
+; PIC 8259 重映射：IRQ0-7 -> 0x20-0x27，IRQ8-15 -> 0x28-0x2F
+;   主片开放 IRQ0(timer) / IRQ1(keyboard) / IRQ2(cascade)
+;   从片只开放 IRQ9(SCI)
+;   ELCR 把 IRQ9 设为电平触发：ACPI SCI 是低电平有效、共享的，
+;   边沿触发会漏事件（QEMU 的 PIIX4 与真实芯片组都遵循这条）。
+; ============================================================
+pic_remap64:
+    mov al, 0x11
+    out 0x20, al
+    mov al, 0x20
+    out 0x21, al
+    mov al, 0x04
+    out 0x21, al
+    mov al, 0x01
+    out 0x21, al
+    mov al, 0xF8                ; IRQ0/1/2 开放
+    out 0x21, al
+
+    mov al, 0x11
+    out 0xA0, al
+    mov al, 0x28
+    out 0xA1, al
+    mov al, 0x02
+    out 0xA1, al
+    mov al, 0x01
+    out 0xA1, al
+    mov al, 0xFD                ; 只开放 IRQ9
+    out 0xA1, al
+
+    ; ELCR（0x4D0 主片 / 0x4D1 从片）：IRQ9 = 从片 bit1
+    ; 注意端口号 > 0xFF，必须放 DX 用 in/out dx 访问，
+    ; `out 0x4D1, al` 会被 NASM 截断成 0xD1 并写坏 DMA 控制器。
+    mov dx, 0x4D1
+    in al, dx
+    or al, 0x02
+    out dx, al
+    ret
+
+; ============================================================
+; 中断 / 异常入口
+; ============================================================
+%macro EXC_STUB 1
+isr_exc%1:
+    push qword %1
+    jmp exc_common
+%endmacro
+
+%assign exc_index 0
+%rep 32
+    EXC_STUB exc_index
+%assign exc_index exc_index + 1
+%endrep
+
+; 异常统一出口：串口打印向量号后停机（不做恢复，异常即内核 bug）
+exc_common:
+    pop rdi
+    mov rsi, msg_exc
+    call serial_puts64
+    mov al, dil
+    shr al, 4
+    call hex_nibble64
+    mov al, dil
+    and al, 0x0F
+    call hex_nibble64
+    mov al, 10
+    call serial_putc64
+.halt:
+    cli
+    hlt
+    jmp .halt
+
+hex_nibble64:
+    cmp al, 10
+    jb .digit
+    add al, 'A' - 10
+    jmp serial_putc64
+.digit:
+    add al, '0'
+    jmp serial_putc64
+
+; 未注册向量：EOI 双 PIC 后直接返回
 isr_default:
-    pusha
-    ; 对于未注册的 CPU 异常 (0-31)，有些会 push error code 在 iret 之上
-    ; 简单起见：跳过 error code (esp+32 的位置)
-    ; 以后补完整的 exception handler + error code 处理
-    popa
-    add esp, 4          ; 跳过可能的 error code
-    iret
-
-isr_timer:
-    pusha
-    ; Timer IRQ 只需要发 EOI；不要写屏幕，否则会污染 UI。
+    push rax
+    push rdx
     mov al, 0x20
     out 0x20, al
-    popa
-    iret
+    out 0xA0, al
+    pop rdx
+    pop rax
+    iretq
+
+; PIT 定时器：只发 EOI，不写显存
+; 用特定 EOI（0x60 | 0）：非特定 EOI 在 IRQ2 级联服务期间会清错位。
+isr_timer:
+    push rax
+    push rdx
+    mov al, 0x60
+    out 0x20, al
+    pop rdx
+    pop rax
+    iretq
+
+; PS/2 键盘：扫描码写入环形缓冲（C 层轮询消费）
+;   0xA000 : head（本 ISR 写）
+;   0xA002 : tail（C 层写）
+;   0xA010 : 64 字节环形缓冲
+; 单字节 mailbox 在连续扫描码（如 Ctrl+S = ctrl down / s down / s up /
+; ctrl up 四个事件）时会互相覆盖，导致修饰键状态错乱，因此改为环形缓冲。
+KB_HEAD_ADDR equ 0xA000
+KB_TAIL_ADDR equ 0xA002
+KB_BUF_ADDR  equ 0xA010
+KB_BUF_MASK  equ 63
 
 isr_keyboard:
-    pusha
+    push rax
+    push rcx
+    push rdx
+    push rsi
     in al, 0x60
-    ; 传递原始扫描码到 mailbox，保留按下/抬起状态。
-    ; C 层会在 kb_read_char() 中解释 0x80 release code。
-    mov byte [0xA000], al
-    mov byte [0xA001], 1
-    mov al, 0x20
+    movzx esi, word [KB_HEAD_ADDR]
+    lea edx, [esi + 1]
+    and edx, KB_BUF_MASK
+    movzx ecx, word [KB_TAIL_ADDR]
+    cmp edx, ecx
+    je .drop                       ; 缓冲满：丢弃最新扫描码
+    mov [KB_BUF_ADDR + rsi], al
+    mov [KB_HEAD_ADDR], dx
+.drop:
+    mov al, 0x61                ; 特定 EOI：主片 IRQ1
     out 0x20, al
-    popa
-    iret
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    iretq
 
 ; ============================================================
-; VBE BIOS 初始化 (Real Mode)
-; 找 1024x768x32, 设 LFB, 结果存 0x7DF0
-; 缓冲区用 pm.asm 末尾的 padding (安全!)
-; 破坏: ax, bx, cx, dx, di, si, es
+; IRQ9 = SCI：转交内核注册的 ACPI 分发器
+; ------------------------------------------------------------
+; 回调地址由内核在 ACPICA 初始化完成后写入 SCI_CALLBACK_ADDR。
+; 必须在中断上下文里清掉 GPE（ACPICA 的 SCI handler 会做），
+; 否则 EOI 之后 SCI 电平仍然有效，会立刻再次进入本 ISR。
+;
+; Win64 ABI：被调函数需要 32 字节 shadow space，而且是 16 字节对齐；
+; 9 个 push（72 字节）刚好把 RSP 从 8 mod 16 对齐到 0 mod 16。
 ; ============================================================
-; ============================================================
-; VBE 缓冲区 — 直接用物理绝对地址, 避开代码/GDT/IDT
-; pm.bin = 6867B, padding 从 ~0x90D3 开始到 0xA1BF
-; VBE_CTL_BUF (512B) @ 0x9500
-; VBE_MODE_BUF (256B) @ 0x9700
-; ============================================================
-VBE_CTL_BUF  equ 0x9500   ; 0x9500 - 0x96FF
-VBE_MODE_BUF equ 0x9700   ; 0x9700 - 0x97FF
+isr_sci:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
 
-[BITS 16]   ; vbe_init 在实模式下被调用，必须按 16-bit 汇编！
+    mov rax, [SCI_CALLBACK_ADDR]
+    test rax, rax
+    jz .no_handler
+    sub rsp, 32
+    call rax
+    add rsp, 32
+
+.no_handler:
+    ; IRQ9 在从片：必须用特定 EOI（OCW2 = 0x60 | IRQ 位）。
+    ; 非特定 EOI（0x20）清的是 PIC 中"当前最高优先级 ISR 位"：
+    ; 定时器 IRQ0 若在 SCI 服务期间触发，会把 IRQ2 的 ISR 位留下，
+    ; 主片从此屏蔽级联，后续从片中断（包括下一次电源键）全部丢失。
+    mov al, 0x61                ; 从片 IRQ1（= IRQ9）
+    out 0xA0, al
+    mov al, 0x62                ; 主片 IRQ2（级联）
+    out 0x20, al
+
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    iretq
+
+; ============================================================
+; VBE BIOS 初始化（实模式）
+; 按优先级挑选 32bpp + 线性帧缓冲模式，结果写 0x7DF0
+; 破坏：ax, bx, cx, dx, di, si, es
+; ============================================================
+[BITS 16]
+
 vbe_init:
-    ; v0.9: 完整 VBE 初始化 (0x4F00 + 遍历 + 0x4F01 + 0x4F02 + 存 0x7DF0)
     mov ax, 0x4F00
     mov di, VBE_CTL_BUF
     int 0x10
     cmp ax, 0x004F
     jne .vbe_fail
 
-    les si, [VBE_CTL_BUF + 0x0E]   ; VideoModePtr 在 0x0E (0x16 是 VendorNamePtr!)
+    mov si, vbe_prefer
+.prefer_loop:
+    mov ax, [si]                  ; 期望宽度（0 = 优先级表结束）
+    test ax, ax
+    jz .vbe_fail
+    mov [vbe_want_w], ax
+    mov ax, [si + 2]              ; 期望高度
+    mov [vbe_want_h], ax
 
-    xor bx, bx
+    xor bx, bx                    ; 模式列表字节偏移
 .mode_loop:
-    mov dx, [es:si + bx]
+    les di, [VBE_CTL_BUF + 0x0E]  ; VideoModePtr 在 0x0E
+    mov dx, [es:di + bx]
     cmp dx, 0xFFFF
-    je .vbe_fail
+    je .next_pref
 
     mov ax, 0x4F01
     mov cx, dx
     mov di, VBE_MODE_BUF
-    push bx                        ; BIOS 可能踩 BX，保住循环偏移
+    push bx                       ; BIOS 可能踩 BX，保住循环偏移
     int 0x10
     pop bx
-    les si, [VBE_CTL_BUF + 0x0E]   ; BIOS 可能踩 ES，每次重载
     cmp ax, 0x004F
     jne .next_mode
 
-    cmp word [VBE_MODE_BUF + 0x12], 1024   ; XResolution @ 0x12
+    ; 模式必须满足：支持线性帧缓冲、直接色、32bpp
+    test byte [VBE_MODE_BUF + 0x00], 0x80   ; ModeAttributes.bit7 = LFB
+    jz .next_mode
+    cmp byte [VBE_MODE_BUF + 0x1B], 6       ; MemoryModel = Direct Color
     jne .next_mode
-    cmp word [VBE_MODE_BUF + 0x14], 768    ; YResolution @ 0x14
-    jne .next_mode
-    cmp byte [VBE_MODE_BUF + 0x19], 32     ; BitsPerPixel @ 0x19
+    cmp byte [VBE_MODE_BUF + 0x19], 32      ; BitsPerPixel
     jne .next_mode
 
-    ; ============================================================
-    ; 找到了! 保存模式号 (DX), 设 LFB bit, VBE 0x4F02 设模式
-    ; ============================================================
-    mov bx, dx                    ; BX = 模式号
-    or bx, 0x4000                 ; 置 LFB bit
+    mov ax, [vbe_want_w]
+    cmp word [VBE_MODE_BUF + 0x12], ax      ; XResolution
+    jne .next_mode
+    mov ax, [vbe_want_h]
+    cmp word [VBE_MODE_BUF + 0x14], ax      ; YResolution
+    jne .next_mode
+
+    ; ---------- 命中：设置模式（置 LFB bit），再查一次模式信息 ----------
+    push dx                       ; 保住原始模式号（不带 0x4000）
+    mov bx, dx
+    or bx, 0x4000
     mov ax, 0x4F02
     int 0x10
+    pop dx
     cmp ax, 0x004F
-    jne .vbe_fail
+    jne .next_pref
 
-    ; 重新查模式信息 (设完后 framebuffer 地址才有效)
     mov ax, 0x4F01
-    mov cx, dx                    ; CX = 原模式号 (不带 0x4000)
+    mov cx, dx
     mov di, VBE_MODE_BUF
     int 0x10
+    cmp ax, 0x004F
+    jne .next_pref
 
-    ; ============================================================
-    ; 存结果到 0x7DF0 (C 层直接读)
-    ; ============================================================
-    mov word [0x7DF0], 0xA1B2          ; magic = OK
-    mov eax, [VBE_MODE_BUF + 0x28]     ; FrameBufferBase (phys) @ 0x28
-    mov [0x7DF2], eax
-    mov ax, [VBE_MODE_BUF + 0x12]      ; XResolution @ 0x12
-    mov [0x7DF6], ax
-    mov ax, [VBE_MODE_BUF + 0x14]      ; YResolution @ 0x14
-    mov [0x7DF8], ax
-    mov al, [VBE_MODE_BUF + 0x19]      ; BitsPerPixel @ 0x19
-    mov [0x7DFA], al
-    mov ax, [VBE_MODE_BUF + 0x10]      ; BytesPerScanLine @ 0x10
-    mov [0x7DFB], ax                   ; 注意: 这里覆盖了 0x7DFA 但只多写了 1B, 结构对齐允许
+    ; ---------- 存结果到 0x7DF0（C 层直接读） ----------
+    mov word [VBE_RESULT], 0xA1B2          ; magic = OK
+    mov eax, [VBE_MODE_BUF + 0x28]         ; FrameBufferBase (phys) @ 0x28
+    mov [VBE_RESULT + 2], eax
+    mov ax, [VBE_MODE_BUF + 0x12]          ; XResolution @ 0x12
+    mov [VBE_RESULT + 6], ax
+    mov ax, [VBE_MODE_BUF + 0x14]          ; YResolution @ 0x14
+    mov [VBE_RESULT + 8], ax
+    mov al, [VBE_MODE_BUF + 0x19]          ; BitsPerPixel @ 0x19
+    mov [VBE_RESULT + 10], al
+    mov ax, [VBE_MODE_BUF + 0x10]          ; BytesPerScanLine @ 0x10
+    mov [VBE_RESULT + 11], ax
     ret
 
 .next_mode:
     add bx, 2
     jmp .mode_loop
 
+.next_pref:
+    add si, 4
+    jmp .prefer_loop
+
 .vbe_fail:
-    mov word [0x7DF0], 0x0000          ; magic = fail
+    mov word [VBE_RESULT], 0x0000          ; magic = fail
     ret
 
+; 期望模式表：宽, 高（按优先级，0,0 结束）
+; 16x32 字体下：1600x900 → 100x28 字符，1440x900 → 90x28，
+; 1280x720 → 80x22，1024x768 → 64x24。改这张表即可改默认终端尺寸。
+vbe_prefer:
+    dw 1600, 900
+    dw 1440, 900
+    dw 1280, 720
+    dw 1024, 768
+    dw 0, 0
+vbe_want_w: dw 0
+vbe_want_h: dw 0
+
 ; ============================================================
-; GDT (每字段单独 dw/db，确保字节对齐正确)
+; GDT
+;   0x08 : 32 位代码（用于 16->32 跳转）
+;   0x10 : 32 位数据
+;   0x18 : 64 位代码（L=1, D=0）
+;   0x20 : 数据（长模式下平坦寻址）
 ; ============================================================
+ALIGN 8
 gdt_start:
     dq 0x0000000000000000      ; Null
 
-    ; Code: Limit=4GB, Base=0, Ring0, 32-bit
+    ; 0x08: 32-bit Code
     dw 0xFFFF
     dw 0x0000
     db 0x00
     db 0x9A                    ; P=1, DPL=0, S=1, Code/Readable
-    db 0xCF                    ; G=1, D=1 (32-bit), LimitH=0xF
+    db 0xCF                    ; G=1, D=1, LimitH=0xF
     db 0x00
 
-    ; Data: Limit=4GB, Base=0, Ring0, 32-bit
+    ; 0x10: 32-bit Data
     dw 0xFFFF
     dw 0x0000
     db 0x00
     db 0x92                    ; P=1, DPL=0, S=1, Data/Writable
-    db 0xCF                    ; G=1, D=1 (32-bit)
+    db 0xCF
+    db 0x00
+
+    ; 0x18: 64-bit Code
+    dw 0xFFFF
+    dw 0x0000
+    db 0x00
+    db 0x9A
+    db 0xAF                    ; G=1, D=0, L=1, LimitH=0xF
+    db 0x00
+
+    ; 0x20: Data（长模式）
+    dw 0xFFFF
+    dw 0x0000
+    db 0x00
+    db 0x92
+    db 0xCF
     db 0x00
 gdt_end:
 
@@ -328,23 +960,59 @@ gdt_descriptor:
     dd gdt_start
 
 ; ============================================================
-; IDT (256 × 8B = 2KB)
+; 64 位 IDT 描述符与异常地址表
+; IDT 本体在 0x60000，这里只放 10 字节的 IDTR 与 32 个入口地址
 ; ============================================================
 ALIGN 8
-idt_entries:
-    times 256 * 8 db 0
-idtr:
-    dw (idt_end - idt_entries - 1)
-    dd idt_entries
-idt_end:
+idtr64:
+    dw 256 * 16 - 1
+    dq IDT_BASE
+
+exc_table:
+    dq isr_exc0
+    dq isr_exc1
+    dq isr_exc2
+    dq isr_exc3
+    dq isr_exc4
+    dq isr_exc5
+    dq isr_exc6
+    dq isr_exc7
+    dq isr_exc8
+    dq isr_exc9
+    dq isr_exc10
+    dq isr_exc11
+    dq isr_exc12
+    dq isr_exc13
+    dq isr_exc14
+    dq isr_exc15
+    dq isr_exc16
+    dq isr_exc17
+    dq isr_exc18
+    dq isr_exc19
+    dq isr_exc20
+    dq isr_exc21
+    dq isr_exc22
+    dq isr_exc23
+    dq isr_exc24
+    dq isr_exc25
+    dq isr_exc26
+    dq isr_exc27
+    dq isr_exc28
+    dq isr_exc29
+    dq isr_exc30
+    dq isr_exc31
 
 ; ============================================================
-; 消息
+; 串口诊断消息（全部纯 ASCII）
 ; ============================================================
-msg_pic_ok:      db '[PIC] 8259 remapped OK', 0
-msg_idt_ok:      db '[IDT] 256 entries built', 0
-msg_idtr_ok:     db '[IDTR] loaded', 0
-msg_sti_ok:      db '[STI] Interrupts enabled!', 0
-msg_keypress:    db '[KB] Press any key...', 0
-
-times 4096 db 0
+msg_vbe_ok:   db '[PM] VBE mode set', 13, 10, 0
+msg_vbe_fail: db '[PM] VBE unavailable, text fallback', 13, 10, 0
+msg_pm32:     db '[PM] 32-bit protected mode', 13, 10, 0
+msg_load:     db '[PM] loading kernel via ATA PIO', 13, 10, 0
+msg_loaded:   db '[PM] kernel loaded at 0x100000', 13, 10, 0
+msg_load_fail: db '[PM] KERNEL LOAD FAILED (ATA PIO)', 13, 10, 0
+msg_paging:   db '[PM] page tables ready', 13, 10, 0
+msg_long:     db '[PM] 64-bit long mode', 13, 10, 0
+msg_idt:      db '[PM] 64-bit IDT loaded', 13, 10, 0
+msg_irq:      db '[PM] IRQ0/IRQ1/IRQ9 enabled', 13, 10, 0
+msg_exc:      db '[PM] EXCEPTION vector=0x', 0

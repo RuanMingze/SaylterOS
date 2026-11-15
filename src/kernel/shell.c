@@ -11,6 +11,7 @@
 #include "reboot.h"
 #include "editor.h"
 #include "acpi.h"
+#include "acpica_glue.h"
 #include "auth.h"
 #include "slyzvm.h"
 #include "mem.h"
@@ -46,6 +47,8 @@ extern int slyzfs_list_dir(const char* path, struct SlyzDirEntry* out, int out_m
 extern int slyzfs_stat(const char* path, struct SlyzDirEntry* out);
 extern int slyzfs_create(const char* path);
 extern int slyzfs_remove(const char* path);
+extern int slyzfs_usage(uint32_t* total_clusters, uint32_t* used_clusters,
+                        uint32_t* cluster_bytes);
 extern int slyzfs_mklazy(void);
 /* 静默开关：启动页打印期间完成挂载，避免 [SlyzFS] 日志打乱启动画面 */
 extern void slyzfs_set_quiet(int quiet);
@@ -302,11 +305,13 @@ static const char *help_text[] = {
     "  min                             Show minimal builtin commands",
     "  clear                           Clear screen",
     "  echo <text>                     Print text",
-    "  dir / ls                        List current directory (SlyzFS)",
+    "  dir / ls [path]                 List a directory (default: current)",
     "  pwd                             Print working directory",
     "  cd <path>                       Change directory (supports .. and /)",
     "  mkdir <path>                    Create a SlyzFS directory",
     "  rmdir <path>                    Remove an empty SlyzFS directory",
+    "  rm [-f] <file>...               Delete files (-f skips the confirmation)",
+    "  df                              Show filesystem used / free space",
     "  run <file>                      Execute a SLYZ image or text script",
     "  bg <file>                       Run a SLYZ image as a background task",
     "  kill <pid>                      Terminate a task (pid 0 triggers BSOD)",
@@ -335,8 +340,6 @@ static const char *help_text[] = {
     0
 };
 
-#define SHELL_LINE_WIDTH 80
-#define SHELL_ROWS 25
 #define SHELL_PATH_MAX 256
 #define SHELL_HISTORY_CAP 16
 
@@ -421,20 +424,23 @@ static void shell_load_history(char *buf, int maxlen, int direction) {
     cmd_strncpy(buf, shell_history[shell_history_index], maxlen);
 }
 
+/* 重绘当前输入行：先清掉提示符右侧内容，再逐字符重画。
+ * 行宽来自 tty（图形终端通常 > 80 列），不再假设 80x25。 */
 static void redraw_line(char *buf, int len, int pos, uint16_t prompt_x) {
-    uint16_t *video = (uint16_t *)0xB8000;
     uint16_t row = tty_get_cursor_y();
+    uint16_t cols = tty_get_cols();
 
-    for (int col = prompt_x; col < SHELL_LINE_WIDTH; col++) {
-        video[row * SHELL_LINE_WIDTH + col] = (0x0F << 8) | ' ';
-    }
-
+    /* 清行 + 重画整行一次回写，避免编辑每个字符都触发一次屏幕交换 */
+    tty_begin_batch();
+    tty_clear_from(prompt_x, row);
     tty_set_cursor(prompt_x, row);
     for (int i = 0; i < len; i++) {
+        if ((uint32_t)prompt_x + (uint32_t)i >= (uint32_t)cols) break;
         tty_putchar(buf[i]);
     }
 
-    tty_set_cursor(prompt_x + pos, row);
+    tty_set_cursor((uint16_t)(prompt_x + pos), row);
+    tty_end_batch();
 }
 
 /* 提交当前输入行：
@@ -450,22 +456,40 @@ static void shell_commit_input_line(void) {
 static void readline(char *buf, int maxlen, uint16_t prompt_x) {
     int pos = 0;
     int len = 0;
-    uint8_t insert_mode = 1;
+    /* 默认覆盖模式：光标为底部粗线；按 Ins 切到插入模式（半高块） */
+    uint8_t insert_mode = 0;
+    tty_set_cursor_shape(0x06, 0x06);
 
     while (1) {
         char c = kb_read_char();
         if (c == 0) {
-            /* 忙等间隙轮询 PM1_STS：主机把电源键实现为 ACPI 关机事件时，
-             * 这里能立刻识别并按 S5 断电，而不是被用户当成"没反应"。 */
-            if (acpi_poll_power_button()) {
-                printk("\n[ACPI] power button: shutting down (S5)\n");
-                acpi_power_off();
-                /* 走到这里说明硬件忽略了 S5，恢复提示符与已输入内容 */
-                printk("[ACPI] S5 request ignored by hardware\n");
-                tty_set_cursor(0, (uint16_t)(tty_get_scroll_limit() + 1));
-                printk(shell_prompt);
-                printk(" ");
-                redraw_line(buf, len, pos, prompt_x);
+            /* 空闲等待时驱动光标闪烁 */
+            tty_tick();
+            /* 排空 ACPICA 的延迟调用（notify / GPE 后续处理） */
+            acpica_drain_deferred();
+            /* 电源键：优先走 ACPI fixed event（由 SCI 送达），
+             * 没有 fixed event 时才回退到 PM1_STS 轮询。 */
+            {
+                int fixed = acpica_power_button_pending();
+                int power = fixed;
+                if (!power && acpi_poll_power_button()) {
+                    power = 1;
+                }
+                if (power) {
+                    printk("\n[ACPI] power button (%s): shutting down (S5), SCI irq seen=%u\n",
+                           fixed ? "SCI fixed event" : "PM1_STS poll",
+                           (unsigned int)acpica_sci_count());
+                    if (acpica_ready()) {
+                        acpica_request_s5();
+                    }
+                    acpi_power_off();
+                    /* 走到这里说明硬件忽略了 S5，恢复提示符与已输入内容 */
+                    printk("[ACPI] S5 request ignored by hardware\n");
+                    tty_set_cursor(0, (uint16_t)(tty_get_scroll_limit() + 1));
+                    printk(shell_prompt);
+                    printk(" ");
+                    redraw_line(buf, len, pos, prompt_x);
+                }
             }
             /* 空闲时让出 CPU：后台脚本任务在这里获得执行机会 */
             task_yield();
@@ -635,13 +659,17 @@ static void shell_refresh_prompt(void) {
 
 /* 按提示符的实际显示宽度（含其后一个空格）动态计算需要保留的行数，
  * 把 TTY 滚动区压到保留区之上。提示符变长（cd 进入深层目录）时
- * 保留行数随之增加，保证输入行永远不会被上方的输出滚掉。 */
+ * 保留行数随之增加，保证输入行永远不会被上方的输出滚掉。
+ * 行宽/行高都取自 tty，图形终端下不再是固定的 80x25。 */
 static void shell_sync_scroll_zone(void) {
+    int cols = (int)tty_get_cols();
+    int rows = (int)tty_get_rows();
     int width = cmd_strlen(shell_prompt) + 1;
-    int rows = (width + SHELL_LINE_WIDTH - 1) / SHELL_LINE_WIDTH;
-    if (rows < 1) rows = 1;
-    if (rows > SHELL_ROWS - 2) rows = SHELL_ROWS - 2;
-    tty_set_scroll_limit((uint16_t)(SHELL_ROWS - 1 - rows));
+    int needed = (width + cols - 1) / cols;
+    if (needed < 1) needed = 1;
+    if (needed > rows - 2) needed = rows - 2;
+    if (needed < 1) needed = 1;
+    tty_set_scroll_limit((uint16_t)(rows - 1 - needed));
 }
 
 static int cmd_strncmp(const char *a, const char *b, int n);
@@ -715,7 +743,7 @@ static int levenshtein(const char *a, const char *b) {
 
 static const char *builtin_cmds[] = {
     "help","min","clear","cls","echo","dir","ls","pwd","cd","run","ask","dd","remove",
-    "mkdir","rmdir","nano","edit","cat","run","bg","kill","gui","version","uname","whoami","date","mem",
+    "mkdir","rmdir","rm","del","df","nano","edit","cat","run","bg","kill","gui","version","uname","whoami","date","mem",
     "reboot","poweroff","shutdown","halt","acpi","ps",
     "useradd","passwd","su","logout","chmod","chown", 0
 };
@@ -835,42 +863,166 @@ static void shell_resolve_path(char *out, const char *cwd, const char *input) {
 
 /* ---------- 目录浏览与导航 ---------- */
 
-static void cmd_dir(void) {
+/* 单条目录项的格式化输出。dir 列表与单文件查询共用这一份，
+ * 避免两处格式漂移。 */
+static void print_dir_entry(const struct SlyzDirEntry *ent) {
+    uint16_t mode = ent->mode;
+    if (mode == 0) {
+        /* 旧卷条目没有权限信息，按保守默认值显示 */
+        mode = (ent->type == SLYZFS_DIR_DIR) ? 0700 : 0600;
+    }
+    char mode_str[11];
+    format_mode_string(mode_str, mode,
+                       ent->type == SLYZFS_DIR_DIR ? 1 : 0);
+    /* 注意：printk 的 vsprintf 不支持 %6u 这类宽度修饰符，
+     * 写成 %6u 会让它不消费对应的可变参数，导致后续 %s 参数错位、名字乱码。 */
+    printk("  %s  %u  %u  %s\n",
+           mode_str,
+           (unsigned int)ent->uid,
+           (unsigned int)ent->size,
+           ent->name);
+}
+
+/* dir / ls —— 列出指定目录（缺省为当前工作目录）。
+ * 参数可以是相对路径、绝对路径，也可以指向单个文件：
+ * 指向文件时只输出该条目，而不是把它当目录去 list_dir。 */
+static void cmd_dir(const char *args) {
     static struct SlyzDirEntry entries[128];
-    int n = slyzfs_list_dir(shell_cwd, entries, 128);
+    char path[SHELL_PATH_MAX];
+
+    if (args && *args) {
+        shell_resolve_path(path, shell_cwd, args);
+    } else {
+        cmd_strncpy(path, shell_cwd, SHELL_PATH_MAX);
+    }
+
+    const char *shown = path[0] ? path : "\\";
+
+    /* 目标是普通文件：SlyzFS 的 list_dir 只接受目录，这里提前分流 */
+    struct SlyzDirEntry single;
+    if (path[0] != '\0' && slyzfs_stat(path, &single)) {
+        if (single.type != SLYZFS_DIR_DIR) {
+            printk("File: %s\n", shown);
+            printk("  MODE        UID  SIZE  NAME\n");
+            print_dir_entry(&single);
+            printk("1 item(s)\n");
+            return;
+        }
+    }
+
+    int n = slyzfs_list_dir(path, entries, 128);
     if (n < 0) {
-        printk("dir: cannot read '%s' (permission denied or missing)\n",
-               shell_cwd[0] ? shell_cwd : "\\");
+        printk("dir: cannot read '%s' (permission denied or missing)\n", shown);
         return;
     }
     if (n == 0) {
+        printk("Directory of %s\n", shown);
         printk("(empty directory)\n");
         return;
     }
-    printk("Directory of %s\n", shell_cwd[0] ? shell_cwd : "\\");
+    printk("Directory of %s\n", shown);
     printk("  MODE        UID  SIZE  NAME\n");
     for (int i = 0; i < n; i++) {
-        /* 注意：printk 的 vsprintf 不支持 %6u 这类宽度修饰符，
-         * 写成 %6u 会让它不消费对应的可变参数，导致后续 %s 参数错位、名字乱码。 */
-        uint16_t mode = entries[i].mode;
-        if (mode == 0) {
-            /* 旧卷条目没有权限信息，按保守默认值显示 */
-            mode = (entries[i].type == SLYZFS_DIR_DIR) ? 0700 : 0600;
-        }
-        char mode_str[11];
-        format_mode_string(mode_str, mode,
-                           entries[i].type == SLYZFS_DIR_DIR ? 1 : 0);
-        printk("  %s  %u  %u  %s\n",
-               mode_str,
-               (unsigned int)entries[i].uid,
-               (unsigned int)entries[i].size,
-               entries[i].name);
+        print_dir_entry(&entries[i]);
     }
     printk("%d item(s)\n", n);
 }
 
 static void cmd_pwd(void) {
     printk("%s\n", shell_cwd[0] ? shell_cwd : "\\");
+}
+
+/* ---------- df：显示卷容量与剩余空间 ----------
+ * printk 的 vsprintf 不支持 %10u 之类的宽度修饰符，表格对齐只能自己拼字符串。 */
+
+static int df_append_text(char *buf, int pos, int cap, const char *s) {
+    while (*s && pos < cap - 1) buf[pos++] = *s++;
+    buf[pos] = '\0';
+    return pos;
+}
+
+static int df_append_spaces(char *buf, int pos, int cap, int count) {
+    while (count-- > 0 && pos < cap - 1) buf[pos++] = ' ';
+    buf[pos] = '\0';
+    return pos;
+}
+
+/* 右对齐写入一个十进制数，width 为所在列宽 */
+static int df_append_u32(char *buf, int pos, int cap, uint32_t v, int width) {
+    char tmp[12];
+    int n = 0;
+    if (v == 0) tmp[n++] = '0';
+    while (v > 0 && n < (int)sizeof(tmp)) {
+        tmp[n++] = (char)('0' + (v % 10u));
+        v /= 10u;
+    }
+    if (width > n) pos = df_append_spaces(buf, pos, cap, width - n);
+    while (n > 0 && pos < cap - 1) buf[pos++] = tmp[--n];
+    buf[pos] = '\0';
+    return pos;
+}
+
+/* 右对齐写入一段文本 */
+static int df_append_text_right(char *buf, int pos, int cap, const char *s, int width) {
+    int n = 0;
+    while (s[n]) n++;
+    if (width > n) pos = df_append_spaces(buf, pos, cap, width - n);
+    return df_append_text(buf, pos, cap, s);
+}
+
+static void cmd_df(void) {
+    uint32_t total_clusters = 0;
+    uint32_t used_clusters = 0;
+    uint32_t cluster_bytes = 0;
+
+    if (!slyzfs_usage(&total_clusters, &used_clusters, &cluster_bytes) ||
+        cluster_bytes == 0) {
+        printk("df: SlyzFS is not mounted\n");
+        return;
+    }
+
+    uint32_t free_clusters = (used_clusters <= total_clusters)
+                                 ? (total_clusters - used_clusters) : 0;
+    /* 卷上限约 32MB（65536 扇区），簇数 * 簇字节数不会溢出 32 位 */
+    uint32_t total_kb = (total_clusters * cluster_bytes) / 1024u;
+    uint32_t used_kb = (used_clusters * cluster_bytes) / 1024u;
+    uint32_t free_kb = (free_clusters * cluster_bytes) / 1024u;
+    uint32_t percent = (total_clusters > 0)
+                           ? (uint32_t)((used_clusters * 100u) / total_clusters) : 0;
+
+    const int col_kb = 12;
+    const int col_pct = 6;
+
+    /* 表头与数据行必须用同一套列宽构造，否则头尾不对齐 */
+    char head[128];
+    int hp = 0;
+    hp = df_append_text(head, hp, sizeof(head), "Filesystem");
+    hp = df_append_spaces(head, hp, sizeof(head), 4);
+    hp = df_append_text_right(head, hp, sizeof(head), "1K-blocks", col_kb);
+    hp = df_append_text_right(head, hp, sizeof(head), "Used", col_kb);
+    hp = df_append_text_right(head, hp, sizeof(head), "Available", col_kb);
+    hp = df_append_text_right(head, hp, sizeof(head), "Use%", col_pct);
+    hp = df_append_text(head, hp, sizeof(head), "  Mounted on");
+    printk("%s\n", head);
+
+    char row[128];
+    int rp = 0;
+    rp = df_append_text(row, rp, sizeof(row), "SlyzFS");
+    rp = df_append_spaces(row, rp, sizeof(row), 8);
+    rp = df_append_u32(row, rp, sizeof(row), total_kb, col_kb);
+    rp = df_append_u32(row, rp, sizeof(row), used_kb, col_kb);
+    rp = df_append_u32(row, rp, sizeof(row), free_kb, col_kb);
+    rp = df_append_u32(row, rp, sizeof(row), percent, col_pct - 1);
+    rp = df_append_text(row, rp, sizeof(row), "%");
+    rp = df_append_text(row, rp, sizeof(row), "  /");
+    printk("%s\n", row);
+
+    printk("\n  clusters : %u used / %u total (%u bytes each)\n",
+           (unsigned int)used_clusters, (unsigned int)total_clusters,
+           (unsigned int)cluster_bytes);
+    printk("  raw disk : %u sectors (%u KB) via ATA PIO\n",
+           (unsigned int)ata_total_sectors(),
+           (unsigned int)(ata_total_sectors() / 2u));
 }
 
 static void cmd_cd(const char *args) {
@@ -922,6 +1074,89 @@ static void cmd_rmdir(const char *args) {
         printk("rmdir: '%s' removed\n", path);
     } else {
         printk("rmdir: cannot remove '%s'\n", path);
+    }
+}
+
+/* ---------- rm / del：删除文件 ----------
+ * 与 rmdir 互补：这里只删普通文件，目录必须走 rmdir（保持"删除前先清空"的语义）。
+ * 默认逐个确认，避免误删；-f 关闭确认，供脚本与批量删除使用。
+ * 支持一次传多个路径。 */
+
+/* 删除单个目标，返回 1 表示确实删掉了 */
+static int rm_remove_target(const char *target, int force) {
+    char path[SHELL_PATH_MAX];
+    shell_resolve_path(path, shell_cwd, target);
+
+    if (path[0] == '\0') {
+        printk("rm: refusing to remove the root directory\n");
+        return 0;
+    }
+
+    struct SlyzDirEntry ent;
+    if (!slyzfs_stat(path, &ent)) {
+        /* 路径不存在：-f 下保持静默，和 Unix rm 的行为一致 */
+        if (!force) {
+            printk("rm: cannot remove '%s': no such file or directory\n", path);
+        }
+        return 0;
+    }
+
+    if (ent.type == SLYZFS_DIR_DIR) {
+        printk("rm: '%s' is a directory (use rmdir)\n", path);
+        return 0;
+    }
+
+    if (!force) {
+        printk("rm: remove file '%s'? [y/N] ", path);
+        if (!read_yes_no()) {
+            printk("rm: '%s' not removed\n", path);
+            return 0;
+        }
+    }
+
+    if (!slyzfs_remove(path)) {
+        /* stat 已确认条目存在且是文件，remove 失败只可能是父目录写权限不足 */
+        printk("rm: '%s': permission denied\n", path);
+        return 0;
+    }
+
+    printk("rm: '%s' removed\n", path);
+    return 1;
+}
+
+static void cmd_rm(char *args) {
+    if (!args || !*args) {
+        printk("usage: rm [-f] <file> [file...]\n");
+        return;
+    }
+
+    int force = 0;
+    int handled = 0;
+    char *p = args;
+
+    while (*p) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+
+        char *tok = p;
+        while (*p && *p != ' ' && *p != '\t') p++;
+        if (*p) *p++ = '\0';
+
+        if (cmd_strcmp(tok, "-f") == 0) {
+            force = 1;
+            continue;
+        }
+        if (tok[0] == '-') {
+            printk("rm: unknown option '%s' (supported: -f)\n", tok);
+            continue;
+        }
+
+        handled = 1;
+        rm_remove_target(tok, force);
+    }
+
+    if (!handled) {
+        printk("usage: rm [-f] <file> [file...]\n");
     }
 }
 
@@ -1060,6 +1295,7 @@ static void cmd_ask(const char *args) {
     while (1) {
         char c = kb_read_char();
         if (c == 0) {
+            tty_tick();
             delay(50000);
             continue;
         }
@@ -1329,7 +1565,7 @@ static int try_run_slyz_by_name(const char *name) {
 }
 
 static void cmd_help(void)  { for (int i = 0; help_text[i]; i++) printk("%s\n", help_text[i]); }
-static void cmd_min(void)  { printk("help clear echo dir ls pwd cd dd mkdir rmdir nano cat run bg kill gui ps version uname whoami date mem reboot poweroff acpi useradd passwd su logout chmod chown\n"); }
+static void cmd_min(void)  { printk("help clear echo dir ls pwd cd dd mkdir rmdir rm del df nano cat run bg kill gui ps version uname whoami date mem reboot poweroff acpi useradd passwd su logout chmod chown\n"); }
 static void cmd_clear(void){ tty_clear(); }
 static void cmd_echo(const char *args)  { printk("%s\n", args); }
 
@@ -1697,12 +1933,22 @@ void gui_main(void) {
     vbe_swap();
 
     for (;;) {
-        /* GUI 模式同样需要响应 ACPI 电源键：轮询 PM1_STS 即可，
-         * 不依赖 SCI 中断路由（那需要 AML 的 _PRT 信息）。 */
-        if (acpi_poll_power_button()) {
-            printk("\n[ACPI] power button: shutting down (S5)\n");
-            acpi_power_off();
+        /* GUI 模式同样响应电源键：ACPICA fixed event 优先，
+         * 未安装时回退到 PM1_STS 轮询。 */
+        {
+            int power = acpica_power_button_pending();
+            if (!power && acpi_poll_power_button()) {
+                power = 1;
+            }
+            if (power) {
+                printk("\n[ACPI] power button: shutting down (S5)\n");
+                if (acpica_ready()) {
+                    acpica_request_s5();
+                }
+                acpi_power_off();
+            }
         }
+        acpica_drain_deferred();
         for (volatile int i = 0; i < 200000; i++) {
             __asm__ volatile ("nop");
         }
@@ -1710,7 +1956,7 @@ void gui_main(void) {
 }
 #endif
 static void cmd_version(void) { printk("SaylterOS v0.3 (TTY shell)\n"); }
-static void cmd_uname(void)   { printk("SaylterOS i386 32-bit\n"); }
+static void cmd_uname(void)   { printk("SaylterOS x86_64 64-bit long mode\n"); }
 static void cmd_whoami(void) {
     const struct AuthUser *u = auth_current();
     if (u) {
@@ -1756,7 +2002,7 @@ static void cmd_reboot(void)  {
 static void cmd_poweroff(const char *args) {
     uint8_t slp_typ = acpi_get_s5_slp_typ();
 
-    if (!acpi_available()) {
+    if (!acpi_available() && !acpica_ready()) {
         printk("poweroff: ACPI not available\n");
         printk("Halting - power off manually\n");
         while (1) __asm__ volatile ("cli; hlt");
@@ -1773,6 +2019,13 @@ static void cmd_poweroff(const char *args) {
         printk("Shutting down (ACPI S5, SLP_TYP=%u)...\n", (unsigned int)slp_typ);
         acpi_power_off_with(slp_typ);
     } else {
+        /* 首选 ACPICA 路径：\_S5 + _PTS，固件期望的顺序 */
+        if (acpica_ready()) {
+            printk("Shutting down (ACPI S5 via \\_S5, SLP_TYP=%u)...\n",
+                   (unsigned int)slp_typ);
+            acpica_request_s5();
+            printk("poweroff: ACPICA S5 did not take effect, falling back to PM1 write\n");
+        }
         printk("Shutting down (ACPI S5, SLP_TYP=%u then fallback %u)...\n",
                (unsigned int)slp_typ,
                (unsigned int)((slp_typ == 0) ? 5 : 0));
@@ -1784,7 +2037,10 @@ static void cmd_poweroff(const char *args) {
     while (1) __asm__ volatile ("cli; hlt");
 }
 
-static void cmd_acpi(void) { acpi_dump(); }
+static void cmd_acpi(void) {
+    acpi_dump();
+    acpica_dump();
+}
 
 /* ---- 任务管理：后台运行与 kill ---- */
 
@@ -1989,11 +2245,13 @@ static int exec_cmd(const char *cmd, char *args) {
     else if (cmd_strcmp(cmd, "clear") == 0) cmd_clear();
     else if (cmd_strcmp(cmd, "cls") == 0)   cmd_clear();
     else if (cmd_strcmp(cmd, "echo") == 0)  cmd_echo(args);
-    else if (cmd_strcmp(cmd, "dir") == 0 || cmd_strcmp(cmd, "ls") == 0) cmd_dir();
+    else if (cmd_strcmp(cmd, "dir") == 0 || cmd_strcmp(cmd, "ls") == 0) cmd_dir(args);
     else if (cmd_strcmp(cmd, "pwd") == 0) cmd_pwd();
     else if (cmd_strcmp(cmd, "cd") == 0)  cmd_cd(args);
     else if (cmd_strcmp(cmd, "mkdir") == 0 || cmd_strcmp(cmd, "md") == 0) cmd_mkdir(args);
     else if (cmd_strcmp(cmd, "rmdir") == 0 || cmd_strcmp(cmd, "rd") == 0) cmd_rmdir(args);
+    else if (cmd_strcmp(cmd, "rm") == 0 || cmd_strcmp(cmd, "del") == 0) cmd_rm(args);
+    else if (cmd_strcmp(cmd, "df") == 0) cmd_df();
     else if (cmd_strcmp(cmd, "run") == 0)   cmd_run(args);
     else if (cmd_strcmp(cmd, "bg") == 0)    cmd_bg(args);
     else if (cmd_strcmp(cmd, "kill") == 0)  cmd_kill(args);
@@ -2034,7 +2292,7 @@ static int exec_cmd(const char *cmd, char *args) {
 static int read_yes_no(void) {
     while (1) {
         char c = kb_read_char();
-        if (c == 0) { delay(50000); continue; }
+        if (c == 0) { tty_tick(); delay(50000); continue; }
         if (c == '\n' || c == '\r' || c == 'n' || c == 'N') {
             printk("n\n");
             return 0;
@@ -2069,8 +2327,12 @@ void shell_main(void) {
     }
     slyzfs_set_quiet(0);
 
+    /* 内核启动画面到此结束：先清屏，再从头输出 shell banner 与登录提示。
+     * 不能反过来先输出再清屏，否则 banner 会被一起抹掉。 */
+    tty_clear();
+
     printk(banner);
-    printk("SaylterOS TTY Shell — type 'help' for commands\n");
+    printk("SaylterOS TTY Shell - type 'help' for commands\n");
     printk("Insert toggles edit mode, arrows move cursor, Backspace/Delete work\n");
 
     if (mount_ok || fresh_volume) {
@@ -2083,17 +2345,20 @@ void shell_main(void) {
             printk("[OK] SlyzFS mounted: %d root entries\n", root_count);
         }
     } else {
-        printk("[!!] SlyzFS unavailable — file commands are disabled\n");
+        printk("[!!] SlyzFS unavailable - file commands are disabled\n");
     }
     printk("\n");
 
     /* ---- 登录 ----
      * 账户库不存在时 auth_init 会创建 root 账户（无密码）；
      * 文件系统不可用时登录必然失败，此时降级为无会话的 root shell，
-     * 让用户仍能使用 reboot/poweroff 等不依赖磁盘的命令。 */
+     * 让用户仍能使用 reboot/poweroff 等不依赖磁盘的命令。
+     * 账户库的底层文件操作日志静默掉，避免把刚输出的 banner 顶走。 */
+    slyzfs_set_quiet(1);
     auth_init();
+    slyzfs_set_quiet(0);
     if (!auth_login()) {
-        printk("[!] login unavailable — continuing as root without a session\n");
+        printk("[!] login unavailable - continuing as root without a session\n");
     }
 
     /* 登录成功后从干净屏幕开始 */
@@ -2106,7 +2371,7 @@ void shell_main(void) {
         shell_cwd[0] = '\0';
     }
 
-    printk("SaylterOS v0.3 — type 'help' for commands\n");
+    printk("SaylterOS v0.3 - type 'help' for commands\n");
     printk("User: %s (uid %u)   Home: %s\n\n",
            session ? session->name : "root",
            (unsigned int)(session ? session->uid : 0),

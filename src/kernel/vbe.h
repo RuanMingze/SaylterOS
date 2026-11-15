@@ -45,6 +45,14 @@ void vbe_restore_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, const uint
 void vbe_draw_char(uint16_t cx, uint16_t cy, char c, uint32_t fg, uint32_t bg);
 void vbe_draw_string(const char *s, uint16_t cx, uint16_t cy, uint32_t fg, uint32_t bg);
 
+/* ---- 文本终端专用：直写帧缓冲（单缓冲，不经过 backbuffer） ----
+ * 终端字符量大、颜色固定，双缓冲会让每个字符多一次 2KB 的 LFB 复制；
+ * 直接写 LFB 可以省掉这一半的显存流量。GUI 仍使用 backbuffer + swap。 */
+void vbe_fb_clear(uint32_t color);
+void vbe_fb_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint32_t color);
+void vbe_fb_draw_char(uint16_t cx, uint16_t cy, char c, uint32_t fg, uint32_t bg);
+void vbe_fb_scroll_up(uint16_t pixel_rows, uint32_t fill_color);
+
 /* 状态 */
 uint8_t vbe_is_enabled(void);
 

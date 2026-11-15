@@ -13,11 +13,12 @@ ORG 0x7C00
 ; ============================================================
 COM1        equ 0x3F8
 STAGE2_ADDR equ 0x7E00
-IMG_LBA_BASE equ 1      ; 镜像第一个被加载的扇区（Stage2 起点）
-IMG_TAIL_SECTORS equ 192 ; 第三段总扇区数: LBA66..257，装载到 0x28000
-                        ; 当前 .text+.rodata+.data 结束于 0x1F1B8，预留约 36KB；
-                        ; 0x20000 是段 0x1000 的结束地址，往上会回卷，
-                        ; 因此按每 64 扇区（32KB）一段继续加载到 0x28000。
+IMG_LBA_BASE equ 1      ; Stage2 起始扇区
+STAGE_SECTORS equ 18    ; LBA1..18：stage2(4 扇区) + pm.bin(14 扇区)
+
+; 内核不再由 MBR 搬运：内核链接在 0x100000，超出实模式段:偏移的可靠
+; 可达范围。pm.asm 在 32 位保护模式下用 ATA PIO 把 LBA19 起的内核
+; 直接读到 0x100000，磁盘兼容性与 SlyzFS 保持一致。
 
 ; ============================================================
 ; 入口
@@ -76,54 +77,18 @@ start:
     mov si, str_load
     call puts
 
-    ; --- 分段加载镜像（LBA 扩展读 int 13h AH=42h） ---
-    ; 为什么必须分段：
-    ;   1) BIOS 单次读扇区有上限（CHS 方式 63，且不能跨磁道）
-    ;   2) 目标缓冲区不能跨越 64KB 段边界
-    ; 镜像布局: LBA1..4=stage2(2KB), LBA5..18=pm(7KB), LBA19+=kernel
-    ; 需装入的部分: .text+.rodata+.data = 0x159C0-0xA200 = 47040B = 92 扇区
-    ; 因此从 LBA1 起共需 110 扇区 → 0x7E00 .. 0x15A00
-    ;   段1: LBA 1..63   → 0x0000:0x7E00 (0x7E00..0xFC00)
-    ;   段2: LBA 64..65  → 0x0000:0xFC00 (0xFC00..0x10000) 恰好到 64KB 边界
-    ;   段3: LBA 66..129 → 0x1000:0x0000 (0x10000..0x18000) 64 扇区
-    ;   段4: LBA 130..193→ 0x1800:0x0000 (0x18000..0x20000) 64 扇区
-    ;   段5: LBA 194..257→ 0x2000:0x0000 (0x20000..0x28000) 64 扇区
-    ; 每段 32KB，既不跨越 64KB 段边界，也低于部分 BIOS 单次 127 扇区的上限。
+    ; --- 读取 stage2 + pm（LBA 扩展读 int 13h AH=42h） ---
+    ; 单次 18 扇区 = 9216 字节，落在 0x7E00..0xA1FF，
+    ; 既不跨 64KB 段边界，也低于 VGA/BIOS 区（0xA0000）。
+    ; 内核由 pm.asm 在 32 位模式下用 ATA PIO 搬到 0x100000。
     mov eax, IMG_LBA_BASE
-    mov cx, 63
+    mov cx, STAGE_SECTORS
     mov dx, 0x0000
     mov bx, STAGE2_ADDR
     call lba_read
     jc .fail
 
-    mov eax, 64
-    mov cx, 2
-    mov dx, 0x0000
-    mov bx, 0xFC00
-    call lba_read
-    jc .fail
-
-    mov eax, 66
-    mov cx, 64
-    mov dx, 0x1000
-    mov bx, 0x0000
-    call lba_read
-    jc .fail
-
-    mov eax, 130
-    mov cx, 64
-    mov dx, 0x1800
-    mov bx, 0x0000
-    call lba_read
-    jc .fail
-
-    mov eax, 194
-    mov cx, 64
-    mov dx, 0x2000
-    mov bx, 0x0000
-    call lba_read
-    jc .fail
-
+.loaded:
     mov si, str_ok
     call puts
 
@@ -238,10 +203,10 @@ dap:
     dw 0                    ; 目标段（运行时填）
     dq 0                    ; 64 位 LBA（运行时填低 32 位）
 
-str_boot:       db '[MBR] SaylterOS Stage1 booting...', 13, 10, 0
-str_load:       db '[MBR] Reading Stage2 (4 sectors @ cyl 0 head 0 sec 1)...', 13, 10, 0
-str_ok:         db '[MBR] Stage2 loaded OK. Jumping to 0x7E00...', 13, 10, 0
-str_fail:       db '[MBR] FATAL: Disk read failed. Halting.', 13, 10, 0
+str_boot:       db '[MBR] boot', 13, 10, 0
+str_load:       db '[MBR] load', 13, 10, 0
+str_ok:         db '[MBR] stage2 ok', 13, 10, 0
+str_fail:       db '[MBR] read fail', 13, 10, 0
 
 ; ============================================================
 ; 填充 + MBR Magic

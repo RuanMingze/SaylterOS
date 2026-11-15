@@ -1,14 +1,20 @@
 /* ============================================================
- * keyboard.c - C 层键盘接口 (mailbox 模式)
+ * keyboard.c - C 层键盘接口（环形缓冲）
  * ------------------------------------------------------------
- * pm.bin ISR 把扫描码写到 0xA000, 0xA001 设 has_data
- * C kernel 从这里轮询
+ * pm.asm 的 IRQ1 ISR 把扫描码写入 0xA010 起的 64 字节环形缓冲：
+ *   head @ 0xA000（ISR 写）、tail @ 0xA002（本层写）。
+ * 早期单字节 mailbox 在连续扫描码（Ctrl+S 会一次产生 4 个事件）
+ * 时会互相覆盖导致修饰键错乱，因此改为环形缓冲。
+ * C kernel 从这里轮询。
  * ============================================================ */
 
 #include <stdint.h>
 #include "io.h"
-#define KB_MAILBOX_SCANCODE (*(volatile uint8_t *)0xA000)
-#define KB_MAILBOX_FLAG     (*(volatile uint8_t *)0xA001)
+
+#define KB_HEAD      (*(volatile uint16_t *)0xA000)
+#define KB_TAIL      (*(volatile uint16_t *)0xA002)
+#define KB_BUF_BASE  0xA010
+#define KB_BUF_MASK  63
 
 #define KB_LED_CAPS   0x04
 #define KB_LED_NUM    0x02
@@ -148,10 +154,12 @@ static const char shift_map[128] = {
 };
 
 char kb_read_char(void) {
-    if (KB_MAILBOX_FLAG == 0) return 0;
-    KB_MAILBOX_FLAG = 0;
+    uint16_t tail = KB_TAIL;
+    if (tail == KB_HEAD) return 0;
 
-    uint8_t sc = KB_MAILBOX_SCANCODE;
+    uint8_t sc = *(volatile uint8_t *)(uintptr_t)(KB_BUF_BASE + (tail & KB_BUF_MASK));
+    KB_TAIL = (uint16_t)((tail + 1) & KB_BUF_MASK);
+
     uint8_t code = sc & 0x7F;
 
     if (sc == 0xE0) {

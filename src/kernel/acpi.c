@@ -116,7 +116,7 @@ static int acpi_rsdp_valid(uint32_t addr) {
     return sum == 0;
 }
 
-static uint32_t acpi_find_rsdp(void) {
+uint32_t acpi_find_rsdp_phys(void) {
     /* 1) EBDA：BIOS 数据区 0x040E 存 EBDA 段地址，其前 1KB 内可能有 RSDP */
     uint32_t ebda = (uint32_t)acpi_rd16(0x040E) << 4;
     if (ebda >= 0x400 && ebda < 0xA0000) {
@@ -214,7 +214,7 @@ static void acpi_enable_power_button(void) {
 int acpi_init(void) {
     acpi_ok = 0;
 
-    uint32_t rsdp = acpi_find_rsdp();
+    uint32_t rsdp = acpi_find_rsdp_phys();
     if (!rsdp) return 0;
 
     uint32_t fadt = acpi_find_fadt(rsdp);
@@ -258,6 +258,10 @@ uint16_t acpi_pm1a_cnt_port(void) {
 
 uint16_t acpi_pm1b_cnt_port(void) {
     return acpi_pm1b_cnt;
+}
+
+uint16_t acpi_sci_irq(void) {
+    return acpi_sci_int;
 }
 
 int acpi_poll_power_button(void) {
