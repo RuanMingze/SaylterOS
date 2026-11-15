@@ -891,7 +891,10 @@ function typeLine(line) {
 }
 
 async function boot() {
-  for (const line of bootLines) await typeLine(line);
+  for (let i = 0; i < bootLines.length; i++) {
+    await typeLine(bootLines[i]);
+    bi = i + 1;
+  }
   fillEl.style.width = '100%';
   setTimeout(() => {
     overlay.classList.add('fade-out');
