@@ -1,373 +1,691 @@
-#include <ctype.h>
-#include <io.h>
+/*
+ * slyzc - SLYZ 二进制编译器（Windows 版）
+ * ------------------------------------------------------------
+ * 把文本 .slyz 源文件编译成 SaylterOS 内核可直接执行的
+ * SLYZBIN v1 字节码镜像。产物与内核 slyzvm.c 完全同构：
+ *
+ *   32 字节头 + 常量池 + 字节码
+ *
+ * 用法：
+ *   slyztool compile <input.slyz> [-o output.bin]
+ *   slyztool check   <input.slyz>
+ *   slyztool dump    <input.bin>
+ *   slyztool run     <input.slyz>
+ *   slyztool doc
+ *
+ * 编译：
+ *   gcc -std=c11 -O2 -Wall -Wextra -o slyztool.exe slyz_tool.c
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
+#include <stdint.h>
 
-#define MAX_LINE_LEN 4096
-#define MAX_IF_DEPTH 128
+/* ============================================================
+ * 与内核 slyzvm.h 保持一致的格式常量
+ * ============================================================ */
 
-static void print_usage(void) {
-    printf("SLYZ Tools for Windows\n");
-    printf("Usage:\n");
-    printf("  slyztool check <file.slyz>\n");
-    printf("  slyztool run <file.slyz> [Y|N]\n");
-    printf("  slyztool translate <file.slyz> [out.bat]\n");
-    printf("  slyztool doc [topic]\n");
-    printf("  slyztool help\n\n");
-    printf("Supported SLYZ commands:\n");
-    printf("  echo <text>\n");
-    printf("  ask <prompt>\n");
-    printf("  if yes|no\n");
-    printf("  endif\n");
-    printf("  dir | ls\n");
-    printf("  run <file.slyz>\n");
-    printf("  exit | quit\n");
-    printf("  help\n");
+#define SLYZ_MAGIC          "SLYZBIN"
+#define SLYZ_HEADER_SIZE    32
+#define SLYZ_VERSION        1
+
+#define SLYZ_MAX_CONST      4096
+#define SLYZ_MAX_CODE       4096
+#define SLYZ_MAX_FILE       (SLYZ_HEADER_SIZE + SLYZ_MAX_CONST + SLYZ_MAX_CODE)
+#define SLYZ_MAX_STEPS      200000
+
+#define SLOP_END            0x00
+#define SLOP_ECHO           0x01
+#define SLOP_ASK            0x02
+#define SLOP_JMP            0x03
+#define SLOP_JZ             0x04
+#define SLOP_JNZ            0x05
+#define SLOP_RUN            0x06
+#define SLOP_EXIT           0x07
+#define SLOP_HELP           0x08
+#define SLOP_CLEAR          0x09
+#define SLOP_SET            0x0A
+#define SLOP_NOP            0x0B
+
+/* ============================================================
+ * 编译器状态
+ * ============================================================ */
+
+static uint8_t g_code[SLYZ_MAX_CODE];
+static int     g_code_len = 0;
+
+static char    g_pool[SLYZ_MAX_CONST];
+static int     g_pool_len = 0;
+
+static int     g_errors = 0;
+static int     g_line_no = 0;
+static const char *g_source_path = "";
+
+struct IfFrame {
+    int jz_at;      /* JZ/JNZ 指令操作数位置，等待回填 */
+    int jmp_at;     /* else 生成的无条件跳转位置，-1 表示没有 else */
+};
+
+static struct IfFrame g_ifs[32];
+static int g_if_depth = 0;
+
+/* ============================================================
+ * 基础工具
+ * ============================================================ */
+
+static void error_at(int line, const char *message) {
+    fprintf(stderr, "%s:%d: error: %s\n", g_source_path, line, message);
+    g_errors++;
 }
 
 static char *trim_in_place(char *s) {
-    char *start = s;
-    while (*start != '\0' && (*start == ' ' || *start == '\t' || *start == '\r' || *start == '\n')) {
-        start++;
+    while (*s == ' ' || *s == '\t') s++;
+    if (*s == '\0') return s;
+
+    char *end = s + strlen(s) - 1;
+    while (end >= s && (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n')) {
+        *end-- = '\0';
     }
-    if (*start == '\0') {
-        return start;
-    }
-    char *end = start + strlen(start) - 1;
-    while (end > start && (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n')) {
-        *end = '\0';
-        end--;
-    }
-    return start;
+    return s;
 }
 
 static int starts_with(const char *s, const char *prefix) {
     return strncmp(s, prefix, strlen(prefix)) == 0;
 }
 
-static int is_known_command(const char *cmd) {
-    static const char *known[] = {
-        "echo", "ask", "if", "endif", "dir", "ls", "run", "help", "exit", "quit", "cls", "clear", "call", "mkdir", "type", "rem", "set", "goto", "pause", "copy", "del", "rd", "rmdir", "cd", "ver", "date", "time", NULL
-    };
-    for (int i = 0; known[i] != NULL; i++) {
-        if (_stricmp(cmd, known[i]) == 0) {
-            return 1;
-        }
+/* 从命令名后取出参数（已 trim） */
+static char *command_args(char *line) {
+    char *p = line;
+    while (*p && *p != ' ' && *p != '\t') p++;
+    if (*p == '\0') return p;
+    *p++ = '\0';
+    while (*p == ' ' || *p == '\t') p++;
+    return p;
+}
+
+/* ============================================================
+ * 常量池与字节码发射
+ * ============================================================ */
+
+static int pool_add(const char *text) {
+    int len = (int)strlen(text) + 1;
+    if (g_pool_len + len > SLYZ_MAX_CONST) {
+        error_at(g_line_no, "string pool overflow (limit 4096 bytes)");
+        return -1;
     }
+    int offset = g_pool_len;
+    memcpy(g_pool + g_pool_len, text, (size_t)len);
+    g_pool_len += len;
+    return offset;
+}
+
+static void emit_byte(uint8_t value) {
+    if (g_code_len >= SLYZ_MAX_CODE) {
+        error_at(g_line_no, "bytecode overflow (limit 4096 bytes)");
+        return;
+    }
+    g_code[g_code_len++] = value;
+}
+
+static int emit_u16_placeholder(void) {
+    if (g_code_len + 2 > SLYZ_MAX_CODE) {
+        error_at(g_line_no, "bytecode overflow (limit 4096 bytes)");
+        return -1;
+    }
+    int at = g_code_len;
+    g_code[g_code_len++] = 0;
+    g_code[g_code_len++] = 0;
+    return at;
+}
+
+static void emit_u16_at(int at, uint16_t value) {
+    if (at < 0 || at + 1 >= SLYZ_MAX_CODE) return;
+    g_code[at] = (uint8_t)(value & 0xFF);
+    g_code[at + 1] = (uint8_t)((value >> 8) & 0xFF);
+}
+
+static void emit_string_op(uint8_t op, const char *text) {
+    int offset = pool_add(text);
+    if (offset < 0) return;
+    emit_byte(op);
+    emit_byte((uint8_t)(offset & 0xFF));
+    emit_byte((uint8_t)((offset >> 8) & 0xFF));
+}
+
+/* ============================================================
+ * 单行编译
+ * ============================================================ */
+
+static int compile_line(char *line) {
+    if (line[0] == '\0') return 1;
+    if (line[0] == '#') return 1;          /* 整行注释 */
+
+    /* if yes / if no */
+    if (starts_with(line, "if ")) {
+        char *cond = line + 3;
+        while (*cond == ' ' || *cond == '\t') cond++;
+
+        int op;
+        if (strcmp(cond, "yes") == 0 || strcmp(cond, "1") == 0) {
+            op = SLOP_JZ;      /* last == 0 时跳过 then 分支 */
+        } else if (strcmp(cond, "no") == 0 || strcmp(cond, "0") == 0) {
+            op = SLOP_JNZ;     /* last != 0 时跳过 then 分支 */
+        } else {
+            error_at(g_line_no, "if expects 'yes' or 'no'");
+            return 0;
+        }
+
+        if (g_if_depth >= 32) {
+            error_at(g_line_no, "if nesting too deep (limit 32)");
+            return 0;
+        }
+
+        emit_byte((uint8_t)op);
+        int at = emit_u16_placeholder();
+        if (at < 0) return 0;
+
+        g_ifs[g_if_depth].jz_at = at;
+        g_ifs[g_if_depth].jmp_at = -1;
+        g_if_depth++;
+        return 1;
+    }
+
+    if (strcmp(line, "else") == 0) {
+        if (g_if_depth <= 0) {
+            error_at(g_line_no, "'else' without matching 'if'");
+            return 0;
+        }
+
+        emit_byte(SLOP_JMP);
+        int jmp_at = emit_u16_placeholder();
+        if (jmp_at < 0) return 0;
+
+        /* 上一分支在这里结束，回填 if 的跳转 */
+        emit_u16_at(g_ifs[g_if_depth - 1].jz_at, (uint16_t)g_code_len);
+        g_ifs[g_if_depth - 1].jmp_at = jmp_at;
+        return 1;
+    }
+
+    if (strcmp(line, "endif") == 0) {
+        if (g_if_depth <= 0) {
+            error_at(g_line_no, "'endif' without matching 'if'");
+            return 0;
+        }
+
+        g_if_depth--;
+        if (g_ifs[g_if_depth].jmp_at >= 0) {
+            emit_u16_at(g_ifs[g_if_depth].jmp_at, (uint16_t)g_code_len);
+        } else {
+            emit_u16_at(g_ifs[g_if_depth].jz_at, (uint16_t)g_code_len);
+        }
+        return 1;
+    }
+
+    if (strcmp(line, "exit") == 0 || strcmp(line, "quit") == 0) {
+        emit_byte(SLOP_EXIT);
+        return 1;
+    }
+
+    if (strcmp(line, "help") == 0) {
+        emit_byte(SLOP_HELP);
+        return 1;
+    }
+
+    if (strcmp(line, "clear") == 0 || strcmp(line, "cls") == 0) {
+        emit_byte(SLOP_CLEAR);
+        return 1;
+    }
+
+    /* set yes / set no：给 last 赋值，便于组合条件 */
+    if (starts_with(line, "set ")) {
+        char *value = line + 4;
+        while (*value == ' ' || *value == '\t') value++;
+
+        uint8_t v;
+        if (strcmp(value, "yes") == 0 || strcmp(value, "1") == 0) {
+            v = 1;
+        } else if (strcmp(value, "no") == 0 || strcmp(value, "0") == 0) {
+            v = 0;
+        } else {
+            error_at(g_line_no, "set expects 'yes' or 'no'");
+            return 0;
+        }
+
+        emit_byte(SLOP_SET);
+        emit_byte(v);
+        return 1;
+    }
+
+    if (starts_with(line, "echo")) {
+        char *args = command_args(line);
+        if (*args == '\0') {
+            error_at(g_line_no, "echo requires text");
+            return 0;
+        }
+        emit_string_op(SLOP_ECHO, args);
+        return 1;
+    }
+
+    if (starts_with(line, "ask")) {
+        char *args = command_args(line);
+        if (*args == '\0') {
+            error_at(g_line_no, "ask requires a prompt");
+            return 0;
+        }
+        emit_string_op(SLOP_ASK, args);
+        return 1;
+    }
+
+    if (starts_with(line, "run ")) {
+        /* 保留整行，由内核交给 shell 的 run 命令处理 */
+        emit_string_op(SLOP_RUN, line);
+        return 1;
+    }
+
+    /* 其余整行视为 shell 命令 */
+    emit_string_op(SLOP_RUN, line);
+    return 1;
+}
+
+/* ============================================================
+ * 源文件读取与编译
+ * ============================================================ */
+
+static char *read_entire_file(const char *path, int *size_out) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return NULL;
+
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        fclose(fp);
+        return NULL;
+    }
+    long size = ftell(fp);
+    if (size < 0 || size > 1024 * 1024) {
+        fclose(fp);
+        return NULL;
+    }
+    rewind(fp);
+
+    char *buffer = (char *)malloc((size_t)size + 1);
+    if (!buffer) {
+        fclose(fp);
+        return NULL;
+    }
+
+    size_t got = fread(buffer, 1, (size_t)size, fp);
+    fclose(fp);
+    buffer[got] = '\0';
+    if (size_out) *size_out = (int)got;
+    return buffer;
+}
+
+/* 编译源文本；成功返回 1，失败返回 0 */
+static int compile_source(const char *path, const char *text) {
+    g_code_len = 0;
+    g_pool_len = 0;
+    g_errors = 0;
+    g_line_no = 0;
+    g_if_depth = 0;
+    g_source_path = path;
+
+    char *copy = (char *)malloc(strlen(text) + 1);
+    if (!copy) {
+        fprintf(stderr, "out of memory\n");
+        return 0;
+    }
+    strcpy(copy, text);
+
+    char *cursor = copy;
+    while (*cursor) {
+        char *line = cursor;
+        while (*cursor && *cursor != '\n') cursor++;
+        if (*cursor == '\n') *cursor++ = '\0';
+
+        g_line_no++;
+        compile_line(trim_in_place(line));
+    }
+
+    free(copy);
+
+    if (g_if_depth != 0) {
+        error_at(g_line_no, "missing 'endif' at end of file");
+    }
+
+    emit_byte(SLOP_END);
+
+    return g_errors == 0;
+}
+
+/* ============================================================
+ * 镜像写入 / 读取
+ * ============================================================ */
+
+static uint32_t fnv1a(const uint8_t *data, int len) {
+    uint32_t h = 2166136261u;
+    for (int i = 0; i < len; i++) {
+        h ^= (uint32_t)data[i];
+        h *= 16777619u;
+    }
+    return h;
+}
+
+static void put_u16(uint8_t *p, uint16_t v) {
+    p[0] = (uint8_t)(v & 0xFF);
+    p[1] = (uint8_t)((v >> 8) & 0xFF);
+}
+
+static void put_u32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)(v & 0xFF);
+    p[1] = (uint8_t)((v >> 8) & 0xFF);
+    p[2] = (uint8_t)((v >> 16) & 0xFF);
+    p[3] = (uint8_t)((v >> 24) & 0xFF);
+}
+
+static uint16_t get_u16(const uint8_t *p) {
+    return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+}
+
+static uint32_t get_u32(const uint8_t *p) {
+    return (uint32_t)p[0] |
+           ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
+
+static int write_image(const char *path) {
+    uint8_t image[SLYZ_MAX_FILE];
+    memset(image, 0, sizeof(image));
+
+    memcpy(image + 0, SLYZ_MAGIC, 8);
+    put_u16(image + 8, SLYZ_VERSION);
+    put_u16(image + 10, 0);
+    put_u32(image + 12, (uint32_t)g_pool_len);
+    put_u32(image + 16, (uint32_t)g_code_len);
+    put_u32(image + 20, 0);
+
+    memcpy(image + SLYZ_HEADER_SIZE, g_pool, (size_t)g_pool_len);
+    memcpy(image + SLYZ_HEADER_SIZE + g_pool_len, g_code, (size_t)g_code_len);
+
+    uint32_t checksum = fnv1a(image + SLYZ_HEADER_SIZE, g_pool_len + g_code_len);
+    put_u32(image + 24, checksum);
+    put_u32(image + 28, 0);
+
+    int total = SLYZ_HEADER_SIZE + g_pool_len + g_code_len;
+    FILE *fp = fopen(path, "wb");
+    if (!fp) return 0;
+
+    size_t written = fwrite(image, 1, (size_t)total, fp);
+    fclose(fp);
+    return written == (size_t)total;
+}
+
+/* ============================================================
+ * Windows 端字节码执行器（验证编译结果）
+ * ============================================================ */
+
+static int vm_last = 0;
+
+static int vm_ask(const char *prompt) {
+    printf("%s [Y/N] ", prompt);
+    fflush(stdout);
+
+    int c;
+    while ((c = getchar()) != EOF) {
+        if (c == 'y' || c == 'Y') { printf("y\n"); return 1; }
+        if (c == 'n' || c == 'N') { printf("n\n"); return 0; }
+    }
+    printf("\n");
     return 0;
 }
 
-static int count_lines(const char *text, char ***out_lines) {
-    char **lines = NULL;
-    int count = 0;
-    const char *p = text;
-    while (*p != '\0') {
-        const char *start = p;
-        while (*p != '\0' && *p != '\n' && *p != '\r') {
-            p++;
-        }
-        if (p > start) {
-            size_t n = (size_t)(p - start);
-            char *line = (char *)malloc(n + 1);
-            if (!line) {
-                fprintf(stderr, "Out of memory.\n");
-                exit(1);
-            }
-            memcpy(line, start, n);
-            line[n] = '\0';
-            lines = (char **)realloc(lines, (count + 1) * sizeof(char *));
-            lines[count++] = line;
-        }
-        while (*p == '\r' || *p == '\n') {
-            p++;
-        }
-    }
-    *out_lines = lines;
-    return count;
+static int vm_run_line(const char *line) {
+    printf("[exec] %s\n", line);
+    return 1;
 }
 
-static void free_lines(char **lines, int count) {
-    if (!lines) return;
-    for (int i = 0; i < count; i++) {
-        free(lines[i]);
+static int vm_execute(const uint8_t *image, int size, const char *name) {
+    if (size < SLYZ_HEADER_SIZE || memcmp(image, SLYZ_MAGIC, 8) != 0) {
+        fprintf(stderr, "%s: not a SLYZBIN image\n", name);
+        return 0;
     }
-    free(lines);
+
+    uint16_t version = get_u16(image + 8);
+    uint32_t const_size = get_u32(image + 12);
+    uint32_t code_size = get_u32(image + 16);
+    uint32_t entry = get_u32(image + 20);
+    uint32_t checksum = get_u32(image + 24);
+
+    if (version != SLYZ_VERSION) {
+        fprintf(stderr, "%s: unsupported version %u\n", name, (unsigned)version);
+        return 0;
+    }
+    if (const_size > SLYZ_MAX_CONST || code_size > SLYZ_MAX_CODE ||
+        (uint32_t)size < SLYZ_HEADER_SIZE + const_size + code_size) {
+        fprintf(stderr, "%s: invalid sizes\n", name);
+        return 0;
+    }
+    if (entry >= code_size) {
+        fprintf(stderr, "%s: bad entry\n", name);
+        return 0;
+    }
+
+    const uint8_t *pool = image + SLYZ_HEADER_SIZE;
+    const uint8_t *code = pool + const_size;
+
+    if (fnv1a(pool, (int)(const_size + code_size)) != checksum) {
+        fprintf(stderr, "%s: checksum mismatch\n", name);
+        return 0;
+    }
+
+    uint32_t pc = entry;
+    uint32_t steps = 0;
+
+    while (pc < code_size) {
+        if (++steps > SLYZ_MAX_STEPS) {
+            fprintf(stderr, "%s: runaway script aborted\n", name);
+            return 0;
+        }
+
+        uint8_t op = code[pc++];
+
+        switch (op) {
+            case SLOP_END:
+                return 1;
+
+            case SLOP_NOP:
+                break;
+
+            case SLOP_ECHO:
+            case SLOP_ASK:
+            case SLOP_RUN: {
+                if (pc + 2 > code_size) { fprintf(stderr, "%s: bad operand\n", name); return 0; }
+                uint16_t off = get_u16(code + pc);
+                pc += 2;
+                if (off >= const_size) { fprintf(stderr, "%s: bad string offset\n", name); return 0; }
+                const char *text = (const char *)(pool + off);
+                if (memchr(text, '\0', const_size - off) == NULL) {
+                    fprintf(stderr, "%s: unterminated string\n", name);
+                    return 0;
+                }
+                if (op == SLOP_ECHO) printf("%s\n", text);
+                else if (op == SLOP_ASK) vm_last = vm_ask(text);
+                else if (!vm_run_line(text)) return 0;
+                break;
+            }
+
+            case SLOP_JMP:
+                if (pc + 2 > code_size) { fprintf(stderr, "%s: bad jump\n", name); return 0; }
+                pc = get_u16(code + pc);
+                break;
+
+            case SLOP_JZ:
+                if (pc + 2 > code_size) { fprintf(stderr, "%s: bad jump\n", name); return 0; }
+                {
+                    uint16_t target = get_u16(code + pc);
+                    pc += 2;
+                    if (vm_last == 0) pc = target;
+                }
+                break;
+
+            case SLOP_JNZ:
+                if (pc + 2 > code_size) { fprintf(stderr, "%s: bad jump\n", name); return 0; }
+                {
+                    uint16_t target = get_u16(code + pc);
+                    pc += 2;
+                    if (vm_last != 0) pc = target;
+                }
+                break;
+
+            case SLOP_EXIT:
+                return 1;
+
+            case SLOP_HELP:
+                printf("[help]\n");
+                break;
+
+            case SLOP_CLEAR:
+                printf("[clear]\n");
+                break;
+
+            case SLOP_SET:
+                if (pc + 1 > code_size) { fprintf(stderr, "%s: bad set\n", name); return 0; }
+                vm_last = code[pc++] ? 1 : 0;
+                break;
+
+            default:
+                fprintf(stderr, "%s: unknown opcode 0x%02X at %u\n",
+                        name, op, (unsigned)(pc - 1));
+                return 0;
+        }
+    }
+
+    return 1;
 }
 
-static int validate_script(const char *path, const char *text, int *error_count) {
-    char **lines = NULL;
-    int count = count_lines(text, &lines);
-    int if_stack[MAX_IF_DEPTH];
-    int depth = 0;
-    int errors = 0;
+/* ============================================================
+ * dump：反汇编
+ * ============================================================ */
 
-    for (int i = 0; i < count; i++) {
-        char *line = trim_in_place(lines[i]);
-        if (*line == '\0' || *line == '#') {
-            continue;
-        }
-
-        if (depth > 0 && line[0] == ' ' && !(line[0] == '\t')) {
-            /* informational style hint; not fatal */
-        }
-
-        if (starts_with(line, "if ")) {
-            char *cond = line + 3;
-            cond = trim_in_place(cond);
-            if (_stricmp(cond, "yes") != 0 && _stricmp(cond, "no") != 0) {
-                printf("ERROR %s:%d: invalid if condition '%s' (expected yes or no)\n", path, i + 1, cond);
-                errors++;
-            }
-            if (depth >= MAX_IF_DEPTH) {
-                printf("ERROR %s:%d: too deep nesting\n", path, i + 1);
-                errors++;
-            } else {
-                if_stack[depth++] = i + 1;
-            }
-            continue;
-        }
-
-        if (_stricmp(line, "endif") == 0) {
-            if (depth <= 0) {
-                printf("ERROR %s:%d: unexpected endif\n", path, i + 1);
-                errors++;
-            } else {
-                depth--;
-            }
-            continue;
-        }
-
-        if (starts_with(line, "ask")) {
-            char *rest = line + 3;
-            rest = trim_in_place(rest);
-            if (*rest == '\0' || *rest == '"' || *rest == '\'') {
-                printf("ERROR %s:%d: ask requires a prompt string\n", path, i + 1);
-                errors++;
-            }
-            continue;
-        }
-
-        if (starts_with(line, "echo")) {
-            char *rest = line + 4;
-            rest = trim_in_place(rest);
-            if (*rest == '\0') {
-                printf("ERROR %s:%d: echo requires a message\n", path, i + 1);
-                errors++;
-            }
-            continue;
-        }
-
-        if (starts_with(line, "run")) {
-            char *rest = line + 3;
-            rest = trim_in_place(rest);
-            if (*rest == '\0') {
-                printf("ERROR %s:%d: run requires a file name\n", path, i + 1);
-                errors++;
-            }
-            continue;
-        }
-
-        if (_stricmp(line, "dir") == 0 || _stricmp(line, "ls") == 0 || _stricmp(line, "help") == 0 || _stricmp(line, "exit") == 0 || _stricmp(line, "quit") == 0 || _stricmp(line, "clear") == 0 || _stricmp(line, "cls") == 0) {
-            continue;
-        }
-
-        if (strncmp(line, "#", 1) == 0) {
-            continue;
-        }
-
-        char *cmd = line;
-        while (*cmd != '\0' && !isspace((unsigned char)*cmd)) {
-            cmd++;
-        }
-        if (*cmd != '\0') {
-            *cmd = '\0';
-            cmd = trim_in_place(cmd + 1);
-        }
-        if (!strcmp(line, "") || is_known_command(line)) {
-            continue;
-        }
-
-        printf("ERROR %s:%d: unknown command '%s'\n", path, i + 1, line);
-        errors++;
+static int dump_image(const uint8_t *image, int size, const char *name) {
+    if (size < SLYZ_HEADER_SIZE || memcmp(image, SLYZ_MAGIC, 8) != 0) {
+        fprintf(stderr, "%s: not a SLYZBIN image\n", name);
+        return 0;
     }
 
-    if (depth > 0) {
-        printf("ERROR %s:%d: missing endif for if started at line %d\n", path, count, if_stack[depth - 1]);
-        errors++;
+    uint32_t const_size = get_u32(image + 12);
+    uint32_t code_size = get_u32(image + 16);
+    if ((uint32_t)size < SLYZ_HEADER_SIZE + const_size + code_size) {
+        fprintf(stderr, "%s: truncated\n", name);
+        return 0;
     }
 
-    free_lines(lines, count);
-    *error_count = errors;
-    return errors == 0;
+    const uint8_t *pool = image + SLYZ_HEADER_SIZE;
+    const uint8_t *code = pool + const_size;
+
+    printf("SLYZBIN v%u  const=%u code=%u entry=%u checksum=0x%08X\n",
+           (unsigned)get_u16(image + 8), (unsigned)const_size,
+           (unsigned)code_size, (unsigned)get_u32(image + 20),
+           (unsigned)get_u32(image + 24));
+
+    uint32_t pc = 0;
+    while (pc < code_size) {
+        uint32_t at = pc;
+        uint8_t op = code[pc++];
+
+        switch (op) {
+            case SLOP_END:   printf("%04u  END\n", (unsigned)at); break;
+            case SLOP_NOP:   printf("%04u  NOP\n", (unsigned)at); break;
+            case SLOP_EXIT:  printf("%04u  EXIT\n", (unsigned)at); break;
+            case SLOP_HELP:  printf("%04u  HELP\n", (unsigned)at); break;
+            case SLOP_CLEAR: printf("%04u  CLEAR\n", (unsigned)at); break;
+
+            case SLOP_ECHO:
+            case SLOP_ASK:
+            case SLOP_RUN: {
+                uint16_t off = get_u16(code + pc);
+                pc += 2;
+                const char *text = (off < const_size) ? (const char *)(pool + off) : "?";
+                const char *mn = (op == SLOP_ECHO) ? "ECHO" : (op == SLOP_ASK) ? "ASK" : "RUN";
+                printf("%04u  %-5s \"%s\"\n", (unsigned)at, mn, text);
+                break;
+            }
+
+            case SLOP_JMP:
+            case SLOP_JZ:
+            case SLOP_JNZ: {
+                uint16_t target = get_u16(code + pc);
+                pc += 2;
+                const char *mn = (op == SLOP_JMP) ? "JMP" : (op == SLOP_JZ) ? "JZ" : "JNZ";
+                printf("%04u  %-5s %04u\n", (unsigned)at, mn, (unsigned)target);
+                break;
+            }
+
+            case SLOP_SET: {
+                uint8_t value = code[pc++];
+                printf("%04u  SET   %u\n", (unsigned)at, (unsigned)value);
+                break;
+            }
+
+            default:
+                printf("%04u  DB    0x%02X\n", (unsigned)at, op);
+                break;
+        }
+    }
+    return 1;
 }
 
-static void replace_ext(char *out, size_t outsz, const char *in, const char *newext) {
-    strncpy(out, in, outsz - 1);
-    out[outsz - 1] = '\0';
-    char *dot = strrchr(out, '.');
-    if (dot == NULL) {
-        strncat(out, newext, outsz - strlen(out) - 1);
-    } else {
-        *dot = '\0';
-        strncat(out, newext, outsz - strlen(out) - 1);
-    }
+/* ============================================================
+ * 文档与用法
+ * ============================================================ */
+
+static void print_usage(void) {
+    printf(
+        "slyzc - SLYZ 二进制编译器\n"
+        "\n"
+        "用法:\n"
+        "  slyztool compile <input.slyz> [-o output.bin]   编译成 SLYZBIN 镜像\n"
+        "  slyztool check   <input.slyz>                   只做语法检查\n"
+        "  slyztool dump    <input.bin>                    反汇编已编译镜像\n"
+        "  slyztool run     <input.slyz>                   编译后在 Windows 上模拟执行\n"
+        "  slyztool doc                                    显示语法参考\n"
+        "\n"
+        "示例:\n"
+        "  slyztool compile demo.slyz -o demo.bin\n"
+        "  slyztool dump demo.bin\n"
+        "\n"
+        "把 demo.bin 放进 SlyzFS 后，在系统内执行:\n"
+        "  run demo.bin\n"
+    );
 }
 
-static void write_bat_translate(const char *in_path, const char *out_path, const char *forced_answer) {
-    FILE *fp = fopen(in_path, "rb");
-    if (!fp) {
-        fprintf(stderr, "Could not open '%s'\n", in_path);
-        exit(1);
-    }
-    fseek(fp, 0, SEEK_END);
-    long len = ftell(fp);
-    rewind(fp);
-    char *buf = (char *)malloc((size_t)len + 1);
-    if (!buf) {
-        fclose(fp);
-        fprintf(stderr, "Out of memory while reading '%s'\n", in_path);
-        exit(1);
-    }
-    size_t got = fread(buf, 1, (size_t)len, fp);
-    fclose(fp);
-    buf[got] = '\0';
-
-    char **lines = NULL;
-    int count = count_lines(buf, &lines);
-    FILE *out = fopen(out_path, "wb");
-    if (!out) {
-        fprintf(stderr, "Could not write '%s'\n", out_path);
-        exit(1);
-    }
-
-    fprintf(out, "@echo off\r\n");
-    fprintf(out, "setlocal EnableExtensions\r\n");
-    fprintf(out, "set \"SLYZ_LAST=0\"\r\n");
-    fprintf(out, "set \"SLYZ_ASK=\"\r\n");
-    if (forced_answer && *forced_answer) {
-        fprintf(out, "set \"SLYZ_FORCE_ANSWER=%s\"\r\n", forced_answer);
-    }
-    for (int i = 0; i < count; i++) {
-        char *line = trim_in_place(lines[i]);
-        if (*line == '\0' || *line == '#') {
-            fprintf(out, "rem %s\r\n", line);
-            continue;
-        }
-
-        if (_strnicmp(line, "echo ", 5) == 0) {
-            fprintf(out, "echo %s\r\n", line + 5);
-        } else if (_strnicmp(line, "ask ", 4) == 0) {
-            char *prompt = line + 4;
-            prompt = trim_in_place(prompt);
-            if (*prompt == '"') {
-                char *p = prompt + 1;
-                while (*p && *p != '"') p++;
-                if (*p == '"') *p = '\0';
-                prompt++;
-            }
-            fprintf(out, "if not \"%%SLYZ_FORCE_ANSWER%%\"==\"\" (\r\n");
-            fprintf(out, "  if /I \"%%SLYZ_FORCE_ANSWER%%\"==\"Y\" ( set \"SLYZ_LAST=1\" ) else ( set \"SLYZ_LAST=0\" )\r\n");
-            fprintf(out, ") else (\r\n");
-            fprintf(out, "  set /p \"SLYZ_ASK=%s [Y/N]? \"\r\n", prompt);
-            fprintf(out, "  if /I \"%%SLYZ_ASK%%\"==\"Y\" ( set \"SLYZ_LAST=1\" ) else ( set \"SLYZ_LAST=0\" )\r\n");
-            fprintf(out, ")\r\n");
-        } else if (_strnicmp(line, "if ", 3) == 0) {
-            char *cond = line + 3;
-            cond = trim_in_place(cond);
-            if (_stricmp(cond, "yes") == 0) {
-                fprintf(out, "if /I \"%%SLYZ_LAST%%\"==\"1\" (\r\n");
-            } else if (_stricmp(cond, "no") == 0) {
-                fprintf(out, "if /I \"%%SLYZ_LAST%%\"==\"0\" (\r\n");
-            } else {
-                fprintf(out, "rem invalid condition: %s\r\n", cond);
-            }
-        } else if (_stricmp(line, "endif") == 0) {
-            fprintf(out, ")\r\n");
-        } else if (_stricmp(line, "dir") == 0 || _stricmp(line, "ls") == 0) {
-            fprintf(out, "dir\r\n");
-        } else if (_stricmp(line, "help") == 0) {
-            fprintf(out, "echo SLYZ help: echo, ask, if yes/no, endif, dir, run, exit\r\n");
-        } else if (_stricmp(line, "exit") == 0 || _stricmp(line, "quit") == 0) {
-            fprintf(out, "exit /b 0\r\n");
-        } else if (_strnicmp(line, "run ", 4) == 0) {
-            char *target = line + 4;
-            target = trim_in_place(target);
-            char bat_target[260];
-            replace_ext(bat_target, sizeof(bat_target), target, ".bat");
-            fprintf(out, "call \"%%~dp0%s\"\r\n", bat_target);
-        } else {
-            fprintf(out, "%s\r\n", line);
-        }
-    }
-
-    fprintf(out, "endlocal\r\n");
-    fclose(out);
-    free_lines(lines, count);
-    free(buf);
+static void show_doc(void) {
+    printf(
+        "SLYZ 语法参考\n"
+        "============================================================\n"
+        "echo <text>          输出一行文本\n"
+        "ask <prompt>         询问 Y/N，结果写入 last\n"
+        "set yes | set no     直接设置 last\n"
+        "if yes               last 为真时执行到 endif / else\n"
+        "if no                last 为假时执行到 endif / else\n"
+        "else                 分支切换\n"
+        "endif                结束条件块\n"
+        "run <script>         调用另一个脚本\n"
+        "clear / cls          清屏\n"
+        "help                 显示系统帮助\n"
+        "exit / quit          立即结束\n"
+        "<其他命令>           整行交给 shell 执行\n"
+        "# 开头               注释\n"
+        "\n"
+        "编译输出:\n"
+        "  SLYZBIN v1，32 字节头 + 常量池 + 字节码，全部小端，\n"
+        "  无重定位信息，Windows 上编译的镜像可直接在 SaylterOS 执行。\n"
+    );
 }
 
-static void run_script_file(const char *path, const char *forced_answer) {
-    char out_path[MAX_PATH];
-    replace_ext(out_path, sizeof(out_path), path, ".bat");
-    write_bat_translate(path, out_path, forced_answer);
-
-    char cmdline[MAX_PATH * 2];
-    snprintf(cmdline, sizeof(cmdline), "cmd.exe /C \"%s\"", out_path);
-    int rc = system(cmdline);
-    if (rc != 0) {
-        printf("Script exited with code %d\n", rc);
-    }
-}
-
-static void show_doc(const char *topic) {
-    char doc_path[MAX_PATH];
-    GetModuleFileNameA(NULL, doc_path, MAX_PATH);
-    char *slash = strrchr(doc_path, '\\');
-    if (slash) {
-        *(slash + 1) = '\0';
-    }
-    strcat(doc_path, "docs\\slyz-reference.md");
-
-    if (topic && *topic) {
-        printf("Documentation topic: %s\n", topic);
-    }
-
-    printf("Documentation file: %s\n", doc_path);
-
-    char *text = read_entire_file(doc_path);
-    if (!text) {
-        fprintf(stderr, "Unable to read documentation file: %s\n", doc_path);
-        return;
-    }
-
-    printf("\n--- SLYZ reference ---\n");
-    printf("%s\n", text);
-    printf("--- end of document ---\n");
-    free(text);
-}
-
-static char *read_entire_file(const char *path) {
-    FILE *fp = fopen(path, "rb");
-    if (!fp) {
-        fprintf(stderr, "Failed to open '%s'\n", path);
-        return NULL;
-    }
-    fseek(fp, 0, SEEK_END);
-    long size = ftell(fp);
-    rewind(fp);
-    char *buf = (char *)malloc((size_t)size + 1);
-    if (!buf) {
-        fclose(fp);
-        fprintf(stderr, "Out of memory\n");
-        return NULL;
-    }
-    size_t read_count = fread(buf, 1, (size_t)size, fp);
-    fclose(fp);
-    buf[read_count] = '\0';
-    return buf;
-}
+/* ============================================================
+ * main
+ * ============================================================ */
 
 int main(int argc, char **argv) {
     if (argc < 2) {
@@ -375,102 +693,124 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    if (_stricmp(argv[1], "help") == 0 || _stricmp(argv[1], "-h") == 0 || _stricmp(argv[1], "--help") == 0) {
-        print_usage();
+    const char *command = argv[1];
+
+    if (strcmp(command, "doc") == 0) {
+        show_doc();
         return 0;
     }
 
-    if (_stricmp(argv[1], "check") == 0) {
+    if (strcmp(command, "compile") == 0 || strcmp(command, "check") == 0) {
         if (argc < 3) {
-            fprintf(stderr, "Usage: slyztool check <file.slyz>\n");
-            return 1;
-        }
-        char *text = read_entire_file(argv[2]);
-        if (!text) return 1;
-        int errors = 0;
-        int ok = validate_script(argv[2], text, &errors);
-        free(text);
-        if (!ok) {
-            printf("Syntax check failed with %d error(s).\n", errors);
-            return 1;
-        }
-        printf("Syntax OK.\n");
-        return 0;
-    }
-
-    if (_stricmp(argv[1], "translate") == 0) {
-        if (argc < 3) {
-            fprintf(stderr, "Usage: slyztool translate <file.slyz> [out.bat]\n");
-            return 1;
-        }
-        char out_path[MAX_PATH];
-        if (argc >= 4) {
-            strncpy(out_path, argv[3], sizeof(out_path) - 1);
-            out_path[sizeof(out_path) - 1] = '\0';
-        } else {
-            replace_ext(out_path, sizeof(out_path), argv[2], ".bat");
-        }
-        char *text = read_entire_file(argv[2]);
-        if (!text) return 1;
-        int errors = 0;
-        if (!validate_script(argv[2], text, &errors)) {
-            free(text);
-            fprintf(stderr, "Translation aborted because the script has syntax errors.\n");
-            return 1;
-        }
-        free(text);
-        write_bat_translate(argv[2], out_path, NULL);
-        printf("Translated to: %s\n", out_path);
-        return 0;
-    }
-
-    if (_stricmp(argv[1], "run") == 0) {
-        if (argc < 3) {
-            fprintf(stderr, "Usage: slyztool run <file.slyz> [Y|N]\n");
-            return 1;
-        }
-        char *text = read_entire_file(argv[2]);
-        if (!text) return 1;
-        int errors = 0;
-        int ok = validate_script(argv[2], text, &errors);
-        free(text);
-        if (!ok) {
-            fprintf(stderr, "Cannot run because the script has syntax errors.\n");
+            fprintf(stderr, "%s requires an input file\n", command);
             return 1;
         }
 
-        const char *forced_answer = (argc >= 4) ? argv[3] : NULL;
-        if (!forced_answer && !isatty(fileno(stdin))) {
-            char std_in_buf[32];
-            if (fgets(std_in_buf, sizeof(std_in_buf), stdin)) {
-                char *trimmed = trim_in_place(std_in_buf);
-                if (*trimmed == 'Y' || *trimmed == 'y' || *trimmed == 'N' || *trimmed == 'n') {
-                    char *tmp = _strdup(trimmed);
-                    if (tmp) {
-                        forced_answer = tmp;
-                    }
-                }
+        const char *input = argv[2];
+        const char *output = NULL;
+
+        for (int i = 3; i < argc; i++) {
+            if ((strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--output") == 0) && i + 1 < argc) {
+                output = argv[i + 1];
+                i++;
             }
         }
 
-        if (forced_answer && (*forced_answer != 'Y' && *forced_answer != 'y' && *forced_answer != 'N' && *forced_answer != 'n')) {
-            fprintf(stderr, "Answer must be Y or N when provided.\n");
+        int size = 0;
+        char *text = read_entire_file(input, &size);
+        if (!text) {
+            fprintf(stderr, "cannot read '%s'\n", input);
             return 1;
         }
-        run_script_file(argv[2], forced_answer);
-        if (forced_answer && forced_answer != argv[3]) {
-            free((void *)forced_answer);
+
+        int ok = compile_source(input, text);
+        free(text);
+
+        if (!ok) {
+            fprintf(stderr, "%s: compilation failed with %d error(s)\n", input, g_errors);
+            return 1;
         }
+
+        if (strcmp(command, "check") == 0) {
+            printf("%s: OK (const=%d code=%d)\n", input, g_pool_len, g_code_len);
+            return 0;
+        }
+
+        if (!output) {
+            char default_out[1024];
+            snprintf(default_out, sizeof(default_out), "%s.bin", input);
+            output = default_out;
+            if (!write_image(output)) {
+                fprintf(stderr, "cannot write '%s'\n", output);
+                return 1;
+            }
+            printf("%s: compiled %d bytes -> %s\n",
+                   input, SLYZ_HEADER_SIZE + g_pool_len + g_code_len, output);
+            return 0;
+        }
+
+        if (!write_image(output)) {
+            fprintf(stderr, "cannot write '%s'\n", output);
+            return 1;
+        }
+        printf("%s: compiled %d bytes -> %s\n",
+               input, SLYZ_HEADER_SIZE + g_pool_len + g_code_len, output);
         return 0;
     }
 
-    if (_stricmp(argv[1], "doc") == 0) {
-        const char *topic = argc >= 3 ? argv[2] : "all";
-        show_doc(topic);
-        return 0;
+    if (strcmp(command, "dump") == 0) {
+        if (argc < 3) {
+            fprintf(stderr, "dump requires an input file\n");
+            return 1;
+        }
+        int size = 0;
+        char *data = read_entire_file(argv[2], &size);
+        if (!data) {
+            fprintf(stderr, "cannot read '%s'\n", argv[2]);
+            return 1;
+        }
+        int ok = dump_image((const uint8_t *)data, size, argv[2]);
+        free(data);
+        return ok ? 0 : 1;
     }
 
-    fprintf(stderr, "Unknown command: %s\n", argv[1]);
+    if (strcmp(command, "run") == 0) {
+        if (argc < 3) {
+            fprintf(stderr, "run requires an input .slyz\n");
+            return 1;
+        }
+
+        int size = 0;
+        char *text = read_entire_file(argv[2], &size);
+        if (!text) {
+            fprintf(stderr, "cannot read '%s'\n", argv[2]);
+            return 1;
+        }
+
+        int ok = compile_source(argv[2], text);
+        free(text);
+
+        if (!ok) {
+            fprintf(stderr, "%s: compilation failed\n", argv[2]);
+            return 1;
+        }
+
+        uint8_t image[SLYZ_MAX_FILE];
+        memset(image, 0, sizeof(image));
+        memcpy(image, SLYZ_MAGIC, 8);
+        put_u16(image + 8, SLYZ_VERSION);
+        put_u32(image + 12, (uint32_t)g_pool_len);
+        put_u32(image + 16, (uint32_t)g_code_len);
+        put_u32(image + 20, 0);
+        memcpy(image + SLYZ_HEADER_SIZE, g_pool, (size_t)g_pool_len);
+        memcpy(image + SLYZ_HEADER_SIZE + g_pool_len, g_code, (size_t)g_code_len);
+        put_u32(image + 24, fnv1a(image + SLYZ_HEADER_SIZE, g_pool_len + g_code_len));
+
+        int total = SLYZ_HEADER_SIZE + g_pool_len + g_code_len;
+        return vm_execute(image, total, argv[2]) ? 0 : 1;
+    }
+
+    fprintf(stderr, "unknown command '%s'\n\n", command);
     print_usage();
     return 1;
 }

@@ -1,111 +1,114 @@
 # SLYZ 参考文档
 
-## 语法概览
+SLYZ 现在有两种形态：
 
-SLYZ 是一个极简脚本语言，目标是让裸机脚本像批处理一样执行。当前 Windows 工具会把它翻译成 .bat，然后交给 cmd.exe 执行。
+- **源码** `.slyz`：人写的文本脚本
+- **镜像** `.bin`：`slyzc` 编译出的 SLYZBIN v1 字节码，内核直接执行
 
-## 关键语法
+内核仍然兼容旧文本脚本（`run xxx.slyz` 会走文本解析），但正式分发应使用二进制镜像：启动更快、语法错误在编译期就被拦住、也不需要运行时逐行解析。
 
-### 1. echo
+## 语法
+
+### echo
 
 ```slyz
 echo Hello, World!
 ```
 
-输出文字。
+输出一行文本。
 
-### 2. ask
+### ask
 
 ```slyz
 ask Are you ready?
 ```
 
-显示提示并等待用户输入 `Y/N`，内部简化为 `SLYZ_LAST`，`Y` 记为 `1`，`N` 记为 `0`。
+显示提示并等待 `Y/N`，结果写入内部变量 `last`：`Y` 为 1，`N` 为 0。
 
-### 3. if yes / if no
+### set
+
+```slyz
+set yes
+set no
+```
+
+不经过交互直接设置 `last`，便于构造顺序逻辑。
+
+### if / else / endif
 
 ```slyz
 if yes
   echo yes branch
-endif
-
-if no
+else
   echo no branch
 endif
 ```
 
-条件分支：只有当前 `SLYZ_LAST` 与条件一致时才执行分支内容。
+`if yes` 在 `last == 0` 时跳过整个分支；`if no` 在 `last != 0` 时跳过。`else` 可选。
 
-### 4. endif
+### run
 
-结束 `if` 分支。
+```slyz
+run demo.bin
+```
 
-### 5. dir / ls
+调用另一个脚本。内核支持两层嵌套，超过会报 `script nesting too deep`。
+
+### 其他命令
 
 ```slyz
 dir
+pwd
+clear
+help
 ```
 
-列出当前目录。
+不以 `echo/ask/set/if/else/endif/run/exit/help/clear` 开头的整行会作为 shell 命令执行。
 
-### 6. run
-
-```slyz
-run demo.slyz
-```
-
-调用另一个 SLYZ 文件。Windows 版会自动翻译并递归调用批处理。
-
-### 7. exit / quit
+### exit
 
 ```slyz
 exit
 ```
 
-立即退出脚本。
+立即结束脚本。
 
-### 8. help
-
-```slyz
-help
-```
-
-显示帮助信息。
-
-## 示例脚本
-
-```slyz
-echo Hello from SLYZ
-ask Continue?
-if yes
-  echo continue path
-endif
-if no
-  echo stop path
-endif
-```
-
-## Windows 工具
-
-运行方式：
+## 编译
 
 ```bat
-slyztool check demo.slyz
-slyztool translate demo.slyz demo.bat
-slyztool run demo.slyz
-slyztool doc
+slyztool compile demo.slyz -o demo.bin
+slyztool dump demo.bin
 ```
+
+反汇编示例：
+
+```
+SLYZBIN v1  const=61 code=19 entry=0 checksum=0x2DDA670F
+0000  ECHO  "Hello from SLYZ on Windows"
+0003  ASK   "Continue?"
+0006  JZ    0012
+0009  ECHO  "continue path"
+0012  JNZ   0018
+0015  ECHO  "stop path"
+0018  END
+```
+
+`ASK` 之后的 `JZ` 对应 `if yes`，`JNZ` 对应 `if no`。
 
 ## 语法检查规则
 
-- `if` 后必须是 `yes` 或 `no`
-- 缺少 `endif` 会报错误
-- `ask` 必须有提示文本
-- `echo`/`run` 也要求参数
-- 未知命令会被判为错误
+- `if` 后必须是 `yes` 或 `no`（也接受 `1` / `0`）
+- `else` 必须有对应的 `if`
+- 每个 `if` 必须有 `endif`
+- `ask` / `echo` 必须有参数
+- 常量池或字节码超过 4 KB 会报错
+
+## 字节码格式
+
+见 [README.md](../README.md) 的「二进制格式」一节，以及内核实现 `src/kernel/slyzvm.c`。
 
 ## 设计目标
 
-- 在 Windows 上做最接近裸机 SLYZ 行为的脚本体验
-- 先支持简单分支和交互
-- 通过 `translate` 方案让脚本能直接在 cmd.exe 中运行
+- 一个可在 Windows 上离线编译、在裸机系统里直接执行的脚本格式
+- 位置无关、无重定位、可校验（FNV-1a）
+- 编译期拦住语法错误，运行时只做边界检查

@@ -48,7 +48,7 @@ function Build-IdeImg($outPath, $pmBin, $kernelBin) {
 Write-Host '===== VBE build ====='
 & $nasm -f bin -D SAYLTER_VBE=1 -o "$bld\pm.bin" "src\boot\pm.asm" 2>&1 | Out-Null
 
-foreach ($f in @('tty','keyboard','mouse','font16x32','reboot','editor','acpi','sha256','auth')) {
+foreach ($f in @('tty','keyboard','mouse','font16x32','reboot','editor','acpi','sha256','auth','slyzvm')) {
     & $gcc $cf.Split() -c -o "$bld\$f.o" "src\kernel\$f.c" 2>&1
 }
 foreach ($f in @('kernel','shell','vbe')) {
@@ -62,7 +62,7 @@ foreach ($f in @('kernel','shell','vbe')) {
 & $gpp $cf.Split() -o "$bld\kernel.elf" `
     "$bld\entry32.o" "$bld\tty.o" "$bld\keyboard.o" "$bld\mouse.o" `
     "$bld\vbe.o" "$bld\shell.o" "$bld\font16x32.o" "$bld\kernel.o" "$bld\reboot.o" "$bld\editor.o" "$bld\acpi.o" `
-    "$bld\sha256.o" "$bld\auth.o" `
+    "$bld\sha256.o" "$bld\auth.o" "$bld\slyzvm.o" `
     "$bld\slyzfs.o" "$bld\slyzfs_bridge.o" "$bld\kernel_disk.o" `
     -T linker.ld 2>&1 | Select-String -NotMatch 'section below image' | Out-Null
 if (!(Test-Path "$bld\kernel.elf")) {
@@ -80,7 +80,7 @@ Write-Host ''
 Write-Host '===== TTY build ====='
 & $nasm -f bin -o "$bld\pm.bin" "src\boot\pm.asm" 2>&1 | Out-Null
 
-foreach ($f in @('tty','keyboard','kernel','shell','reboot','editor','acpi','sha256','auth')) {
+foreach ($f in @('tty','keyboard','kernel','shell','reboot','editor','acpi','sha256','auth','slyzvm')) {
     & $gcc $cf.Split() -c -o "$bld\tty2-$f.o" "src\kernel\$f.c" 2>&1
 }
 
@@ -91,7 +91,7 @@ foreach ($f in @('tty','keyboard','kernel','shell','reboot','editor','acpi','sha
 & $gpp $cf.Split() -o "$bld\kernel-tty.elf" `
     "$bld\entry32.o" "$bld\tty2-tty.o" "$bld\tty2-keyboard.o" `
     "$bld\tty2-shell.o" "$bld\tty2-kernel.o" "$bld\tty2-reboot.o" "$bld\tty2-editor.o" "$bld\tty2-acpi.o" `
-    "$bld\tty2-sha256.o" "$bld\tty2-auth.o" `
+    "$bld\tty2-sha256.o" "$bld\tty2-auth.o" "$bld\tty2-slyzvm.o" `
     "$bld\tty2-slyzfs.o" "$bld\tty2-slyzfs_bridge.o" "$bld\tty2-kernel_disk.o" `
     -T linker.ld 2>&1 | Select-String -NotMatch 'section below image' | Out-Null
 if (!(Test-Path "$bld\kernel-tty.elf")) {

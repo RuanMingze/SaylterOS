@@ -12,6 +12,7 @@
 #include "editor.h"
 #include "acpi.h"
 #include "auth.h"
+#include "slyzvm.h"
 
 /* ---- SlyzFS 目录项镜像结构 ----
  * 必须与 slyzfs.h 的 DirEntry 以及 bridge 层的 SlyzDirEntry 逐字节一致：
@@ -340,6 +341,8 @@ static int cmd_strlen(const char *s);
 static int try_run_slyz_by_name(const char *name);
 static int exec_cmd(const char *cmd, char *args);
 static void format_mode_string(char out[11], uint16_t mode, uint8_t is_dir);
+static void cmd_clear(void);
+static void cmd_help(void);
 
 static char shell_history[SHELL_HISTORY_CAP][256];
 static int shell_history_count = 0;
@@ -1065,13 +1068,53 @@ static void cmd_ask(const char *args) {
     }
 }
 
+/* SLYZ 执行缓冲：二进制镜像上限 8KB+32，支持两层脚本嵌套调用。
+ * 文本脚本也复用这块缓冲，深度由 slyz_depth 选择不同副本。 */
+static uint8_t slyz_image[2][SLYZVM_MAX_FILE];
+static int slyz_depth = 0;
+
+static void slyz_op_print(const char *text) {
+    printk("%s\n", text);
+}
+
+static int slyz_op_ask(const char *prompt) {
+    cmd_ask(prompt);
+    return slyz_last_answer;
+}
+
+static int slyz_op_run(const char *line) {
+    static char buffer[256];
+    cmd_strncpy(buffer, line, sizeof(buffer));
+
+    char *cmd = buffer;
+    while (*cmd == ' ' || *cmd == '\t') cmd++;
+    if (*cmd == '\0') return 1;
+
+    char *args = cmd;
+    while (*args && *args != ' ' && *args != '\t') args++;
+    if (*args) {
+        *args++ = '\0';
+        while (*args == ' ' || *args == '\t') args++;
+    }
+
+    if (cmd_strcmp(cmd, "ask") == 0) {
+        cmd_ask(args);
+        return 1;
+    }
+    return exec_cmd(cmd, args) != 0;
+}
+
 static int try_run_slyz_by_name(const char *name) {
     if (!name || *name == '\0') return 0;
+    if (slyz_depth >= 2) {
+        printk("run: script nesting too deep\n");
+        return 0;
+    }
 
     /* 通过 SlyzFS 打开脚本，不再扫描原始扇区。
      * 先按用户给的名字找，找不到再补 .slyz 后缀。 */
-    static char script[4096];
     char path[SHELL_PATH_MAX];
+    uint8_t *image = slyz_image[slyz_depth];
     int got = 0;
 
     for (int attempt = 0; attempt < 2 && !got; attempt++) {
@@ -1095,17 +1138,33 @@ static int try_run_slyz_by_name(const char *name) {
 
         void *fh = slyzfs_open(path, "r");
         if (!fh) continue;
-        int n = slyzfs_read(fh, (uint8_t *)script, (int)sizeof(script) - 1);
+        int n = slyzfs_read(fh, image, SLYZVM_MAX_FILE - 1);
         slyzfs_close(fh);
-        if (n > 0) {
-            script[n] = '\0';
-            got = 1;
-        }
+        if (n > 0) got = n;
     }
 
     if (!got) {
         return 0;
     }
+
+    /* 二进制镜像：交给字节码虚拟机执行 */
+    if (slyzvm_is_binary(image, got)) {
+        static const struct SlyzVmOps vm_ops = {
+            slyz_op_print,
+            slyz_op_ask,
+            slyz_op_run,
+            cmd_clear,
+            cmd_help
+        };
+        slyz_depth++;
+        int rc = slyzvm_run(image, got, &vm_ops, path);
+        slyz_depth--;
+        return rc;
+    }
+
+    /* 文本脚本：保留对旧 .slyz 的兼容 */
+    char *script = (char *)image;
+    script[got] = '\0';
 
     char *lines[64];
     int line_count = 0;
@@ -1184,6 +1243,7 @@ static void cmd_echo(const char *args)  { printk("%s\n", args); }
  *
  *   <src> / <dst> 取值：
  *     sector:<N>   第 N 个扇区（LBA 从 0 起）
+ *     file:<path>  SlyzFS 里的普通文件
  *     text:<str>   字面文本（仅 if=）
  *     zero         全零填充（仅 if=）
  *     stdout       屏幕 hexdump（仅 of=）
@@ -1206,7 +1266,8 @@ enum {
     DD_SPEC_SECTOR = 0,
     DD_SPEC_TEXT,
     DD_SPEC_ZERO,
-    DD_SPEC_STDOUT
+    DD_SPEC_STDOUT,
+    DD_SPEC_FILE
 };
 
 struct dd_spec {
@@ -1227,6 +1288,12 @@ static int dd_parse_spec(const char *s, struct dd_spec *out) {
         out->sector = 0;
         out->text = s + 5;
         return 1;
+    }
+    if (cmd_strncmp(s, "file:", 5) == 0) {
+        out->kind = DD_SPEC_FILE;
+        out->sector = 0;
+        out->text = s + 5;
+        return out->text[0] != '\0';
     }
     if (cmd_strcmp(s, "zero") == 0) {
         out->kind = DD_SPEC_ZERO;
@@ -1277,9 +1344,10 @@ static void dd_hexdump(const uint8_t *buf, uint32_t n, uint32_t base) {
 
 static void dd_usage(void) {
     printk("usage: dd if=<src> of=<dst> [bs=<n>] [count=<n>] [seek=<n>] [skip=<n>] [quiet]\n");
-    printk("  src/dst: sector:<N> | text:<str> | zero | stdout\n");
+    printk("  src/dst: sector:<N> | text:<str> | file:<path> | zero | stdout\n");
     printk("  example: dd if=sector:2048 of=stdout\n");
-    printk("  example: dd if=text:hello of=sector:4096\n");
+    printk("  example: dd if=sector:16384 of=file:demo.bin count=16\n");
+    printk("  example: dd if=file:demo.bin of=sector:16384\n");
     printk("  example: dd if=zero of=sector:4096 count=8\n");
 }
 
@@ -1331,7 +1399,7 @@ static void cmd_dd(char *args) {
 
     if (src.kind == DD_SPEC_STDOUT) { printk("dd: if= cannot be stdout\n"); return; }
     if (dst.kind == DD_SPEC_TEXT || dst.kind == DD_SPEC_ZERO) {
-        printk("dd: of= must be sector:<N> or stdout\n");
+        printk("dd: of= must be sector:<N>, file:<path> or stdout\n");
         return;
     }
     if (bs == 0u || (bs % 512u) != 0u) {
@@ -1353,13 +1421,48 @@ static void cmd_dd(char *args) {
     uint32_t total = 0;
     int text_consumed = 0;
 
+    /* 文件源/目标是 SlyzFS 里的普通文件，句柄要在整个分块循环期间保持打开 */
+    void *src_fh = 0;
+    void *dst_fh = 0;
+    char src_path[SHELL_PATH_MAX];
+    char dst_path[SHELL_PATH_MAX];
+
+    if (src.kind == DD_SPEC_FILE) {
+        shell_resolve_path(src_path, shell_cwd, src.text);
+        src_fh = slyzfs_open(src_path, "r");
+        if (!src_fh) {
+            printk("dd: cannot open %s\n", src_path);
+            return;
+        }
+    }
+    if (dst.kind == DD_SPEC_FILE) {
+        shell_resolve_path(dst_path, shell_cwd, dst.text);
+        if (dst_path[0] == '\0') {
+            printk("dd: invalid output path\n");
+            if (src_fh) slyzfs_close(src_fh);
+            return;
+        }
+        dst_fh = slyzfs_open(dst_path, "w");
+        if (!dst_fh) {
+            printk("dd: cannot create %s\n", dst_path);
+            if (src_fh) slyzfs_close(src_fh);
+            return;
+        }
+    }
+
     while (done < count) {
         uint32_t chunk = count - done;
         if (chunk > blocks_per_chunk) chunk = blocks_per_chunk;
         uint32_t bytes = chunk * bs;
+        uint32_t actual = bytes;
 
         /* ---- 填充缓冲区 ---- */
-        if (src.kind == DD_SPEC_ZERO) {
+        if (src.kind == DD_SPEC_FILE) {
+            int got = slyzfs_read(src_fh, buf, (int)bytes);
+            if (got <= 0) break;               /* 读到文件尾 */
+            actual = (uint32_t)got;
+            for (uint32_t i = actual; i < bytes; i++) buf[i] = 0;
+        } else if (src.kind == DD_SPEC_ZERO) {
             for (uint32_t i = 0; i < bytes; i++) buf[i] = 0;
         } else if (src.kind == DD_SPEC_TEXT) {
             uint32_t len = 0;
@@ -1391,26 +1494,39 @@ static void cmd_dd(char *args) {
             uint32_t base_addr = (src.kind == DD_SPEC_SECTOR)
                 ? (src.sector + skip + done) * bs
                 : done * bs;
-            dd_hexdump(buf, bytes, base_addr);
+            dd_hexdump(buf, actual, base_addr);
+        } else if (dst.kind == DD_SPEC_FILE) {
+            int n = slyzfs_write(dst_fh, buf, (int)actual);
+            if (n != (int)actual) {
+                printk("dd: file write failed\n");
+                break;
+            }
         } else {
             for (uint32_t b = 0; b < chunk; b++) {
                 for (uint32_t s = 0; s < sectors_per_block; s++) {
                     uint32_t lba = dst.sector + (seek + done + b) * sectors_per_block + s;
                     if (lba >= DISK_MAX_SECTORS) {
                         printk("dd: of sector %u out of range\n", (unsigned)lba);
+                        if (src_fh) slyzfs_close(src_fh);
+                        if (dst_fh) slyzfs_close(dst_fh);
                         return;
                     }
                     if (!ata_write_sector(lba, buf + b * bs + s * 512u)) {
                         printk("dd: write failed at sector %u\n", (unsigned)lba);
+                        if (src_fh) slyzfs_close(src_fh);
+                        if (dst_fh) slyzfs_close(dst_fh);
                         return;
                     }
                 }
             }
         }
 
-        total += bytes;
+        total += actual;
         done += chunk;
     }
+
+    if (src_fh) slyzfs_close(src_fh);
+    if (dst_fh) slyzfs_close(dst_fh);
 
     if (!quiet) {
         printk("dd: %u bytes (%u block(s) x %u) done\n",

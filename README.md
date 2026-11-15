@@ -20,7 +20,7 @@ SaylterOS 是一个运行在 x86（32 位）上的裸金属操作系统：没有
 | ACPI S5 关机 + 电源键识别 | 可用 |
 | 8042 硬件重启 | 可用 |
 | 动态提示符 + TTY 底部安全区 | 可用 |
-| SLYZ 批处理脚本解释器 | 可用（`run`） |
+| SLYZ 二进制字节码（SLYZBIN v1） | 可用，同时兼容旧文本脚本 |
 | 网络、多任务、分页、SMP | 未实现 |
 
 ---
@@ -125,9 +125,9 @@ root 的 hash 为空表示无密码。普通用户读取 `\etc\shadow` 会被文
 | `mkdir` / `rmdir` | 创建 / 删除目录 |
 | `cat <file>` | 输出文件内容 |
 | `nano <file>` / `edit` | 全屏编辑器（Ctrl+S 保存、Ctrl+X 退出、Ctrl+K 删行） |
-| `run <file.slyz>` | 执行 SLYZ 脚本 |
+| `run <file>` | 执行 SLYZ 镜像或文本脚本 |
 | `ask <prompt>` | 读取 y/n 确认 |
-| `dd` | 扇区 / 文本 / stdout 之间的裸数据复制 |
+| `dd` | 扇区 / 文件 / 文本 / stdout 之间的裸数据复制 |
 | `remove <start> <end>` | 清除扇区 |
 | `whoami` | 当前用户与 uid |
 | `useradd <name>` | 创建用户（root） |
@@ -172,6 +172,7 @@ SaylterOS/
 │   │   ├── auth.c / .h          账户库、登录、口令哈希
 │   │   ├── sha256.c / .h        SHA-256（FIPS 180-4）
 │   │   ├── acpi.c / .h          RSDP/FADT 解析、S5、电源键轮询
+│   │   ├── slyzvm.c / .h        SLYZBIN 字节码虚拟机
 │   │   ├── reboot.c / .h        8042 硬件复位
 │   │   └── io.h                 端口 I/O 内联封装
 │   └── fs/
@@ -250,6 +251,24 @@ type(1) name(52) start_cluster(2) size(4) created(4) modified(4) mode(2) uid(1) 
 
 root（uid 0）绕过全部检查。
 
+### SLYZ 二进制可执行
+
+`.slyz` 源码由 `tools/windows-slyz-tools` 里的 `slyzc` 编译成 SLYZBIN v1 镜像：
+
+```bat
+slyztool compile demo.slyz -o demo.bin
+slyztool dump demo.bin
+```
+
+镜像结构：32 字节头（魔数 `SLYZBIN\0`、版本、常量池/字节码长度、入口、FNV-1a 校验和）+ 常量池 + 字节码。全部小端、位置无关，Windows 上编译后可直接放进 SlyzFS 由内核 [slyzvm.c](src/kernel/slyzvm.c) 执行；`run` 先检查魔数，不是镜像时回退到文本解析。
+
+把镜像导入系统（`dd` 支持 `file:` 规格）：
+
+```text
+root@os:~# dd if=sector:16384 of=file:demo.bin
+root@os:~# run demo.bin
+```
+
 ### 用户系统
 
 - uid 为 8 位（0 = root，1..255 为普通用户）
@@ -282,7 +301,7 @@ Shell 提示符始终绘制在屏幕底部的保留区，命令输出只滚动�
 - 无 `rm`、`sudo`、用户组、setuid
 - 口令哈希无迭代 KDF（无 PBKDF2/Argon2），仅单轮 SHA-256
 - VBE 模式只显示 Logo，尚未实现图形 Shell
-- SLYZ 脚本解释器只支持有限的 `if/else/endif` 与内置命令
+- SLYZ 虚拟机只支持 `echo/ask/set/if/else/endif/run/clear/help/exit` 与整行 shell 命令
 - 每次运行 `build.ps1` 都会重建 `saylter-ide.img`，其中的用户与文件会被清空
 
 ---
