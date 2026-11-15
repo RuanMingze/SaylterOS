@@ -35,6 +35,7 @@
  *   0x0B NOP
  *   0x0C ALLOC  u16 bytes       向宿主申请内存
  *   0x0D FREE                   释放最近一次 ALLOC
+ *   0x0E WAIT                   永久让出 CPU，直到任务被 kill
  * ============================================================ */
 
 #ifndef SLYZVM_H
@@ -77,6 +78,7 @@
 #define SLOP_NOP     0x0B
 #define SLOP_ALLOC   0x0C
 #define SLOP_FREE    0x0D
+#define SLOP_WAIT    0x0E
 
 /* 宿主回调：VM 自身不做任何 I/O，全部由 shell 注入 */
 struct SlyzVmOps {
@@ -90,6 +92,8 @@ struct SlyzVmOps {
     void  (*free)(void *ptr);
     /* 每执行一条指令调用一次，用于任务步数统计与协作式调度；可为 0 */
     void (*tick)(void);
+    /* 主动让出 CPU（WAIT 指令每次调用）；可为 0 */
+    void (*yield)(void);
 };
 
 /* 只检查 8 字节魔数，用于区分二进制与文本脚本 */

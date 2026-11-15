@@ -49,6 +49,7 @@
 #define SLOP_NOP            0x0B
 #define SLOP_ALLOC          0x0C
 #define SLOP_FREE           0x0D
+#define SLOP_WAIT           0x0E
 
 /* ============================================================
  * 编译器状态
@@ -279,6 +280,11 @@ static int compile_line(char *line) {
 
     if (strcmp(line, "free") == 0) {
         emit_byte(SLOP_FREE);
+        return 1;
+    }
+
+    if (strcmp(line, "wait") == 0) {
+        emit_byte(SLOP_WAIT);
         return 1;
     }
 
@@ -599,6 +605,10 @@ static int vm_execute(const uint8_t *image, int size, const char *name) {
                 break;
             }
 
+            case SLOP_WAIT:
+                printf("[wait] task would block here on SaylterOS\n");
+                return 1;
+
             default:
                 fprintf(stderr, "%s: unknown opcode 0x%02X at %u\n",
                         name, op, (unsigned)(pc - 1));
@@ -684,6 +694,10 @@ static int dump_image(const uint8_t *image, int size, const char *name) {
                 printf("%04u  FREE\n", (unsigned)at);
                 break;
 
+            case SLOP_WAIT:
+                printf("%04u  WAIT\n", (unsigned)at);
+                break;
+
             default:
                 printf("%04u  DB    0x%02X\n", (unsigned)at, op);
                 break;
@@ -725,6 +739,7 @@ static void show_doc(void) {
         "set yes | set no     直接设置 last\n"
         "alloc <bytes>        向系统申请内存（1..65535）\n"
         "free                 释放最近一次 alloc\n"
+        "wait                 永久让出 CPU，直到任务被 kill\n"
         "if yes               last 为真时执行到 endif / else\n"
         "if no                last 为假时执行到 endif / else\n"
         "else                 分支切换\n"

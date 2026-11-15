@@ -80,6 +80,9 @@ void task_release_all(void);
 /* OOM：打印并杀死当前任务，不返回。 */
 void task_oom_kill(uint32_t requested);
 
+/* 杀死指定任务（id 1..TASK_MAX-1）。内核任务 0 不可杀，返回 0。 */
+int task_kill(int id);
+
 /* 等待指定任务结束（协作式） */
 void task_wait(int id);
 

@@ -222,6 +222,18 @@ int slyzvm_run(const uint8_t *data, int size,
                 break;
             }
 
+            case SLOP_WAIT: {
+                /* 停在 WAIT 上反复让出 CPU。任务被 kill 后调度器不再
+                 * 选择它，栈就永久冻结在这里，等价于进程被终止。 */
+                pc--;
+                if (ops->yield) {
+                    ops->yield();
+                } else {
+                    return 1;
+                }
+                break;
+            }
+
             default:
                 printk("%s: unknown opcode 0x%x at %u\n",
                        name, (unsigned int)op, (unsigned int)(pc - 1));

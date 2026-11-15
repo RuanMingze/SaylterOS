@@ -310,8 +310,27 @@ void task_oom_kill(uint32_t requested) {
     }
 }
 
-void task_wait(int id) {
-    struct Task *t = task_by_id(id);
+int task_kill(int id) {
+    if (!g_initialized) return 0;
+    if (id <= 0 || id >= TASK_MAX) return 0;   /* 内核任务不可杀 */
+
+    struct Task *t = &g_tasks[id];
+    if (t->state == TASK_FREE || t->state == TASK_DEAD) return 0;
+
+    /* 只能从内核任务发起：脚本任务杀自己会让当前栈失效 */
+    struct Task *cur = task_current();
+    if (!cur || cur->id != 0) return 0;
+
+    /* 协作式调度下 shell 运行时其他任务不可能是 RUNNING */
+    if (t->state == TASK_RUNNING) return 0;
+
+    task_release_blocks(t);
+    t->state = TASK_DEAD;
+    t->exit_code = -3;
+    return 1;
+}
+
+void task_wait(int id) {    struct Task *t = task_by_id(id);
     if (!t) return;
 
     int guard = 0;

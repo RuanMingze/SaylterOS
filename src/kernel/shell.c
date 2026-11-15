@@ -15,6 +15,7 @@
 #include "slyzvm.h"
 #include "mem.h"
 #include "task.h"
+#include "bsod.h"
 
 /* ---- SlyzFS 目录项镜像结构 ----
  * 必须与 slyzfs.h 的 DirEntry 以及 bridge 层的 SlyzDirEntry 逐字节一致：
@@ -307,6 +308,8 @@ static const char *help_text[] = {
     "  mkdir <path>                    Create a SlyzFS directory",
     "  rmdir <path>                    Remove an empty SlyzFS directory",
     "  run <file>                      Execute a SLYZ image or text script",
+    "  bg <file>                       Run a SLYZ image as a background task",
+    "  kill <pid>                      Terminate a task (pid 0 triggers BSOD)",
     "  nano <file> / edit <file>       Full-screen editor (Ctrl+S save, Ctrl+X exit)",
     "  cat <file>                      Print file contents",
     "  ask <prompt>                    Prompt for yes/no input",
@@ -346,6 +349,7 @@ static int exec_cmd(const char *cmd, char *args);
 static void format_mode_string(char out[11], uint16_t mode, uint8_t is_dir);
 static void cmd_clear(void);
 static void cmd_help(void);
+static int read_yes_no(void);
 
 static char shell_history[SHELL_HISTORY_CAP][256];
 static int shell_history_count = 0;
@@ -711,7 +715,7 @@ static int levenshtein(const char *a, const char *b) {
 
 static const char *builtin_cmds[] = {
     "help","min","clear","cls","echo","dir","ls","pwd","cd","run","ask","dd","remove",
-    "mkdir","rmdir","nano","edit","cat","gui","version","uname","whoami","date","mem",
+    "mkdir","rmdir","nano","edit","cat","run","bg","kill","gui","version","uname","whoami","date","mem",
     "reboot","poweroff","shutdown","halt","acpi","ps",
     "useradd","passwd","su","logout","chmod","chown", 0
 };
@@ -1142,7 +1146,8 @@ static const struct SlyzVmOps slyz_vm_ops = {
     cmd_help,
     slyz_op_alloc,
     slyz_op_free,
-    slyz_op_tick
+    slyz_op_tick,
+    task_yield
 };
 
 /* 脚本作为独立任务执行时的镜像副本。任务运行期间 shell 在 task_wait 中
@@ -1150,6 +1155,7 @@ static const struct SlyzVmOps slyz_vm_ops = {
 static uint8_t slyz_task_image[SLYZVM_MAX_FILE];
 static int slyz_task_size = 0;
 static char slyz_task_name[SHELL_PATH_MAX];
+static int slyz_run_background = 0;
 
 static void slyz_task_entry(void) {
     struct Task *t = task_current();
@@ -1217,7 +1223,16 @@ static int try_run_slyz_by_name(const char *name) {
             return rc ? 1 : 2;
         }
 
-        /* shell 任务：把脚本放进独立任务，便于配额记账与 OOM 回收 */
+        /* shell 任务：把脚本放进独立任务，便于配额记账与 OOM 回收。
+         * 任务镜像缓冲只有一份，已有活动脚本任务时拒绝再启动。 */
+        for (int i = 1; i < TASK_MAX; i++) {
+            struct Task *other = task_by_id(i);
+            if (other && (other->state == TASK_READY || other->state == TASK_RUNNING)) {
+                printk("run: task slot %d busy (%s)\n", i, other->name);
+                return 2;
+            }
+        }
+
         for (int i = 0; i < got; i++) {
             slyz_task_image[i] = image[i];
         }
@@ -1227,7 +1242,12 @@ static int try_run_slyz_by_name(const char *name) {
         int tid = task_spawn(path, slyz_task_entry, TASK_QUOTA_DEFAULT);
         if (tid < 0) {
             printk("run: no free task slot\n");
-            return 0;
+            return 2;
+        }
+
+        if (slyz_run_background) {
+            printk("[bg] pid %d: %s\n", tid, path);
+            return 1;
         }
 
         task_wait(tid);
@@ -1309,7 +1329,7 @@ static int try_run_slyz_by_name(const char *name) {
 }
 
 static void cmd_help(void)  { for (int i = 0; help_text[i]; i++) printk("%s\n", help_text[i]); }
-static void cmd_min(void)  { printk("help clear echo dir ls pwd cd dd mkdir rmdir nano cat run gui ps version uname whoami date mem reboot poweroff acpi useradd passwd su logout chmod chown\n"); }
+static void cmd_min(void)  { printk("help clear echo dir ls pwd cd dd mkdir rmdir nano cat run bg kill gui ps version uname whoami date mem reboot poweroff acpi useradd passwd su logout chmod chown\n"); }
 static void cmd_clear(void){ tty_clear(); }
 static void cmd_echo(const char *args)  { printk("%s\n", args); }
 
@@ -1766,6 +1786,71 @@ static void cmd_poweroff(const char *args) {
 
 static void cmd_acpi(void) { acpi_dump(); }
 
+/* ---- 任务管理：后台运行与 kill ---- */
+
+static void cmd_bg(const char *args) {
+    if (!args || !*args) {
+        printk("usage: bg <file>\n");
+        return;
+    }
+
+    slyz_run_background = 1;
+    int rc = try_run_slyz_by_name(args);
+    slyz_run_background = 0;
+
+    if (rc == 0) {
+        printk("bg: %s not found\n", args);
+    } else if (rc == 2) {
+        printk("bg: cannot start %s\n", args);
+    }
+}
+
+static void cmd_kill(const char *args) {
+    if (!args || !*args) {
+        printk("usage: kill <pid>    (pid 0 = kernel, triggers BSOD)\n");
+        return;
+    }
+
+    const struct AuthUser *u = auth_current();
+    if (u && u->uid != 0) {
+        printk("kill: permission denied (root only)\n");
+        return;
+    }
+
+    uint32_t pid;
+    if (!parse_u32(args, &pid) || pid >= TASK_MAX) {
+        printk("kill: invalid pid\n");
+        return;
+    }
+
+    if (pid == 0) {
+        printk("kill: the kernel task cannot be terminated normally.\n");
+        printk("Trigger the crash handler and show BSOD? [y/N] ");
+        if (!read_yes_no()) {
+            printk("kill: cancelled\n");
+            return;
+        }
+        bsod(0x00000000u, "kernel task terminated by user request");
+        return;   /* 不会到这里 */
+    }
+
+    struct Task *t = task_by_id((int)pid);
+    if (!t || t->state == TASK_FREE || t->state == TASK_DEAD) {
+        printk("kill: no such process: %u\n", (unsigned)pid);
+        return;
+    }
+
+    char name[TASK_NAME_MAX];
+    cmd_strncpy(name, t->name, sizeof(name));
+
+    if (task_kill((int)pid)) {
+        printk("kill: pid %u (%s) terminated, memory released\n",
+               (unsigned)pid, name);
+    } else {
+        printk("kill: cannot kill pid %u\n", (unsigned)pid);
+    }
+}
+
 /* ---- 用户与权限命令 ---- */
 
 static int parse_octal_mode(const char *s, uint16_t *out) {
@@ -1910,6 +1995,8 @@ static int exec_cmd(const char *cmd, char *args) {
     else if (cmd_strcmp(cmd, "mkdir") == 0 || cmd_strcmp(cmd, "md") == 0) cmd_mkdir(args);
     else if (cmd_strcmp(cmd, "rmdir") == 0 || cmd_strcmp(cmd, "rd") == 0) cmd_rmdir(args);
     else if (cmd_strcmp(cmd, "run") == 0)   cmd_run(args);
+    else if (cmd_strcmp(cmd, "bg") == 0)    cmd_bg(args);
+    else if (cmd_strcmp(cmd, "kill") == 0)  cmd_kill(args);
     else if (cmd_strcmp(cmd, "nano") == 0 || cmd_strcmp(cmd, "edit") == 0) cmd_edit(args);
     else if (cmd_strcmp(cmd, "cat") == 0) cmd_cat(args);
     else if (cmd_strcmp(cmd, "ask") == 0)  cmd_ask(args);
