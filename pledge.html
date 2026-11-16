@@ -163,14 +163,19 @@
   #tty-body { max-height: 560px; overflow-y: auto; cursor: text; }
   .tty-input-line { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
   .tty-echo { color: var(--text); white-space: pre-wrap; word-break: break-all; }
-  .tty-hidden-input {
-    position: absolute;
-    opacity: 0;
-    width: 1px;
-    height: 1px;
+  .tty-line-input {
+    flex: 1 1 220px;
+    min-width: 120px;
+    background: transparent;
     border: 0;
+    outline: none;
     padding: 0;
-    pointer-events: none;
+    margin: 0;
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 14px;
+    line-height: inherit;
+    caret-color: var(--accent);
   }
   .tty-editor {
     display: block;
@@ -994,6 +999,13 @@ setInterval(draw, 50);
   if (!body) return;
 
   /* ---------------- DOM ---------------- */
+  /* 原有的静态演示内容保留；激活时隐藏它最后一行的提示符与光标，
+   * 避免出现"两个 root@saylter 提示符、两个光标同时闪"的错觉。 */
+  var staticChildren = Array.prototype.slice.call(body.children);
+  var staticLast = staticChildren.length > 0
+    ? staticChildren[staticChildren.length - 1]
+    : null;
+
   var live = document.createElement('div');
   body.appendChild(live);
 
@@ -1011,21 +1023,20 @@ setInterval(draw, 50);
   var spUser = mkSpan('prompt');
   var spPath = mkSpan('cmd');
   var spHash = mkSpan('output', '#\u00a0');
-  var spEcho = mkSpan('tty-echo');
-  var spCursor = mkSpan('cursor');
+
+  /* 用真实的 input 承载输入：浏览器自带的插入符就是唯一光标，
+   * 不再自绘第二个闪烁方块。 */
+  var lineInput = document.createElement('input');
+  lineInput.className = 'tty-line-input';
+  lineInput.type = 'text';
+  lineInput.autocomplete = 'off';
+  lineInput.spellcheck = false;
+
   inputLine.appendChild(spUser);
   inputLine.appendChild(spPath);
   inputLine.appendChild(spHash);
-  inputLine.appendChild(spEcho);
-  inputLine.appendChild(spCursor);
+  inputLine.appendChild(lineInput);
   body.appendChild(inputLine);
-
-  var hidden = document.createElement('input');
-  hidden.className = 'tty-hidden-input';
-  hidden.type = 'text';
-  hidden.autocomplete = 'off';
-  hidden.spellcheck = false;
-  body.appendChild(hidden);
 
   /* ---------------- 输出 ---------------- */
   function print(text, cls) {
@@ -1196,37 +1207,57 @@ setInterval(draw, 50);
     body.scrollTop = body.scrollHeight;
   }
 
+  function focusInput() {
+    try {
+      lineInput.focus({ preventScroll: true });
+    } catch (e) {
+      lineInput.focus();
+    }
+  }
+
   function showPrompt() {
     refreshPrompt();
     inputLine.style.display = 'flex';
-    hidden.value = '';
-    spEcho.textContent = '';
-    try { hidden.focus({ preventScroll: true }); } catch (e) { hidden.focus(); }
+    lineInput.value = '';
+    focusInput();
+    body.scrollTop = body.scrollHeight;
   }
 
   function hidePrompt() {
     inputLine.style.display = 'none';
-    hidden.blur();
+    lineInput.blur();
   }
 
   function activate() {
     if (state.dead) return;
     if (document.querySelector('.tty-bsod')) return;
     if (document.querySelector('.tty-editor')) return;
+
+    /* 第一次激活时隐藏静态演示里的最后一行提示符，
+     * 否则页面上会同时出现 "$" 和 "#" 两个提示符。 */
+    if (staticLast && staticLast.style.display !== 'none') {
+      staticLast.style.display = 'none';
+    }
+
     if (inputLine.style.display === 'flex') {
-      try { hidden.focus({ preventScroll: true }); } catch (e) { hidden.focus(); }
+      focusInput();
       return;
     }
     showPrompt();
   }
 
+  /* mousedown 里阻止默认行为，防止浏览器把焦点从 input 挪走 */
   body.addEventListener('mousedown', function (e) {
-    if (e.target && e.target.classList && e.target.classList.contains('tty-editor')) return;
+    if (e.target && e.target.tagName === 'TEXTAREA') return;
+    e.preventDefault();
     activate();
   });
 
-  hidden.addEventListener('input', function () {
-    spEcho.textContent = hidden.value;
+  body.addEventListener('click', function (e) {
+    if (e.target && e.target.tagName === 'TEXTAREA') return;
+    if (e.target === lineInput) return;
+    e.preventDefault();
+    activate();
   });
 
   /* ---------------- 命令表 ---------------- */
@@ -2125,7 +2156,7 @@ setInterval(draw, 50);
   }
 
   /* ---------------- 键盘 ---------------- */
-  hidden.addEventListener('keydown', function (e) {
+  lineInput.addEventListener('keydown', function (e) {
     if (state.dead) {
       e.preventDefault();
       return;
@@ -2133,9 +2164,8 @@ setInterval(draw, 50);
 
     if (e.key === 'Enter') {
       e.preventDefault();
-      var value = hidden.value;
-      hidden.value = '';
-      spEcho.textContent = '';
+      var value = lineInput.value;
+      lineInput.value = '';
       execute(value);
       return;
     }
@@ -2144,8 +2174,7 @@ setInterval(draw, 50);
       e.preventDefault();
       if (state.history.length === 0) return;
       if (state.histIdx > 0) state.histIdx--;
-      hidden.value = state.history[state.histIdx] || '';
-      spEcho.textContent = hidden.value;
+      lineInput.value = state.history[state.histIdx] || '';
       return;
     }
 
@@ -2154,25 +2183,23 @@ setInterval(draw, 50);
       if (state.history.length === 0) return;
       if (state.histIdx < state.history.length - 1) {
         state.histIdx++;
-        hidden.value = state.history[state.histIdx];
+        lineInput.value = state.history[state.histIdx];
       } else {
         state.histIdx = state.history.length;
-        hidden.value = '';
+        lineInput.value = '';
       }
-      spEcho.textContent = hidden.value;
       return;
     }
 
     if (e.key === 'Tab') {
       e.preventDefault();
-      var prefix = hidden.value.trim().toLowerCase();
+      var prefix = lineInput.value.trim().toLowerCase();
       if (!prefix) return;
       var matches = COMMANDS.filter(function (c) { return c.indexOf(prefix) === 0; });
       if (matches.length === 1) {
-        hidden.value = matches[0] + ' ';
-        spEcho.textContent = hidden.value;
+        lineInput.value = matches[0] + ' ';
       } else if (matches.length > 1) {
-        print(state.user + '@saylter:' + shortPath() + '# ' + hidden.value, 'cmd');
+        print(state.user + '@saylter:' + shortPath() + '# ' + lineInput.value, 'cmd');
         print(matches.join('  '));
       }
       return;
@@ -2188,17 +2215,10 @@ setInterval(draw, 50);
     if (e.ctrlKey && (e.key === 'c' || e.key === 'C')) {
       e.preventDefault();
       print('^C');
-      hidden.value = '';
-      spEcho.textContent = '';
+      lineInput.value = '';
       showPrompt();
       return;
     }
-  });
-
-  /* 页面加载后终端本身仍然保持安静；只有点击过终端才会出现提示符。 */
-  body.addEventListener('click', function (e) {
-    if (e.target && e.target.tagName === 'TEXTAREA') return;
-    activate();
   });
 })();
 </script>
