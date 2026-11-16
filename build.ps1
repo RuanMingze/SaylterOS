@@ -80,7 +80,7 @@ if ($stage2Size -ne 2048) {
 foreach ($f in @('keyboard','mouse','font16x32','reboot','acpi','sha256','auth','slyzvm','mem','task','bsod')) {
     & $gcc $cfArgs -c -o "$bld\$f.o" "src\kernel\$f.c" 2>&1
 }
-foreach ($f in @('tty','editor')) {
+foreach ($f in @('tty','editor','ui')) {
     & $gcc $cfFastArgs -c -o "$bld\$f.o" "src\kernel\$f.c" 2>&1
 }
 foreach ($f in @('kernel','shell')) {
@@ -143,7 +143,7 @@ if ($acpicaFailed) {
 }
 Write-Host ("  ACPICA objects: {0}" -f $acpicaObjs.Count)
 
-foreach ($o in @('entry64','tty','keyboard','mouse','vbe','shell','font16x32','kernel','reboot','editor','acpi','sha256','auth','slyzvm','mem','task','bsod','slyzfs','slyzfs_bridge','kernel_disk')) {
+foreach ($o in @('entry64','tty','keyboard','mouse','vbe','shell','font16x32','kernel','reboot','editor','ui','acpi','sha256','auth','slyzvm','mem','task','bsod','slyzfs','slyzfs_bridge','kernel_disk')) {
     if (!(Test-Path "$bld\$o.o")) {
         Write-Host "  COMPILE FAILED: build\$o.o was not produced" -ForegroundColor Red
         exit 1
@@ -156,7 +156,7 @@ Write-Host '===== link ====='
 # 显式置 0 后符号值与 linker.ld 的 VMA 完全一致（_start = 0x100000）。
 & $gpp $cfArgs -o "$bld\kernel.elf" `
     "$bld\entry64.o" "$bld\tty.o" "$bld\keyboard.o" "$bld\mouse.o" `
-    "$bld\vbe.o" "$bld\shell.o" "$bld\font16x32.o" "$bld\kernel.o" "$bld\reboot.o" "$bld\editor.o" "$bld\acpi.o" `
+    "$bld\vbe.o" "$bld\shell.o" "$bld\font16x32.o" "$bld\kernel.o" "$bld\reboot.o" "$bld\editor.o" "$bld\ui.o" "$bld\acpi.o" `
     "$bld\sha256.o" "$bld\auth.o" "$bld\slyzvm.o" "$bld\mem.o" "$bld\task.o" "$bld\bsod.o" `
     "$bld\slyzfs.o" "$bld\slyzfs_bridge.o" "$bld\kernel_disk.o" `
     "$bld\acpica_osl.o" "$bld\acpica_glue.o" $acpicaObjs `

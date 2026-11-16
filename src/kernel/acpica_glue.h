@@ -37,6 +37,27 @@ int acpica_power_button_pending(void);
  * kernel/acpi.c 的 acpi_power_off()）。 */
 int acpica_request_s5(void);
 
+/* 固件定义的睡眠状态位图（bit0=S0 ... bit5=S5）。
+ * 只表示 DSDT 里有对应的 \_Sx 包，不代表 OS 已实现该状态的恢复。 */
+uint32_t acpica_firmware_sleep_mask(void);
+
+/* OS 已实现的睡眠状态位图（S0/S1/S2/S3/S5；S4 缺少休眠镜像）。 */
+uint32_t acpica_os_sleep_mask(void);
+
+/* 进入指定睡眠状态（1..5）。
+ * 返回 0 = 已成功进入并返回（S1/S2，或 QEMU 下被立即唤醒）；
+ *      -1 = ACPICA 未就绪；-2 = S4 无休眠镜像；-3 = 固件未定义该状态；
+ *      -4 = _PTS 准备失败；-5 = 写入 PM1_CNT 失败。
+ * S3 在真机上不会返回（CPU 掉电），唤醒后由固件跳回；QEMU 下
+ * system_wakeup 会从同一处继续执行并走唤醒恢复流程。 */
+int acpica_enter_sleep(uint8_t state);
+
+/* 最近一次唤醒源：0=未知，1=电源键，2=其他（GPE/定时器）。 */
+const char *acpica_last_wake_source(void);
+
+/* 已进入睡眠的次数（诊断用）。 */
+uint32_t acpica_sleep_count(void);
+
 /* 已处理的 SCI 中断次数（诊断用：为 0 说明硬件中断没送到）。 */
 uint32_t acpica_sci_count(void);
 

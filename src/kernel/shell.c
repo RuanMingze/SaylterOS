@@ -17,6 +17,7 @@
 #include "mem.h"
 #include "task.h"
 #include "bsod.h"
+#include "ui.h"
 
 /* ---- SlyzFS 目录项镜像结构 ----
  * 必须与 slyzfs.h 的 DirEntry 以及 bridge 层的 SlyzDirEntry 逐字节一致：
@@ -331,6 +332,10 @@ static const char *help_text[] = {
     "  reboot                          Reset the machine via 8042",
     "  poweroff / shutdown [n]         ACPI S5 shutdown (optional SLP_TYP 0..7)",
     "  acpi                            Show ACPI / PM1 status",
+    "  powercfg /a                     List S0-S5 sleep states and OS support",
+    "  powercfg /sleep <1..5>          Enter a sleep state (S2 is deprecated)",
+    "  powercfg /lastwake              Show last wake source",
+    "  powercfg /devices               Show power button / SCI wiring",
     "  useradd <name>                  Create a user (root only)",
     "  passwd [name]                   Change password (self or root)",
     "  su [name]                       Switch user (default root)",
@@ -744,7 +749,7 @@ static int levenshtein(const char *a, const char *b) {
 static const char *builtin_cmds[] = {
     "help","min","clear","cls","echo","dir","ls","pwd","cd","run","ask","dd","remove",
     "mkdir","rmdir","rm","del","df","nano","edit","cat","run","bg","kill","gui","version","uname","whoami","date","mem",
-    "reboot","poweroff","shutdown","halt","acpi","ps",
+    "reboot","poweroff","shutdown","halt","acpi","powercfg","ps",
     "useradd","passwd","su","logout","chmod","chown", 0
 };
 
@@ -1904,55 +1909,19 @@ static void cmd_remove(char *args) {
 }
 
 #ifdef SAYLTER_VBE
-#include "logo.h"
-
-static void vbe_draw_bitmap_centered(int ox, int oy, uint16_t w, uint16_t h, const uint32_t *src) {
-    if (!src) return;
-    for (uint16_t y = 0; y < h; y++) {
-        for (uint16_t x = 0; x < w; x++) {
-            uint32_t color = src[(uint32_t)y * w + x];
-            vbe_put_pixel((uint16_t)(ox + x), (uint16_t)(oy + y), color);
-        }
-    }
-}
-
 void gui_main(void) {
-    tty_clear();
-    tty_set_cursor(0, 0);
     vbe_init();
     if (!vbe_is_enabled()) {
         printk("[GUI] VBE not available.\n");
         return;
     }
 
-    vbe_fill_color(0x00000000);
+    ui_demo_main();
 
-    const int draw_x = (vbe_current.width - SAYLTER_LOGO_W) / 2;
-    const int draw_y = (vbe_current.height - SAYLTER_LOGO_H) / 2;
-    vbe_draw_bitmap_centered(draw_x, draw_y, SAYLTER_LOGO_W, SAYLTER_LOGO_H, saylter_logo_pixels);
-    vbe_swap();
-
-    for (;;) {
-        /* GUI 模式同样响应电源键：ACPICA fixed event 优先，
-         * 未安装时回退到 PM1_STS 轮询。 */
-        {
-            int power = acpica_power_button_pending();
-            if (!power && acpi_poll_power_button()) {
-                power = 1;
-            }
-            if (power) {
-                printk("\n[ACPI] power button: shutting down (S5)\n");
-                if (acpica_ready()) {
-                    acpica_request_s5();
-                }
-                acpi_power_off();
-            }
-        }
-        acpica_drain_deferred();
-        for (volatile int i = 0; i < 200000; i++) {
-            __asm__ volatile ("nop");
-        }
-    }
+    /* 返回 TTY：图形像素不能残留在终端区域，重新初始化后清屏 */
+    vbe_init();
+    tty_clear();
+    printk("[GUI] returned to shell\n");
 }
 #endif
 static void cmd_version(void) { printk("SaylterOS v0.3 (TTY shell)\n"); }
@@ -2040,6 +2009,146 @@ static void cmd_poweroff(const char *args) {
 static void cmd_acpi(void) {
     acpi_dump();
     acpica_dump();
+}
+
+/* ---- powercfg：仿 Windows 的电源状态管理 ----
+ *   powercfg /a              列出 S0..S5 的固件 / OS 支持情况
+ *   powercfg /sleep <1..5>   进入 S<n>（/s 为简写）
+ *   powercfg /lastwake       上次唤醒源与进入次数
+ *   powercfg /devices        电源按钮与 SCI 接线状态
+ *   powercfg /h on|off       休眠（S4）开关：当前无休眠镜像
+ * S2 按用户要求保留，但会明确提示 ACPI 规范已废弃该状态。 */
+static const char *powercfg_state_name(uint8_t s) {
+    switch (s) {
+        case 0: return "S0  Working";
+        case 1: return "S1  Standby (CPU clock stopped)";
+        case 2: return "S2  Standby (deprecated)";
+        case 3: return "S3  Suspend to RAM";
+        case 4: return "S4  Hibernate (disk image)";
+        case 5: return "S5  Soft off";
+        default: return "?";
+    }
+}
+
+static void powercfg_usage(void) {
+    printk("usage: powercfg /a | /sleep <1..5> | /lastwake | /devices | /h on|off\n");
+}
+
+static void cmd_powercfg(const char *args) {
+    char opt[16];
+    const char *p = args;
+    int i = 0;
+
+    while (p && *p == ' ') p++;
+    if (!p || !*p) {
+        powercfg_usage();
+        return;
+    }
+
+    while (*p && *p != ' ' && i < (int)sizeof(opt) - 1) {
+        opt[i++] = *p++;
+    }
+    opt[i] = '\0';
+    while (*p == ' ') p++;
+
+    if (cmd_strcmp(opt, "/a") == 0 || cmd_strcmp(opt, "/query") == 0 ||
+        cmd_strcmp(opt, "/avail") == 0) {
+        if (!acpica_ready()) {
+            printk("powercfg: ACPICA not initialized\n");
+            return;
+        }
+
+        uint32_t fw = acpica_firmware_sleep_mask();
+        uint32_t os = acpica_os_sleep_mask();
+
+        printk("Sleep states (S0-S5)\n\n");
+        for (uint8_t s = 0; s <= 5; s++) {
+            uint8_t f = (uint8_t)((fw >> s) & 1u);
+            uint8_t o = (uint8_t)((os >> s) & 1u);
+            printk("  %s  firmware:%s  os:%s%s\n",
+                   powercfg_state_name(s),
+                   f ? "yes" : "no ",
+                   o ? "yes" : "no ",
+                   (s == 2) ? "  [deprecated]" : "");
+        }
+
+        printk("\nUnavailable sleep states:\n");
+        if (!(fw & (1u << 1))) printk("  S1: firmware does not define \\_S1\n");
+        if (!(fw & (1u << 3))) printk("  S3: firmware does not define \\_S3\n");
+        if (!(os & (1u << 4))) printk("  S4: no hibernate image support\n");
+        printk("  S2: available here, but deprecated by the ACPI specification\n");
+        return;
+    }
+
+    if (cmd_strcmp(opt, "/sleep") == 0 || cmd_strcmp(opt, "/s") == 0 ||
+        cmd_strcmp(opt, "sleep") == 0) {
+        uint32_t v;
+
+        if (!acpica_ready()) {
+            printk("powercfg: ACPICA not initialized\n");
+            return;
+        }
+        if (!parse_u32(p, &v) || v > 5) {
+            printk("powercfg: sleep state must be 1..5\n");
+            return;
+        }
+        if (v == 0) {
+            printk("powercfg: S0 is the working state\n");
+            return;
+        }
+        if (v == 2) {
+            printk("powercfg: warning: S2 is deprecated by ACPI, entering anyway\n");
+        }
+
+        printk("Entering S%u...\n", (unsigned int)v);
+        int rc = acpica_enter_sleep((uint8_t)v);
+        if (rc != 0) {
+            printk("powercfg: cannot enter S%u (code %d)\n", (unsigned int)v, rc);
+            if (rc == -2) {
+                printk("  reason: S4 requires a hibernate image, not implemented\n");
+            } else if (rc == -3) {
+                printk("  reason: firmware does not define this state\n");
+            } else if (rc == -4) {
+                printk("  reason: _PTS preparation failed\n");
+            } else if (rc == -5) {
+                printk("  reason: PM1_CNT write failed\n");
+            }
+        }
+        return;
+    }
+
+    if (cmd_strcmp(opt, "/lastwake") == 0 || cmd_strcmp(opt, "/wake") == 0) {
+        if (!acpica_ready()) {
+            printk("powercfg: ACPICA not initialized\n");
+            return;
+        }
+        printk("Last wake source: %s\n", acpica_last_wake_source());
+        printk("Sleep entries   : %u\n", (unsigned int)acpica_sleep_count());
+        return;
+    }
+
+    if (cmd_strcmp(opt, "/devices") == 0) {
+        if (!acpica_ready()) {
+            printk("powercfg: ACPICA not initialized\n");
+            return;
+        }
+        acpica_dump();
+        return;
+    }
+
+    if (cmd_strcmp(opt, "/h") == 0 || cmd_strcmp(opt, "/hibernate") == 0) {
+        if (cmd_strcmp(p, "on") == 0) {
+            printk("powercfg: hibernate (S4) is not available: no hibernate image\n");
+        } else if (cmd_strcmp(p, "off") == 0) {
+            printk("powercfg: hibernate is already disabled\n");
+        } else {
+            printk("usage: powercfg /h on|off\n");
+        }
+        return;
+    }
+
+    printk("powercfg: unknown option '%s'\n", opt);
+    powercfg_usage();
 }
 
 /* ---- 任务管理：后台运行与 kill ---- */
@@ -2276,6 +2385,7 @@ static int exec_cmd(const char *cmd, char *args) {
     else if (cmd_strcmp(cmd, "poweroff") == 0 || cmd_strcmp(cmd, "shutdown") == 0 ||
              cmd_strcmp(cmd, "halt") == 0) cmd_poweroff(args);
     else if (cmd_strcmp(cmd, "acpi") == 0) cmd_acpi();
+    else if (cmd_strcmp(cmd, "powercfg") == 0) cmd_powercfg(args);
     else if (cmd_strcmp(cmd, "useradd") == 0 || cmd_strcmp(cmd, "adduser") == 0) cmd_useradd(args);
     else if (cmd_strcmp(cmd, "passwd") == 0) cmd_passwd(args);
     else if (cmd_strcmp(cmd, "su") == 0)     cmd_su(args);

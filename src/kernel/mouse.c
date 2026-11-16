@@ -57,20 +57,46 @@ static uint8_t mouse_command(uint8_t mouse_cmd) {
     return ack == 0xFA;
 }
 
+/* 读走 8042 输出缓冲里所有残留字节。
+ * 读配置字节（0x20）之前必须调用：输出缓冲里若有键盘扫描码，
+ * 会被当成配置字节读走，随后 0x60 写回时把键盘中断/时钟位关掉，
+ * 表现为“进入 GUI 后键盘完全失效”。 */
+static void flush_output(void) {
+    uint32_t guard = 100000;
+    while ((inb(STATUS_PORT) & 0x01) && guard--) {
+        (void)inb(DATA_PORT);
+    }
+}
+
 uint8_t ps2_mouse_init(void) {
+    static int initialized = 0;
+
+    if (initialized) {
+        return 1;
+    }
+
     /* 1. Enable 8042 second port */
+    flush_output();
     ctrl_command(0xA8);
 
-    /* 2. Read controller config byte, clear bit1 (disable mouse IRQ for polling) */
+    /* 2. Read controller config byte, keep keyboard alive */
+    flush_output();
     ctrl_command(0x20);
     uint8_t cfg = ctrl_read_data();
-    cfg &= ~0x02;                  /* bit1 = mouse IRQ; 清掉走 polling */
+
+    /* 显式保证键盘：中断使能、时钟使能；鼠标走轮询（关中断）。
+     * 只清 bit1 是不够的——若配置字节本身被读错，写回会把 bit0/bit4 弄坏。 */
+    cfg |= 0x01;                   /* bit0: keyboard IRQ on */
+    cfg &= (uint8_t)~0x10;         /* bit4: keyboard clock enabled */
+    cfg &= (uint8_t)~0x02;         /* bit1: mouse IRQ off (polling) */
+
     ctrl_command(0x60);
     ctrl_write_data(cfg);
 
     /* 3. Enable data reporting (mouse 0xF4 → ACK 0xFA) */
     if (!mouse_command(0xF4)) return 0;
 
+    initialized = 1;
     return 1;
 }
 

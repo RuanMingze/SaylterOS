@@ -116,6 +116,42 @@ void vbe_put_pixel(uint16_t x, uint16_t y, uint32_t color) {
     *back_ptr(x, y) = color;
 }
 
+uint32_t vbe_get_pixel(uint16_t x, uint16_t y) {
+    if (!vbe_is_enabled()) return 0;
+    if (x >= vbe_current.width || y >= vbe_current.height) return 0;
+    return *back_ptr(x, y);
+}
+
+void vbe_blend_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
+                    uint32_t color, uint8_t alpha) {
+    if (!vbe_is_enabled() || alpha == 0) return;
+    if (alpha == 255) {
+        vbe_fill_rect(x, y, w, h, color);
+        return;
+    }
+
+    uint32_t a = alpha;
+    uint32_t ia = 255u - a;
+    uint32_t sr = ((color >> 16) & 0xFFu) * a / 255u;
+    uint32_t sg = ((color >> 8) & 0xFFu) * a / 255u;
+    uint32_t sb = (color & 0xFFu) * a / 255u;
+
+    for (uint16_t row = 0; row < h; row++) {
+        uint32_t py = (uint32_t)y + row;
+        if (py >= vbe_current.height) break;
+        uint32_t *line = back_ptr(x, (uint16_t)py);
+        for (uint16_t col = 0; col < w; col++) {
+            uint32_t px = (uint32_t)x + col;
+            if (px >= vbe_current.width) break;
+            uint32_t d = line[col];
+            uint32_t dr = ((d >> 16) & 0xFFu) * ia / 255u;
+            uint32_t dg = ((d >> 8) & 0xFFu) * ia / 255u;
+            uint32_t db = (d & 0xFFu) * ia / 255u;
+            line[col] = 0xFF000000u | ((dr + sr) << 16) | ((dg + sg) << 8) | (db + sb);
+        }
+    }
+}
+
 void vbe_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint32_t color) {
     if (!vbe_is_enabled()) return;
     if ((uint32_t)x + w > vbe_current.width) return;
@@ -204,6 +240,37 @@ void vbe_draw_string(const char *s, uint16_t cx, uint16_t cy, uint32_t fg, uint3
     while (*s) {
         vbe_draw_char(cx, cy, *s++, fg, bg);
         cx++;
+    }
+}
+
+/* 像素坐标文本：GUI 组件需要 16px 网格之外的位置。
+ * 不走 g_row_lut：GUI 的前景/背景色组合多，缓存会频繁重建；
+ * 直接逐位写 dword，文本量小，开销可以接受。 */
+void vbe_draw_text_px(uint16_t x, uint16_t y, const char *s, uint32_t fg, uint32_t bg) {
+    if (!vbe_is_enabled()) return;
+
+    uint32_t stride = back_pitch_bytes / 4;
+    uint16_t px = x;
+
+    while (*s) {
+        if ((uint32_t)px + FONT16_W > vbe_current.width) return;
+        if ((uint32_t)y + FONT16_H > vbe_current.height) return;
+
+        const uint8_t (*glyph)[2] = font16x32[(uint8_t)(*s)];
+        for (int row = 0; row < FONT16_H; row++) {
+            uint32_t *line = back + (uint32_t)(y + row) * stride + px;
+            uint8_t left = glyph[row][0];
+            uint8_t right = glyph[row][1];
+            for (int i = 0; i < 8; i++) {
+                line[i] = (left & (0x80 >> i)) ? fg : bg;
+            }
+            for (int i = 0; i < 8; i++) {
+                line[8 + i] = (right & (0x80 >> i)) ? fg : bg;
+            }
+        }
+
+        px = (uint16_t)(px + FONT16_W);
+        s++;
     }
 }
 

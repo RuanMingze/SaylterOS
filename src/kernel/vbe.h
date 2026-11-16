@@ -34,6 +34,13 @@ void vbe_swap_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h);
 /* 单像素 */
 void vbe_put_pixel(uint16_t x, uint16_t y, uint32_t color);
 
+/* 读 backbuffer 像素（UI 的圆角阴影 / 高光需要做 alpha 混合） */
+uint32_t vbe_get_pixel(uint16_t x, uint16_t y);
+
+/* 把 color 以 alpha（0..255）混合到 backbuffer 矩形上 */
+void vbe_blend_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
+                    uint32_t color, uint8_t alpha);
+
 /* 实心矩形 */
 void vbe_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint32_t color);
 
@@ -44,6 +51,9 @@ void vbe_restore_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, const uint
 /* 16×32 字符绘制 */
 void vbe_draw_char(uint16_t cx, uint16_t cy, char c, uint32_t fg, uint32_t bg);
 void vbe_draw_string(const char *s, uint16_t cx, uint16_t cy, uint32_t fg, uint32_t bg);
+
+/* 像素坐标文本（GUI 用）：每个字形 16×32 像素，不返回边界外 */
+void vbe_draw_text_px(uint16_t x, uint16_t y, const char *s, uint32_t fg, uint32_t bg);
 
 /* ---- 文本终端专用：直写帧缓冲（单缓冲，不经过 backbuffer） ----
  * 终端字符量大、颜色固定，双缓冲会让每个字符多一次 2KB 的 LFB 复制；

@@ -39,6 +39,8 @@ static int      g_sci_enabled;
 static uint32_t g_sci_irq;
 static volatile uint32_t g_sci_count;
 static volatile int g_power_pending;
+static volatile uint32_t g_sleep_count;
+static volatile uint8_t  g_last_wake_source;
 
 static ACPI_STATUS acpica_device_callback(ACPI_HANDLE Object,
                                           UINT32 NestingLevel,
@@ -100,6 +102,7 @@ static UINT32 acpica_power_button_handler(void *Context)
 {
     (void)Context;
     g_power_pending = 1;
+    g_last_wake_source = 1;
     return ACPI_INTERRUPT_HANDLED;
 }
 
@@ -169,6 +172,131 @@ uint32_t acpica_sci_count(void)
     return g_sci_count;
 }
 
+/* ============================================================
+ * S0~S5 睡眠状态
+ * ------------------------------------------------------------
+ * S1/S2 只停 CPU 时钟，唤醒后从睡眠指令之后继续执行；
+ * S3 在真机上 CPU 掉电，需要固件唤醒向量（本项目尚未放置
+ * trampoline，QEMU 的 S3 是暂停 VM，唤醒后同样从这里继续）；
+ * S4 需要休眠镜像，未实现；
+ * S5 不会返回。
+ * ============================================================ */
+
+uint32_t acpica_firmware_sleep_mask(void)
+{
+    uint32_t mask = 1u;             /* S0 永远存在 */
+
+    for (uint8_t s = 1; s <= 5; s++) {
+        UINT8 a = 0;
+        UINT8 b = 0;
+        if (ACPI_SUCCESS(AcpiGetSleepTypeData(s, &a, &b))) {
+            mask |= (1u << s);
+        }
+    }
+    return mask;
+}
+
+uint32_t acpica_os_sleep_mask(void)
+{
+    /* S0/S1/S2/S3/S5 已实现；S4 缺休眠镜像，不宣称可用 */
+    return (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3) | (1u << 5);
+}
+
+/* S3 唤醒后 PIC 处于复位后的默认状态：重新做一次重映射与掩码设置。
+ * 与 pm.asm 的 pic_remap64 必须保持一致（IRQ0/1/2 + IRQ9）。 */
+static void acpica_reprogram_pic(void)
+{
+    outb(0x20, 0x11); outb(0x21, 0x20); outb(0x21, 0x04); outb(0x21, 0x01);
+    outb(0x21, 0xF8);
+    outb(0xA0, 0x11); outb(0xA1, 0x28); outb(0xA1, 0x02); outb(0xA1, 0x01);
+    outb(0xA1, 0xFD);
+    outb(0x4D1, (uint8_t)(inb(0x4D1) | 0x02));
+}
+
+static void acpica_after_wake(uint8_t state)
+{
+    uint16_t evt = acpi_pm1a_evt_port();
+
+    if (evt) {
+        uint16_t sts = inw(evt);
+        g_last_wake_source = (uint8_t)((sts & (1u << 8)) ? 1 : 2);
+    }
+
+    acpica_reprogram_pic();
+    g_power_pending = 0;
+
+    /* ACPICA 要求 Leave 阶段在关中断下执行 */
+    AcpiLeaveSleepStatePrep(state);
+    AcpiLeaveSleepState(state);
+
+    g_sci_enabled = 1;
+    __asm__ volatile ("sti" ::: "memory");
+
+    printk("[ACPI] resumed from S%u (wake source: %s)\n",
+           (unsigned int)state, acpica_last_wake_source());
+}
+
+int acpica_enter_sleep(uint8_t state)
+{
+    UINT8 slp_a = 0;
+    UINT8 slp_b = 0;
+    ACPI_STATUS status;
+
+    if (!g_acpica_ready) {
+        return -1;
+    }
+    if (state == 0 || state > 5) {
+        return -3;
+    }
+    if (state == 4) {
+        return -2;
+    }
+    if (ACPI_FAILURE(AcpiGetSleepTypeData(state, &slp_a, &slp_b))) {
+        return -3;
+    }
+
+    AcpiOsPrintf("[ACPICA] entering S%u (SLP_TYP A=%u B=%u)\n",
+                 (unsigned int)state,
+                 (unsigned int)slp_a, (unsigned int)slp_b);
+
+    status = AcpiEnterSleepStatePrep(state);
+    if (ACPI_FAILURE(status)) {
+        AcpiOsPrintf("[ACPICA] SleepStatePrep(S%u) failed: %s\n",
+                     (unsigned int)state, AcpiFormatException(status));
+        return -4;
+    }
+
+    __asm__ volatile ("cli" ::: "memory");
+    status = AcpiEnterSleepState(state);
+    if (ACPI_FAILURE(status)) {
+        __asm__ volatile ("sti" ::: "memory");
+        AcpiOsPrintf("[ACPICA] EnterSleepState(S%u) failed: %s\n",
+                     (unsigned int)state, AcpiFormatException(status));
+        return -5;
+    }
+
+    g_sleep_count++;
+
+    /* S1/S2 在硬件上停时钟，S3 在 QEMU 下暂停 VM：恢复后都从这里继续。
+     * 真机 S3 需要固件唤醒向量，当前没有 trampoline，不会回到这里。 */
+    acpica_after_wake(state);
+    return 0;
+}
+
+const char *acpica_last_wake_source(void)
+{
+    switch (g_last_wake_source) {
+        case 1:  return "power button";
+        case 2:  return "other (GPE/timer)";
+        default: return "unknown";
+    }
+}
+
+uint32_t acpica_sleep_count(void)
+{
+    return g_sleep_count;
+}
+
 int acpica_request_s5(void)
 {
     ACPI_STATUS status;
@@ -233,6 +361,11 @@ void acpica_dump(void)
     }
     printk("  power button : %s\n",
            g_fixed_power_installed ? "ACPI fixed event" : "PM1_STS polling fallback");
+    printk("  sleep mask   : firmware=0x%x os=0x%x\n",
+           (unsigned int)acpica_firmware_sleep_mask(),
+           (unsigned int)acpica_os_sleep_mask());
+    printk("  sleep entries: %u   last wake: %s\n",
+           (unsigned int)g_sleep_count, acpica_last_wake_source());
     printk("  PM1a_EVT/CNT : 0x%x / 0x%x\n",
            (unsigned int)acpi_pm1a_evt_port(),
            (unsigned int)acpi_pm1a_cnt_port());
