@@ -1,0 +1,52 @@
+{
+  "Slyz GUI program": {
+    "prefix": "gui",
+    "body": [
+      "#gui",
+      "title \"${1:My App}\"",
+      "size ${2:560} ${3:460}",
+      "",
+      "label \"${4:Hello}\"",
+      "",
+      "input name \"${5:Your name}\"",
+      "",
+      "button \"${6:Say hi}\" -> set:Hi {name}",
+      "button \"Date\" -> shell:date",
+      "space 8",
+      "hr",
+      "button \"Close\" -> close",
+      "$0"
+    ],
+    "description": "声明式 Slyz GUI 程序骨架（#gui 首行）"
+  },
+  "GUI label": {
+    "prefix": "label",
+    "body": ["label \"${1:Text}\"", "$0"],
+    "description": "静态文本"
+  },
+  "GUI input": {
+    "prefix": "input",
+    "body": ["input ${1:name} \"${2:Label}\"", "$0"],
+    "description": "文本输入框；名称用于 {name} 占位符"
+  },
+  "GUI button": {
+    "prefix": "button",
+    "body": ["button \"${1:Label}\" -> ${2|close,set:,open:,shell:|}${3}", "$0"],
+    "description": "按钮与动作：close / set: / open: / shell:"
+  },
+  "GUI button with shell": {
+    "prefix": "buttonshell",
+    "body": ["button \"${1:Run}\" -> shell:${2:date}", "$0"],
+    "description": "执行 shell 命令并把输出写入窗口"
+  },
+  "GUI button with input": {
+    "prefix": "buttonset",
+    "body": ["button \"${1:Say hi}\" -> set:${2:Hi} {${3:name}}", "$0"],
+    "description": "把输入框内容代入文本并输出"
+  },
+  "GUI size": {
+    "prefix": "size",
+    "body": ["size ${1:560} ${2:460}"],
+    "description": "窗口尺寸，最小 360 × 260"
+  }
+}

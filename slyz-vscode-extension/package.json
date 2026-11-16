@@ -1,8 +1,8 @@
 {
   "name": "saylter-slyz",
   "displayName": "Saylter SLYZ",
-  "description": "Syntax highlighting and validation for SaylterOS SLYZ scripts.",
-  "version": "0.1.0",
+  "description": "Syntax highlighting, GUI DSL snippets and validation for SaylterOS SLYZ scripts (#gui declarative UI and classic text scripts).",
+  "version": "0.2.0",
   "publisher": "saylter-os",
   "repository": {
     "type": "git",
@@ -34,6 +34,12 @@
         "language": "slyz",
         "scopeName": "source.slyz",
         "path": "./syntaxes/slyz.tmLanguage.json"
+      }
+    ],
+    "snippets": [
+      {
+        "language": "slyz",
+        "path": "./snippets/slyz.json"
       }
     ]
   },
