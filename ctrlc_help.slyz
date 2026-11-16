@@ -1,4 +1,0 @@
-echo Press Ctrl+C to abort a stuck command or script.
-echo If the shell looks frozen, press Ctrl+C once.
-echo Then try the command again or type exit.
-exit

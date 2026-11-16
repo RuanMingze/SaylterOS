@@ -666,7 +666,18 @@ int net_init(void) {
 }
 
 int net_ready(void) {
-    return g_info.initialized && g_info.present && g_info.link_up;
+    if (!g_info.initialized || !g_info.present) return 0;
+
+    /* 链路状态按需刷新：e1000 的 STATUS.LU 在协商完成后才置位，
+     * 初始化时的 2 秒轮询有可能刚好错过。任务栏/网络面板每次调用
+     * 这里时补读一次，避免"IP 已配置但永远显示未连接"。 */
+    if (!g_info.link_up) {
+        uint32_t status = e1000_read(E1000_STATUS);
+        if (status & E1000_STATUS_LU) {
+            g_info.link_up = 1;
+        }
+    }
+    return g_info.link_up;
 }
 
 struct NetInfo *net_info(void) {
@@ -1664,4 +1675,190 @@ void net_poll(void) {
         e1000_write(E1000_RDT, g_rx_cur);
         g_rx_cur = (g_rx_cur + 1u) % NET_RX_COUNT;
     }
+}
+
+/* ============================================================
+ * HTTP GET（GUI 浏览器使用）
+ * ------------------------------------------------------------
+ * 约束：
+ *   1. 只支持 http://（https 需要 TLS，当前未实现）；
+ *   2. 不跟随 3xx 重定向，状态码原样交给调用方显示；
+ *   3. 用 HTTP/1.0 请求，避免 chunked 编码——1.0 下服务器要么给
+ *      Content-Length，要么直接关连接，两者都能线性读完；
+ *   4. 只把响应体拷进调用方缓冲，头部在缓冲内就地前移覆盖。
+ * 返回响应体长度；-1 = 参数/连接失败；-2 = 头部不完整。
+ * ============================================================ */
+
+static int http_parse_url(const char *url, char *host, int host_cap,
+                          uint16_t *port, char *path, int path_cap) {
+    if (!url || !host || !port || !path) return 0;
+    if (host_cap < 4 || path_cap < 4) return 0;
+
+    const char *p = url;
+    const char *prefix = "http://";
+    for (int i = 0; prefix[i]; i++) {
+        if (p[i] != prefix[i]) return 0;
+    }
+    p += 7;
+
+    int hi = 0;
+    while (*p && *p != ':' && *p != '/' && hi < host_cap - 1) {
+        host[hi++] = *p++;
+    }
+    host[hi] = '\0';
+    if (hi == 0) return 0;
+
+    *port = 80;
+    if (*p == ':') {
+        p++;
+        uint32_t v = 0;
+        int digits = 0;
+        while (*p >= '0' && *p <= '9') {
+            v = v * 10u + (uint32_t)(*p - '0');
+            p++;
+            digits++;
+            if (v > 65535u) return 0;
+        }
+        if (digits == 0 || v == 0) return 0;
+        *port = (uint16_t)v;
+    }
+
+    if (*p == '\0') {
+        path[0] = '/';
+        path[1] = '\0';
+        return 1;
+    }
+    if (*p != '/') return 0;
+
+    int pi = 0;
+    while (*p && pi < path_cap - 1) path[pi++] = *p++;
+    path[pi] = '\0';
+    return 1;
+}
+
+static int http_append(char *buf, int cap, int *pos, const char *s) {
+    while (*s) {
+        if (*pos >= cap - 1) return 0;
+        buf[(*pos)++] = *s++;
+    }
+    buf[*pos] = '\0';
+    return 1;
+}
+
+int net_http_get(const char *url, char *out, int cap, int *status_out,
+                 char *ctype_out, int ctype_cap) {
+    if (!url || !out || cap < 2048) return -1;
+    if (status_out) *status_out = 0;
+    if (ctype_out && ctype_cap > 0) ctype_out[0] = '\0';
+
+    char host[96];
+    char path[256];
+    uint16_t port = 80;
+    if (!http_parse_url(url, host, (int)sizeof(host), &port,
+                        path, (int)sizeof(path))) {
+        return -1;
+    }
+
+    if (!net_ready()) return -1;
+
+    uint32_t ip = 0;
+    if (!net_dns_resolve(host, &ip, 6000u)) return -1;
+
+    if (net_tcp_connect(ip, port, 6000u) != 0) return -1;
+
+    char req[512];
+    int rp = 0;
+    req[0] = '\0';
+
+    http_append(req, (int)sizeof(req), &rp, "GET ");
+    http_append(req, (int)sizeof(req), &rp, path);
+    http_append(req, (int)sizeof(req), &rp, " HTTP/1.0\r\nHost: ");
+    http_append(req, (int)sizeof(req), &rp, host);
+    http_append(req, (int)sizeof(req), &rp,
+                "\r\nUser-Agent: SaylterOS/0.3-Beta1 (x86_64)\r\n"
+                "Accept: text/html,application/xhtml+xml,text/plain,*/*\r\n"
+                "Connection: close\r\n\r\n");
+
+    if (net_tcp_send(req, (uint32_t)rp, 4000u) < 0) {
+        net_tcp_close();
+        return -1;
+    }
+
+    int total = 0;
+    int idle = 0;
+
+    while (total < cap - 1) {
+        int n = net_tcp_recv(out + total, (uint32_t)(cap - 1 - total), 600u);
+        if (n > 0) {
+            total += n;
+            idle = 0;
+            continue;
+        }
+        if (n == 0) break;
+        idle++;
+        if (idle >= 8) break;
+    }
+
+    net_tcp_close();
+    out[total] = '\0';
+
+    if (total <= 0) return -1;
+
+    int hdr_end = -1;
+    for (int i = 0; i + 3 < total; i++) {
+        if (out[i] == '\r' && out[i + 1] == '\n' &&
+            out[i + 2] == '\r' && out[i + 3] == '\n') {
+            hdr_end = i + 4;
+            break;
+        }
+    }
+    if (hdr_end < 0) return -2;
+
+    if (status_out) {
+        int sp = 0;
+        while (sp + 3 < hdr_end &&
+               !(out[sp] == 'H' && out[sp + 1] == 'T' &&
+                 out[sp + 2] == 'T' && out[sp + 3] == 'P')) {
+            sp++;
+        }
+        int q = sp;
+        while (q < hdr_end && out[q] != ' ') q++;
+        if (q + 3 < hdr_end &&
+            out[q + 1] >= '0' && out[q + 1] <= '9' &&
+            out[q + 2] >= '0' && out[q + 2] <= '9' &&
+            out[q + 3] >= '0' && out[q + 3] <= '9') {
+            *status_out = (out[q + 1] - '0') * 100 +
+                          (out[q + 2] - '0') * 10 +
+                          (out[q + 3] - '0');
+        }
+    }
+
+    if (ctype_out && ctype_cap > 0) {
+        for (int i = 0; i + 12 < hdr_end; i++) {
+            if ((out[i] == 'C' || out[i] == 'c') &&
+                (out[i + 1] == 'o') && (out[i + 2] == 'n') &&
+                (out[i + 3] == 't') && (out[i + 4] == 'e') &&
+                (out[i + 5] == 'n') && (out[i + 6] == 't') &&
+                out[i + 7] == '-' &&
+                (out[i + 8] == 'T' || out[i + 8] == 't') &&
+                out[i + 9] == 'y' && out[i + 10] == 'p' &&
+                out[i + 11] == 'e') {
+                int j = i + 12;
+                if (j < hdr_end && out[j] == ':') j++;
+                while (j < hdr_end && (out[j] == ' ' || out[j] == '\t')) j++;
+                int k = 0;
+                while (j < hdr_end && out[j] != '\r' && out[j] != '\n' &&
+                       k < ctype_cap - 1) {
+                    ctype_out[k++] = out[j++];
+                }
+                ctype_out[k] = '\0';
+                break;
+            }
+        }
+    }
+
+    int body_len = total - hdr_end;
+    for (int i = 0; i < body_len; i++) out[i] = out[hdr_end + i];
+    out[body_len] = '\0';
+    return body_len;
 }

@@ -47,6 +47,7 @@ struct Task {
 
     /* 执行统计 */
     uint32_t steps;
+    uint32_t disk_written;   /* 该任务经 SlyzFS 写出的字节数（任务管理器显示） */
     int      exit_code;
 
     /* 该任务名下的分配块，退出时统一回收 */
@@ -90,6 +91,11 @@ void task_wait(int id);
 
 int  task_count_alive(void);
 uint32_t task_total_used(void);
+
+/* 磁盘写入记账：SlyzFS 的写入路径在完成一次写后调用，
+ * 把字节数记到当前任务名下；内核上下文（当前任务为 0）同样记账。 */
+void task_account_disk(uint32_t bytes);
+uint32_t task_total_disk_written(void);
 
 /* ps 输出 */
 void task_dump(void);

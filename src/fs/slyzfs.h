@@ -104,6 +104,15 @@ static constexpr uint8_t  DIR_DIR      = 0x02;
 /* 文件名长度（8.3 风格，留 null 结尾） */
 static constexpr int      SLYZ_NAME_MAX = 52;
 
+/* 受保护文件标志 —— mode 的最高位。
+ * 语义与权限位（低 12 位）完全正交：
+ *   - 受保护文件不能被 remove 删除，即使调用者是 root；
+ *   - 不能被 create() 截断，也不能被 open("w") 清空；
+ *   - 不能被 chmod/chown 改写元数据（否则可以先把保护位改掉再删）。
+ * 只有显式提权接口 set_protected(path, false) 才能解除，而该接口
+ * 自身要求调用者是 root。这样构成"root + 显式操作"的双重门槛。 */
+static constexpr uint16_t MODE_PROTECTED = 0x8000;
+
 /* ======================= 结构 ======================= */
 
 #pragma pack(push, 1)
@@ -255,6 +264,13 @@ public:
     /* 修改 owner。需要 root 身份（目录 owner 也不能把文件送人）。 */
     bool chown(const char* path, uint8_t uid);
 
+    /* 设置 / 清除受保护标志。只有 root（uid 0）可以调用；
+     * 设置后 remove/create 截断/chmod/chown 全部拒绝，root 也不例外。 */
+    bool set_protected(const char* path, bool on);
+
+    /* 查询受保护标志；路径不存在或不是普通文件时返回 false。 */
+    bool is_protected(const char* path);
+
     /* 解析目录路径并返回其条目副本（根目录返回合成的 uid 0 / 0755 条目）。 */
     bool resolve_dir_entry(const char* path, DirEntry* out);
 
@@ -295,9 +311,12 @@ private:
     static uint8_t access_bits(const DirEntry& de, uint16_t uid);
     static bool has_perm(const DirEntry& de, uint16_t uid, uint8_t want);
 
-    /* 就地更新目录条目的 mode / uid，set_mode/set_uid 控制哪些字段生效。 */
+    /* 就地更新目录条目的 mode / uid，set_mode/set_uid 控制哪些字段生效。
+     * protect：-1 = 不改变保护位（chmod/chown 路径，受保护文件直接拒绝）；
+     *           0 = 清除保护位；1 = 设置保护位（set_protected 专用，
+     *           调用方必须已校验 root 身份）。 */
     bool update_meta(const char* path, uint16_t mode, uint8_t uid,
-                     bool set_mode, bool set_uid);
+                     bool set_mode, bool set_uid, int protect = -1);
 
     /* 当前操作者（进程级，非线程安全；裸内核单线程） */
     static uint16_t g_current_uid;

@@ -80,6 +80,22 @@ uint8_t kb_num_locked(void) {
     return num_lock;
 }
 
+void kb_flush(void) {
+    /* 关中断再同步 head/tail，避免 ISR 在赋值中间写入新扫描码 */
+    uint64_t flags;
+    __asm__ volatile ("pushfq; popq %0" : "=r"(flags));
+    __asm__ volatile ("cli");
+
+    KB_TAIL = KB_HEAD;
+    shift_pressed = 0;
+    ctrl_pressed = 0;
+    ext_prefix = 0;
+
+    if (flags & 0x200u) {
+        __asm__ volatile ("sti");
+    }
+}
+
 static int is_alpha_code(uint8_t code) {
     return (code >= 0x10 && code <= 0x19) ||
            (code >= 0x1E && code <= 0x26) ||

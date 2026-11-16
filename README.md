@@ -1,8 +1,8 @@
 # SaylterOS
 
-SaylterOS 是一个运行在 x86（32 位）上的裸金属操作系统：没有宿主系统、没有标准库、没有现成文件系统，从 MBR 开始全部自己实现。引导链由汇编完成，进入保护模式后交给 C/C++ 内核，提供带用户账户与文件权限的 TTY Shell、自研 SlyzFS 文件系统、全屏文本编辑器，以及 ACPI S5 关机与电源键支持。
+SaylterOS 是一个运行在 x86_64（64 位长模式）上的裸金属操作系统：没有宿主系统、没有标准库、没有现成文件系统，从 MBR 开始全部自己实现。引导链由汇编完成，先进入 32 位保护模式完成内核搬运与页表建立，再切入 64 位长模式交给 C/C++ 内核，提供完整图形桌面、SMP 多核、4KB 分页与 swap、自研 SlyzFS 文件系统、E1000 网络栈以及 ACPI S5 关机与电源键支持。
 
-当前版本：**v0.0.3-Alpha3**（代码内版本号 `v0.3`）。
+当前版本：**v0.3 Beta1**（代码内版本号 `v0.3 Beta1`）。
 ⚠️警告：此版本未进行实机验证，并且 SlyzFS 的代码里存在危险行为，会在挂载失败时自动格式化目标分区。谨慎实机运行！我不为冒着风险尝试实体机运行导致丢数据承担责任。
 
 ---
@@ -11,22 +11,26 @@ SaylterOS 是一个运行在 x86（32 位）上的裸金属操作系统：没有
 
 | 模块 | 状态 |
 |---|---|
-| 自研引导链（MBR → Stage2 → 保护模式 → 内核） | 可用 |
+| 自研引导链（MBR → Stage2 → 保护模式 → 长模式 → 内核） | 可用 |
 | VGA 文本模式 TTY Shell | 可用 |
-| VBE 图形界面 | 仅 Logo 展示 |
+| 完整图形桌面（窗口管理、任务栏、文件管理器、编辑器、终端、浏览器、设置、任务管理器、计算器） | 可用 |
+| 桌面右键菜单、桌面图标、鼠标滚轮与终端历史滚动条 | 可用 |
 | SlyzFS 文件系统（目录、文件、权限） | 可用 |
 | 用户账户、登录、口令哈希 | 可用 |
 | 文件权限（mode / owner，FS 层强制） | 可用 |
+| 受保护文件（MODE_PROTECTED，root 也不能删除） | 可用 |
 | 全屏文本编辑器 `nano` | 可用 |
-| 内核堆（1 MB，first-fit + 相邻合并） | 可用 |
+| 内核堆（6 MB，first-fit + 相邻合并） | 可用 |
 | 任务与内存配额、OOM 回收 | 可用（协作式调度） |
-| `bg` 后台任务、`kill` 强杀 | 可用 |
-| 内核崩溃蓝屏（冻结硬件） | 可用 |
+| 4KB 分页、按需分页、缺页处理 | 可用 |
+| swap 文件分页（etc\pagefile.os，16 MB 容量） | 可用 |
+| SMP 多核启动与并行工作池（0xF0 IPI + 静态轮转分片） | 可用 |
+| 内核崩溃蓝屏（冻结硬件） | 可用，致命缺页会进入蓝屏 |
 | ACPI S5 关机 + 电源键识别 | 可用 |
 | 8042 硬件重启 | 可用 |
 | 动态提示符 + TTY 底部安全区 | 可用 |
 | SLYZ 二进制字节码（SLYZBIN v1） | 可用，同时兼容旧文本脚本 |
-| 网络、多任务、分页、SMP | 未实现 |
+| E1000 有线网络（ARP/IPv4/ICMP/UDP/DNS/TCP/HTTP） | 可用 |
 
 ---
 
@@ -159,36 +163,50 @@ root 的 hash 为空表示无密码。普通用户读取 `\etc\shadow` 会被文
 
 ```
 SaylterOS/
-├── build.ps1                    唯一的构建入口（生成三个镜像）
-├── run-ide.ps1                  以 IDE 硬盘方式启动 QEMU
-├── linker.ld                    内核链接脚本（起始 0xA200）
+├── build.ps1                    唯一的构建入口（生成 IDE 与安装盘镜像）
+├── run-ide.ps1                  以 IDE 硬盘方式启动 QEMU（-Smp / -Persist / -Headless）
+├── linker.ld                    内核链接脚本（起始 0x100000）
 ├── src/
 │   ├── boot/
 │   │   ├── boot.asm             MBR，分段加载后续镜像
-│   │   ├── stage2.asm           Stage2（A20、内存探测）
-│   │   ├── pm.asm               进入 32 位保护模式
-│   │   └── entry32.asm          32 位入口，清 BSS 后跳入 C 内核
+│   │   ├── stage2.asm           Stage2（A20、内存探测、VBE 模式）
+│   │   ├── pm.asm               保护模式 → 页表 → 长模式 → IDT/PIC
+│   │   ├── entry64.asm          64 位入口，清 BSS 后跳入 kernel_main
+│   │   └── ap_tramp.asm         AP 启动 trampoline（16→32→64 位）
 │   ├── kernel/
-│   │   ├── kernel.c             kernel_main，初始化串口/ACPI/界面
+│   │   ├── kernel.c             kernel_main，初始化串口/显示/SMP
+│   │   ├── gui.c                图形桌面：启动页、登录、窗口、7 个应用
+│   │   ├── vm.c / vm.h          4KB 页帧、按需分页、时钟换出、swap
+│   │   ├── smp.c / smp.h        多核启动、0xF0 IPI 并行工作池
+│   │   ├── apic.c / apic.h      Local APIC 驱动
+│   │   ├── net.c / net.h        E1000 + TCP/IP 栈
+│   │   ├── netcmds.c            ip / curl / ping / nslookup 命令
 │   │   ├── shell.c              Shell、登录会话、命令分发、GUI 入口
-│   │   ├── tty.c / tty.h        VGA 文本输出、滚动区与安全区
+│   │   ├── tty.c / tty.h        字符终端、滚动区与安全区
 │   │   ├── keyboard.c / .h      PS/2 键盘，扫描码到字符
-│   │   ├── mouse.c / .h         鼠标（VBE 版）
-│   │   ├── vbe.c / vbe.h        VBE 帧缓冲
+│   │   ├── mouse.c / .h         鼠标（含 IntelliMouse 滚轮）
+│   │   ├── vbe.c / vbe.h        VBE 帧缓冲与裁剪
+│   │   ├── ui.c / ui.h          图形组件库
+│   │   ├── html.c / html.h      GUI 浏览器的 HTML/CSS 子集渲染
 │   │   ├── font16x32.c          16x32 点阵字模
 │   │   ├── editor.c / .h        nano 风格全屏编辑器
 │   │   ├── auth.c / .h          账户库、登录、口令哈希
 │   │   ├── sha256.c / .h        SHA-256（FIPS 180-4）
-│   │   ├── acpi.c / .h          RSDP/FADT 解析、S5、电源键轮询
+│   │   ├── acpi.c / .h          RSDP/FADT 解析、S5、电源键
+│   │   ├── acpica_osl.c         ACPICA 平台层（AML 解释器）
 │   │   ├── slyzvm.c / .h        SLYZBIN 字节码虚拟机
-│   │   ├── reboot.c / .h        8042 硬件复位
+│   │   ├── task.c / mem.c       协作式任务、内存配额、内核堆
+│   │   ├── bsod.c / .h          蓝屏：冻结中断与任务
+│   │   ├── system_cfg.c         启动模式 / 时区配置
 │   │   └── io.h                 端口 I/O 内联封装
 │   └── fs/
-│       ├── slyzfs.cpp / .h      SlyzFS 实现（C++，含权限检查）
+│       ├── slyzfs.cpp / .h      SlyzFS 实现（C++，含权限与受保护位）
 │       ├── slyzfs_bridge.cpp    C++ → C 的 extern "C" 桥接
 │       └── kernel_disk.cpp      磁盘抽象（ATA PIO 对接）
+├── third_party/acpica/          AML 解释器
 ├── fonts/                       字模源数据与授权说明
 ├── tools/                       字体生成与调试脚本
+├── samples/                     SLYZ / GUI 示例程序
 └── slyz-vscode-extension/       .slyz 脚本的 VS Code 语法扩展
 ```
 
@@ -221,12 +239,12 @@ LBA 130..193→ 0x18000
 
 | 约束 | 原因 |
 |---|---|
-| `.data` 结束 < `0x20000` | 引导只加载到这里，超出部分不会进内存 |
-| `.bss` 结束 < `0xA0000` | 640 KB 以上是 VGA 显存与 BIOS ROM 映射区，写入被忽略 |
+| `.data/.reloc` 结束 < `0x3F0000` | `0x3FF000` 是内核初始栈顶，镜像不能顶到栈 |
+| `.bss` 结束 < `0x1400000` | BSS 从 18 MB 起，必须留在 20 MB 内存范围内 |
 | 编译必须带 `-mno-sse -mno-sse2 -mno-mmx -mno-3dnow` | 裸内核未置位 `CR4.OSFXSR`，SSE 指令会触发 `#UD` 并卡死 |
-| 编译固定 `-O0` | 高优化级别会插入 SSE 指令与栈探针 |
+| 编译默认 `-O0`，绘制热路径 `-O2` | 高优化级别会插入 SSE 指令与栈探针，热路径显式关闭循环改写 |
 
-当前实测：`.data` 结束于 `0x1CE44`（余量约 29 KB），`.bss` 结束于 `0x869C0`（距 640 KB 红线约 100 KB）。新增模块后需重新核算，必要时提高 `boot.asm` 的 `IMG_TAIL_SECTORS`（当前 128）。
+当前实测：内核镜像约 592 KB，装载结束于 `0x194200`；`.bss` 结束于 `0x1350700`（距 20 MB 上界约 700 KB）。新增模块后 `build.ps1` 会自动重新核算并拒绝越界构建。
 
 ### SlyzFS
 
@@ -296,7 +314,7 @@ root@os:~# run demo.bin
 
 ### 内存管理与任务
 
-内核堆固定在物理地址 `0x100000`（1 MB 起 1 MB），不占用 `.bss`，分配器为 first-fit + 相邻空闲块合并，带总/已用/峰值/失败次数统计（`mem` 命令）。
+内核堆固定在物理地址 `0x400000`（4 MB 起 6 MB），不占用 `.bss`，分配器为 first-fit + 相邻空闲块合并，带总/已用/峰值/失败次数统计（`mem` 命令）。4 KB 页帧池从 24 MB 起，上界为检测到的 RAM − 4 MB。
 
 任务模型（`task.c`）：
 
@@ -315,7 +333,7 @@ root@os:~# run demo.bin
 
 `kill 0` 不会真的终止内核：它会要求二次确认，然后进入崩溃蓝屏（[bsod.c](src/kernel/bsod.c)）。蓝屏不是装饰——关闭中断、屏蔽 8259 全部 IRQ、停止所有任务、不再执行任何磁盘写入，CPU 冻结在 `cli; hlt` 循环里，只能靠电源键或复位离开。
 
-**这不是虚拟内存**：没有分页、没有地址空间隔离，越界写仍然会直接破坏内核。配额是软件层面的资源上限，用来演示 OOM 语义，不是硬件保护。
+**任务配额与分页是两个层次**：配额是软件层面的资源上限，用来演示 OOM 语义；硬件分页已经实现，但当前只有一个 16 MB 的按需窗口（`0x20000000`），没有按进程的独立地址空间。窗口外或保护违规的缺页会进入蓝屏，而不是杀死某个进程。跨核 TLB shootdown 尚未实现，AP 不访问按需窗口。
 
 ### ACPI
 
@@ -338,11 +356,12 @@ Shell 提示符始终绘制在屏幕底部的保留区，命令输出只滚动�
 
 ## 已知限制
 
-- 单核、单线程、无分页、无抢占，所有等待都是忙轮询
-- 没有硬件虚拟内存：任务只有软件内存配额，指针越界仍会破坏内核；调度为协作式，不抢占
-- 无 `rm`、`sudo`、用户组、setuid
+- SMP 只在 3 颗 vCPU 的 QEMU 环境验证；`-smp 4` 时第 4 颗核在 QEMU TCG 下启动超时，工作池只使用成功在线的核
+- 分页只有一个 16 MB 按需窗口，没有按进程地址空间隔离；致命缺页直接进入蓝屏，没有进程级 OOM-kill
+- 跨核 TLB shootdown 尚未实现，AP 不访问按需分页区；GUI 并行渲染只用于大面积全屏重绘
+- 无 `sudo`、用户组、setuid
 - 口令哈希无迭代 KDF（无 PBKDF2/Argon2），仅单轮 SHA-256
-- VBE 模式只显示 Logo，尚未实现图形 Shell
+- 网络为同步轮询实现，不支持中断收包与 DHCP；IP 为静态配置
 - SLYZ 虚拟机只支持 `echo/ask/set/if/else/endif/run/clear/help/exit` 与整行 shell 命令
 - 每次运行 `build.ps1` 都会重建 `saylter-ide.img`，其中的用户与文件会被清空
 
@@ -352,6 +371,7 @@ Shell 提示符始终绘制在屏幕底部的保留区，命令输出只滚动�
 
 | 版本 | 主要内容 |
 |---|---|
+| v0.3 Beta1 | 完整 GUI（窗口管理、任务管理器、计算器、鼠标滚轮与终端滚动条、桌面右键）、SMP 多核并行工作池、4KB 分页与 swap 文件、E1000 网络栈、ACPI 电源管理、致命缺页接入蓝屏 |
 | v0.0.3-Alpha3 | SlyzFS 接入 Shell、用户账户与权限、nano 编辑器、ACPI S5 与电源键、动态提示符与安全区 |
 | v0.0.3-Alpha2 | VBE 图形界面、字体渲染、鼠标支持 |
 | v0.0.3-Alpha1 | 保护模式、中断、C 内核与基础 Shell |

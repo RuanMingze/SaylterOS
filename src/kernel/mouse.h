@@ -20,4 +20,9 @@ void    ps2_mouse_disable(void);
 /* 非阻塞 poll：返回 1 表示有新数据包（3 字节完整），0 表示现在没数据 */
 uint8_t ps2_mouse_poll(int8_t *out_dx, int8_t *out_dy, uint8_t *out_buttons);
 
+/* 带滚轮版本：若设备支持 IntelliMouse 扩展，out_wheel 返回 4 位有符号
+ * 滚轮值（正 = 向上滚）；普通 3 字节设备恒为 0。out_wheel 可为 NULL。 */
+uint8_t ps2_mouse_poll_ex(int8_t *out_dx, int8_t *out_dy, uint8_t *out_buttons,
+                          int8_t *out_wheel);
+
 #endif /* MOUSE_H */

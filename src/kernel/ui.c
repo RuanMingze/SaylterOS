@@ -153,11 +153,44 @@ void ui_round_gradient(ui_rect r, int radius, uint32_t top, uint32_t bottom)
     }
 }
 
+/* 只填充圆角矩形的 1px 外框。
+ * 阴影本质上就是窗口外的一圈渐变，旧实现每圈都整块 alpha 混合，
+ * 10 圈就是 10 倍窗口面积；1600x900 下每次重绘要混合数百万像素，
+ * 是 GUI 卡顿的主因。改成逐圈画外框后成本降到周长级别。 */
+static void ui_round_border_alpha(ui_rect r, int radius, uint32_t color, uint8_t alpha)
+{
+    if (r.w <= 0 || r.h <= 0 || alpha == 0) return;
+    if (radius > r.w / 2) radius = r.w / 2;
+    if (radius > r.h / 2) radius = r.h / 2;
+
+    for (int dy = 0; dy < r.h; dy++) {
+        int inset = 0;
+        if (radius > 0 && dy < radius) {
+            inset = ui_round_inset(radius, dy);
+        } else if (radius > 0 && dy >= r.h - radius) {
+            inset = ui_round_inset(radius, r.h - 1 - dy);
+        }
+
+        int x0 = r.x + inset;
+        int x1 = r.x + r.w - inset;
+        if (x1 <= x0) continue;
+
+        if (dy == 0 || dy == r.h - 1 || inset > 0) {
+            /* 顶/底行与圆角行需要整行，否则圆角会缺像素 */
+            vbe_blend_rect((uint16_t)x0, (uint16_t)(r.y + dy),
+                           (uint16_t)(x1 - x0), 1, color, alpha);
+        } else {
+            vbe_blend_rect((uint16_t)x0, (uint16_t)(r.y + dy), 1, 1, color, alpha);
+            vbe_blend_rect((uint16_t)(x1 - 1), (uint16_t)(r.y + dy), 1, 1, color, alpha);
+        }
+    }
+}
+
 void ui_shadow(ui_rect r, int radius, int spread)
 {
     if (r.w <= 0 || r.h <= 0 || spread <= 0) return;
 
-    /* 由外向内叠加半透明圆角矩形，形成柔和投影 */
+    /* 由外向内叠加半透明圆角外框，形成柔和投影 */
     for (int i = spread; i >= 1; i--) {
         ui_rect s;
         uint8_t alpha;
@@ -168,7 +201,7 @@ void ui_shadow(ui_rect r, int radius, int spread)
         s.h = r.h + i * 2;
         alpha = (uint8_t)(8 + (spread - i) * 10);
 
-        ui_round_fill_alpha(s, radius + i, 0x000000, alpha);
+        ui_round_border_alpha(s, radius + i, 0x000000, alpha);
     }
 }
 
@@ -231,36 +264,128 @@ void ui_text(int x, int y, const char *s, uint32_t fg, uint32_t bg)
     vbe_draw_text_px((uint16_t)x, (uint16_t)y, s, fg, bg);
 }
 
-/* 透明文本：只画前景像素，用于渐变/图片上，不会留下色块 */
-static void ui_text_px_transparent(int x, int y, const char *s, uint32_t fg)
+/* 绘制前 n 个字符（不越过字符串结尾）。
+ * 按"连续像素段"合并填充，避免逐像素调用把文本渲染拖慢。 */
+static void ui_text_px_n(int x, int y, const char *s, int n, uint32_t fg)
 {
     extern const uint8_t font16x32[256][32][2];
     int px = x;
 
-    while (*s) {
-        const uint8_t (*glyph)[2] = font16x32[(uint8_t)(*s)];
+    for (int k = 0; k < n && s[k]; k++) {
+        const uint8_t (*glyph)[2] = font16x32[(uint8_t)s[k]];
         for (int row = 0; row < 32; row++) {
-            uint8_t left = glyph[row][0];
-            uint8_t right = glyph[row][1];
-            for (int i = 0; i < 8; i++) {
-                if (left & (0x80 >> i)) {
-                    vbe_put_pixel((uint16_t)(px + i), (uint16_t)(y + row), fg);
+            uint16_t bits = (uint16_t)(((uint16_t)glyph[row][0] << 8) | glyph[row][1]);
+            int i = 0;
+            while (i < 16) {
+                if ((bits & (uint16_t)(0x8000u >> i)) == 0) {
+                    i++;
+                    continue;
                 }
-            }
-            for (int i = 0; i < 8; i++) {
-                if (right & (0x80 >> i)) {
-                    vbe_put_pixel((uint16_t)(px + 8 + i), (uint16_t)(y + row), fg);
+                int start = i;
+                while (i < 16 && (bits & (uint16_t)(0x8000u >> i)) != 0) {
+                    i++;
                 }
+                vbe_fill_rect((uint16_t)(px + start), (uint16_t)(y + row),
+                              (uint16_t)(i - start), 1, fg);
             }
         }
         px += 16;
-        s++;
     }
+}
+
+/* 透明文本：只画前景像素，用于渐变/图片上，不会留下色块 */
+static void ui_text_px_transparent(int x, int y, const char *s, uint32_t fg)
+{
+    int n = 0;
+    while (s[n]) n++;
+    ui_text_px_n(x, y, s, n, fg);
 }
 
 void ui_text_transparent(int x, int y, const char *s, uint32_t fg)
 {
     ui_text_px_transparent(x, y, s, fg);
+}
+
+/* 从 p 开始切出一行：最多 cols 个字符，遇 '\n' 截止。
+ * 若超宽且行内有空格，回退到最后一个空格处断行（空格本身被吃掉）。 */
+static const char *ui_wrap_next(const char *p, int cols, int *out_len)
+{
+    const char *start = p;
+    const char *last_space = 0;
+    int n = 0;
+
+    while (*p && *p != '\n' && n < cols) {
+        if (*p == ' ') last_space = p;
+        p++;
+        n++;
+    }
+
+    if (*p && *p != '\n' && last_space && last_space > start) {
+        *out_len = (int)(last_space - start);
+        return last_space + 1;
+    }
+
+    *out_len = n;
+    if (*p == '\n') p++;
+    return p;
+}
+
+int ui_text_wrap_lines(int max_w, const char *s)
+{
+    if (!s || !*s) return 0;
+
+    int cols = max_w / 16;
+    if (cols <= 0) return 1;
+
+    const char *p = s;
+    int lines = 0;
+
+    while (*p) {
+        int n = 0;
+        p = ui_wrap_next(p, cols, &n);
+        lines++;
+        /* 防止只剩换行符时无限占行 */
+        if (n == 0 && !*p) break;
+    }
+
+    return lines;
+}
+
+int ui_text_wrap(int x, int y, int max_w, int line_h, const char *s,
+                 uint32_t color, int max_lines)
+{
+    if (!s || !*s || max_w <= 0) return 0;
+
+    int cols = max_w / 16;
+    if (cols <= 0) return 0;
+    if (line_h <= 0) line_h = 34;
+
+    const char *p = s;
+    int line = 0;
+
+    while (*p && (max_lines <= 0 || line < max_lines)) {
+        int n = 0;
+        const char *next = ui_wrap_next(p, cols, &n);
+
+        if (n > 0) {
+            ui_text_px_n(x, y + line * line_h, p, n, color);
+        }
+
+        p = next;
+        line++;
+
+        if (n == 0 && !*p) break;
+    }
+
+    return line;
+}
+
+int ui_text_wrap_height(int max_w, int line_h, const char *s, int max_lines)
+{
+    int lines = ui_text_wrap_lines(max_w, s);
+    if (max_lines > 0 && lines > max_lines) lines = max_lines;
+    if (line_h <= 0) line_h = 34;
+    return lines * line_h;
 }
 
 /* 2 倍放大标题：每个字形 32×64 像素 */

@@ -1,0 +1,13 @@
+#gui
+title "Slyz GUI Demo"
+size 620 560
+label "This window is described entirely by a .slyz file."
+label "Compile it on Windows with: tools\slyzc.ps1 gui-demo.slyz"
+space 8
+input name "Your name"
+button "Say hello" -> set:Hello, {name}!
+button "Show date" -> shell:date
+button "List home" -> shell:dir
+button "Close" -> close
+space 6
+hr

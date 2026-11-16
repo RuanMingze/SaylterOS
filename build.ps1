@@ -69,6 +69,14 @@ if (!(Test-Path "$bld\entry64.o")) {
     Write-Host '  NASM FAILED (entry64)' -ForegroundColor Red
     exit 1
 }
+
+# AP 启动引导：16 位实模式 -> 32 位 -> 64 位，作为内核 .text 的一部分，
+# 运行时由 smp.c 复制到 0x7000 再发 SIPI。
+& $nasm -f elf64 -o "$bld\ap_tramp.o" "src\boot\ap_tramp.asm" 2>&1
+if (!(Test-Path "$bld\ap_tramp.o")) {
+    Write-Host '  NASM FAILED (ap_tramp)' -ForegroundColor Red
+    exit 1
+}
 # pm.asm 需要内核扇区数，等 kernel.bin 生成后再汇编（见下方）
 
 $stage2Size = (Get-Item "$bld\stage2.bin").Length
@@ -77,16 +85,19 @@ if ($stage2Size -ne 2048) {
     exit 1
 }
 
-foreach ($f in @('keyboard','mouse','font16x32','reboot','acpi','sha256','auth','slyzvm','mem','task','bsod','net','netcmds')) {
+foreach ($f in @('keyboard','mouse','font16x32','reboot','acpi','sha256','auth','slyzvm','mem','task','bsod','net','netcmds','system_cfg','apic','smp','vm')) {
     & $gcc $cfArgs -c -o "$bld\$f.o" "src\kernel\$f.c" 2>&1
 }
-foreach ($f in @('tty','editor','ui')) {
+foreach ($f in @('tty','editor','ui','html')) {
     & $gcc $cfFastArgs -c -o "$bld\$f.o" "src\kernel\$f.c" 2>&1
 }
 foreach ($f in @('kernel','shell')) {
     & $gcc $cfVbeArgs -c -o "$bld\$f.o" "src\kernel\$f.c" 2>&1
 }
 & $gcc $cfVbeFastArgs -c -o "$bld\vbe.o" "src\kernel\vbe.c" 2>&1
+# gui.c 是整套图形会话（启动页/登录/桌面/文件管理器/编辑器），
+# 绘制循环在 -O2 下才不至于让打字与窗口拖动明显掉帧。
+& $gcc $cfVbeFastArgs -c -o "$bld\gui.o" "src\kernel\gui.c" 2>&1
 
 & $gpp $cfArgs -DSLYZFS_NO_STDIO -fno-exceptions -fno-rtti -c -o "$bld\slyzfs.o" "src\fs\slyzfs.cpp" 2>&1
 & $gpp $cfArgs -DSLYZFS_NO_STDIO -fno-exceptions -fno-rtti -c -o "$bld\slyzfs_bridge.o" "src\fs\slyzfs_bridge.cpp" 2>&1
@@ -143,7 +154,7 @@ if ($acpicaFailed) {
 }
 Write-Host ("  ACPICA objects: {0}" -f $acpicaObjs.Count)
 
-foreach ($o in @('entry64','tty','keyboard','mouse','vbe','shell','font16x32','kernel','reboot','editor','ui','acpi','sha256','auth','slyzvm','mem','task','bsod','net','netcmds','slyzfs','slyzfs_bridge','kernel_disk')) {
+foreach ($o in @('entry64','tty','keyboard','mouse','vbe','shell','font16x32','kernel','reboot','editor','ui','html','acpi','sha256','auth','slyzvm','mem','task','bsod','net','netcmds','system_cfg','apic','smp','vm','gui','slyzfs','slyzfs_bridge','kernel_disk')) {
     if (!(Test-Path "$bld\$o.o")) {
         Write-Host "  COMPILE FAILED: build\$o.o was not produced" -ForegroundColor Red
         exit 1
@@ -156,9 +167,10 @@ Write-Host '===== link ====='
 # 显式置 0 后符号值与 linker.ld 的 VMA 完全一致（_start = 0x100000）。
 & $gpp $cfArgs -o "$bld\kernel.elf" `
     "$bld\entry64.o" "$bld\tty.o" "$bld\keyboard.o" "$bld\mouse.o" `
-    "$bld\vbe.o" "$bld\shell.o" "$bld\font16x32.o" "$bld\kernel.o" "$bld\reboot.o" "$bld\editor.o" "$bld\ui.o" "$bld\acpi.o" `
-    "$bld\sha256.o" "$bld\auth.o" "$bld\slyzvm.o" "$bld\mem.o" "$bld\task.o" "$bld\bsod.o" `
-    "$bld\net.o" "$bld\netcmds.o" `
+    "$bld\vbe.o" "$bld\shell.o" "$bld\font16x32.o" "$bld\kernel.o" "$bld\reboot.o" "$bld\editor.o" "$bld\ui.o" "$bld\html.o" "$bld\gui.o" "$bld\acpi.o" `
+    "$bld\apic.o" "$bld\smp.o" "$bld\ap_tramp.o" `
+    "$bld\sha256.o" "$bld\auth.o" "$bld\slyzvm.o" "$bld\mem.o" "$bld\task.o" "$bld\bsod.o" "$bld\vm.o" `
+    "$bld\net.o" "$bld\netcmds.o" "$bld\system_cfg.o" `
     "$bld\slyzfs.o" "$bld\slyzfs_bridge.o" "$bld\kernel_disk.o" `
     "$bld\acpica_osl.o" "$bld\acpica_glue.o" $acpicaObjs `
     '-Wl,--image-base=0' -T linker.ld 2>&1 | Select-String -NotMatch 'section below image' | ForEach-Object { Write-Host $_ }

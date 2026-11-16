@@ -18,7 +18,11 @@
 #include "task.h"
 #include "bsod.h"
 #include "ui.h"
+#include "gui.h"
+#include "system_cfg.h"
 #include "net.h"
+#include "smp.h"
+#include "vm.h"
 
 /* ---- SlyzFS 目录项镜像结构 ----
  * 必须与 slyzfs.h 的 DirEntry 以及 bridge 层的 SlyzDirEntry 逐字节一致：
@@ -59,6 +63,8 @@ extern void slyzfs_set_uid(int uid);
 extern int  slyzfs_get_uid(void);
 extern int  slyzfs_chmod(const char* path, int mode);
 extern int  slyzfs_chown(const char* path, int uid);
+extern int  slyzfs_set_protected(const char* path, int on);
+extern int  slyzfs_is_protected(const char* path);
 extern void* slyzfs_open(const char* path, const char* mode);
 extern int slyzfs_read(void* fh, uint8_t* buf, int n);
 extern int slyzfs_write(void* fh, const uint8_t* buf, int n);
@@ -172,6 +178,16 @@ static int ata_disk_present(void) {
 /* 注意：ATA 读写是高频路径（扫描可执行文件时单条命令可达 6 万次扇区访问），
  * 绝不能在成功路径上打印串口日志 —— 9600 波特率下会把 3 秒的操作拖成 77 分钟，
  * 表现为"任意命令都卡死"。仅在失败时输出诊断信息。 */
+/* ATA 累计读写扇区数：任务管理器的磁盘页面与设备页都依赖它。
+ * 只统计成功完成的扇区，失败重试不计入，避免把超时算成写入量。 */
+static uint32_t g_ata_read_sectors = 0;
+static uint32_t g_ata_write_sectors = 0;
+
+void ata_stats(uint32_t *reads, uint32_t *writes) {
+    if (reads) *reads = g_ata_read_sectors;
+    if (writes) *writes = g_ata_write_sectors;
+}
+
 int ata_read_sector(uint32_t lba, uint8_t *buf) {
     if (!ata_disk_present()) return 0;
     if (!ata_wait_busy_clear(20000)) return 0;
@@ -195,6 +211,7 @@ int ata_read_sector(uint32_t lba, uint8_t *buf) {
         buf[i * 2] = (uint8_t)(word & 0xFF);
         buf[i * 2 + 1] = (uint8_t)((word >> 8) & 0xFF);
     }
+    g_ata_read_sectors++;
     return 1;
 }
 
@@ -227,6 +244,7 @@ int ata_write_sector(uint32_t lba, const uint8_t *buf) {
         serial_putc('\n');
         return 0;
     }
+    g_ata_write_sectors++;
     return 1;
 }
 
@@ -299,7 +317,7 @@ static const char banner[] =
     " ____) | (_| |  __/ | | || (_) | ____) | |___| |     \n"
     "|_____/ \\__,_|\\___| |_|\\__\\___/ |_____/|_____|_|     \n"
     "\n"
-    "  [ SAYLTER OPERATING SYSTEM ] v0.3 - TTY Shell\n"
+    "  [ SAYLTER OPERATING SYSTEM ] v0.3 Beta1 - TTY Shell\n"
     "\n";
 
 static const char *help_text[] = {
@@ -323,13 +341,14 @@ static const char *help_text[] = {
     "  exit / quit                     Exit the shell",
     "  dd if=<src> of=<dst> [bs=] [count=] [seek=] [skip=]  Raw sector / text copy (see 'dd' alone for help)",
     "  remove <start> <end>            Clear sectors",
-    "  gui                             Launch the GUI demo",
+    "  gui                             Enter the graphical desktop session",
     "  version                         Show OS version",
     "  uname                           Show kernel info",
     "  whoami                          Show current user",
     "  date                            Show fake system date",
     "  mem                             Show kernel heap statistics",
     "  ps                              Show tasks, quotas and memory usage",
+    "  smp / cpu                       Show CPUs, APIC IDs and Local APIC base",
     "  reboot                          Reset the machine via 8042",
     "  poweroff / shutdown [n]         ACPI S5 shutdown (optional SLP_TYP 0..7)",
     "  acpi                            Show ACPI / PM1 status",
@@ -337,12 +356,21 @@ static const char *help_text[] = {
     "  powercfg /sleep <1..5>          Enter a sleep state (S2 is deprecated)",
     "  powercfg /lastwake              Show last wake source",
     "  powercfg /devices               Show power button / SCI wiring",
+    "  bootmode [gui|tty|status]       Show or set the startup mode (etc\\system.cfg)",
     "  useradd <name>                  Create a user (root only)",
     "  passwd [name]                   Change password (self or root)",
     "  su [name]                       Switch user (default root)",
     "  logout                          End session and show login prompt",
     "  chmod <octal> <path>            Change permissions, e.g. chmod 600 secret.txt",
     "  chown <uid> <path>              Change owner (root only)",
+    "  vm                              Show paging, frame pool and fault statistics",
+    "  vm swap                         Show swap file, slots and page traffic",
+    "  vm limit <pages>                Set resident page quota (16..4096)",
+    "  swap                            Alias of 'vm swap'",
+    "  pfa                             Run the demand paging + swap self-test",
+    "  protect <path>                  Show the protected-file flag",
+    "  protect on <path>               Mark a file protected (root only)",
+    "  protect off <path> --force      Remove protection (root + explicit override)",
     "  ip / ifconfig                   Show NIC, MAC, IPv4 and packet counters",
     "  ip set <ip> <mask> [gw] [dns]   Configure static IPv4 (default 10.0.2.15)",
     "  curl [-iIvs] [-A ua] [-m sec] <url>   HTTP/1.1 GET with a custom User-Agent",
@@ -376,6 +404,19 @@ static int shell_history_index = -1;
  * 提示符顶出屏幕。 */
 static char shell_cwd[SHELL_PATH_MAX] = "";
 static char shell_prompt[SHELL_PATH_MAX + 32] = "saylter@os:~$";
+
+/* 非交互模式：GUI 内嵌终端设置。此时没有独立的 TTY 键盘，
+ * 任何"等用户敲 y/N"或"独占全屏"的命令都必须改写行为，
+ * 否则会卡死整个图形循环。 */
+static int shell_noninteractive_flag = 0;
+
+void shell_set_noninteractive(int on) {
+    shell_noninteractive_flag = on ? 1 : 0;
+}
+
+int shell_noninteractive(void) {
+    return shell_noninteractive_flag;
+}
 
 static void shell_refresh_prompt(void);
 static void shell_sync_scroll_zone(void);
@@ -755,7 +796,7 @@ static int levenshtein(const char *a, const char *b) {
 static const char *builtin_cmds[] = {
     "help","min","clear","cls","echo","dir","ls","pwd","cd","run","ask","dd","remove",
     "mkdir","rmdir","rm","del","df","nano","edit","cat","run","bg","kill","gui","version","uname","whoami","date","mem",
-    "reboot","poweroff","shutdown","halt","acpi","powercfg","ps",
+    "reboot","poweroff","shutdown","halt","acpi","powercfg","bootmode","ps","smp","cpu",
     "useradd","passwd","su","logout","chmod","chown",
     "ip","ifconfig","curl","ping","nslookup", 0
 };
@@ -1119,6 +1160,11 @@ static int rm_remove_target(const char *target, int force) {
     }
 
     if (!force) {
+        if (shell_noninteractive()) {
+            /* GUI 终端里没法回应 y/N 提示，要求显式 -f，避免误删 */
+            printk("rm: '%s' skipped (use 'rm -f' in the GUI terminal)\n", path);
+            return 0;
+        }
         printk("rm: remove file '%s'? [y/N] ", path);
         if (!read_yes_no()) {
             printk("rm: '%s' not removed\n", path);
@@ -1216,7 +1262,15 @@ static void cmd_edit(const char *args) {
         slyzfs_close(probe);
     }
 
-    int rc = editor_run(path);
+    int rc = 0;
+    if (shell_noninteractive()) {
+        /* GUI 终端会自己接管 nano/edit，在终端窗口里跑字符编辑器。
+         * 走到这里说明是从脚本等路径调用的，没有可用的终端界面。 */
+        printk("nano: run this from the GUI terminal window\n");
+        return;
+    }
+
+    rc = editor_run(path);
     shell_refresh_prompt();
 
     if (rc == 0) {
@@ -1577,7 +1631,7 @@ static int try_run_slyz_by_name(const char *name) {
 }
 
 static void cmd_help(void)  { for (int i = 0; help_text[i]; i++) printk("%s\n", help_text[i]); }
-static void cmd_min(void)  { printk("help clear echo dir ls pwd cd dd mkdir rmdir rm del df nano cat run bg kill gui ps version uname whoami date mem reboot poweroff acpi useradd passwd su logout chmod chown ip curl ping nslookup\n"); }
+static void cmd_min(void)  { printk("help clear echo dir ls pwd cd dd mkdir rmdir rm del df nano cat run bg kill gui ps smp version uname whoami date mem vm swap pfa protect reboot poweroff acpi powercfg bootmode useradd passwd su logout chmod chown ip curl ping nslookup\n"); }
 static void cmd_clear(void){ tty_clear(); }
 static void cmd_echo(const char *args)  { printk("%s\n", args); }
 
@@ -1916,14 +1970,14 @@ static void cmd_remove(char *args) {
 }
 
 #ifdef SAYLTER_VBE
-void gui_main(void) {
+static void shell_enter_gui(void) {
     vbe_init();
     if (!vbe_is_enabled()) {
         printk("[GUI] VBE not available.\n");
         return;
     }
 
-    ui_demo_main();
+    gui_main();
 
     /* 返回 TTY：图形像素不能残留在终端区域，重新初始化后清屏 */
     vbe_init();
@@ -1931,7 +1985,7 @@ void gui_main(void) {
     printk("[GUI] returned to shell\n");
 }
 #endif
-static void cmd_version(void) { printk("SaylterOS v0.3 (TTY shell)\n"); }
+static void cmd_version(void) { printk("SaylterOS v0.3 Beta1 (TTY shell)\n"); }
 static void cmd_uname(void)   { printk("SaylterOS x86_64 64-bit long mode\n"); }
 static void cmd_whoami(void) {
     const struct AuthUser *u = auth_current();
@@ -1963,6 +2017,171 @@ static void cmd_mem(void) {
            (unsigned int)allocs, (unsigned int)frees, (unsigned int)failed);
     printk("  tasks  : %u alive, %u bytes accounted\n",
            (unsigned int)task_count_alive(), (unsigned int)task_total_used());
+}
+
+/* ---- 虚拟内存 / 分页 / swap ----
+ * vm        概览：帧池、按需区、驻留配额、缺页与换页计数
+ * vm swap   只看 swap 文件与槽位
+ * vm limit  调整驻留页配额（页数），用于观察不同内存压力下的换出行为
+ * pfa       自测：逐页写入并校验，强制走完缺页 + 换出 + 换入全链路
+ */
+static void cmd_vm(const char *args) {
+    if (!args || !*args) {
+        vm_dump();
+        return;
+    }
+
+    char work[64];
+    cmd_strncpy(work, args, sizeof(work));
+
+    char *p = work;
+    while (*p == ' ' || *p == '\t') p++;
+    char *tok = p;
+    while (*p && *p != ' ' && *p != '\t') p++;
+    if (*p) *p++ = '\0';
+    while (*p == ' ' || *p == '\t') p++;
+
+    if (cmd_strcmp(tok, "swap") == 0) {
+        vm_dump_swap();
+        return;
+    }
+
+    if (cmd_strcmp(tok, "limit") == 0) {
+        uint32_t pages = 0;
+        if (!parse_u32(p, &pages)) {
+            printk("vm: usage: vm limit <16..4096>\n");
+            return;
+        }
+        if (vm_set_resident_limit(pages)) {
+            printk("vm: resident limit = %u pages (%u KB)\n",
+                   (unsigned int)pages, (unsigned int)(pages * 4u));
+        } else {
+            printk("vm: limit must be 16..4096 pages\n");
+        }
+        return;
+    }
+
+    printk("vm: usage: vm | vm swap | vm limit <pages>\n");
+}
+
+static void cmd_swap(void) {
+    vm_dump_swap();
+}
+
+static void cmd_pfa(const char *args) {
+    (void)args;
+    printk("pfa: starting demand paging self-test\n");
+    if (vm_selftest()) {
+        printk("pfa: self-test finished successfully\n");
+    } else {
+        printk("pfa: self-test FAILED\n");
+    }
+}
+
+/* ---- 受保护文件 ----
+ * protect <path>                 查询
+ * protect on <path>              设置（root）
+ * protect off <path> --force     解除（root + 显式 --force）
+ * 保护位由文件系统层强制执行，shell 只负责解析参数与提示。 */
+static void cmd_protect(const char *args) {
+    char work[256];
+    cmd_strncpy(work, (args && *args) ? args : "", sizeof(work));
+
+    char *p = work;
+    while (*p == ' ' || *p == '\t') p++;
+    if (!*p) {
+        printk("usage: protect <path> | protect on <path> | protect off <path> --force\n");
+        return;
+    }
+
+    char *tok = p;
+    while (*p && *p != ' ' && *p != '\t') p++;
+    if (*p) *p++ = '\0';
+    while (*p == ' ' || *p == '\t') p++;
+
+    int set_on = -1;
+    if (cmd_strcmp(tok, "on") == 0) {
+        set_on = 1;
+    } else if (cmd_strcmp(tok, "off") == 0) {
+        set_on = 0;
+    }
+
+    char path[SHELL_PATH_MAX];
+
+    if (set_on >= 0) {
+        if (!*p) {
+            printk("protect: missing path\n");
+            return;
+        }
+
+        int force = 0;
+        if (set_on == 0) {
+            /* 在路径里查找 "--force" 标记，找到后截断并置位 */
+            char *q = p;
+            while (*q) {
+                if (q[0] == ' ' && q[1] == '-' && q[2] == '-' &&
+                    q[3] == 'f' && q[4] == 'o' && q[5] == 'r' &&
+                    q[6] == 'c' && q[7] == 'e' &&
+                    (q[8] == '\0' || q[8] == ' ' || q[8] == '\t')) {
+                    *q = '\0';
+                    force = 1;
+                    break;
+                }
+                q++;
+            }
+        }
+
+        if (slyzfs_get_uid() != 0) {
+            printk("protect: root only\n");
+            return;
+        }
+
+        shell_resolve_path(path, shell_cwd, p);
+        if (path[0] == '\0') {
+            printk("protect: invalid path\n");
+            return;
+        }
+
+        if (set_on) {
+            if (slyzfs_set_protected(path, 1)) {
+                printk("protect: %s is now protected (root cannot delete)\n", path);
+            } else {
+                printk("protect: cannot protect '%s' (not found or not a file)\n", path);
+            }
+            return;
+        }
+
+        if (!force) {
+            printk("protect: removing protection requires an explicit override\n");
+            printk("         protect off <path> --force\n");
+            return;
+        }
+        if (slyzfs_set_protected(path, 0)) {
+            printk("protect: %s is no longer protected\n", path);
+        } else {
+            printk("protect: cannot unprotect '%s'\n", path);
+        }
+        return;
+    }
+
+    /* 单参数：查询状态 */
+    shell_resolve_path(path, shell_cwd, tok);
+    if (path[0] == '\0') {
+        printk("protect: invalid path\n");
+        return;
+    }
+
+    struct SlyzDirEntry ent;
+    if (!slyzfs_stat(path, &ent)) {
+        printk("protect: '%s' not found\n", path);
+        return;
+    }
+    if (ent.type != SLYZFS_DIR_FILE) {
+        printk("protect: '%s' is a directory\n", path);
+        return;
+    }
+    printk("%s: %s\n", path,
+           slyzfs_is_protected(path) ? "protected (root cannot delete)" : "not protected");
 }
 /* 真实硬件复位：走 8042 键盘控制器的 0xFE 命令拉 CPU RESET#。
  * 旧实现只是 cli;hlt，等于关机，必须手动断电才能恢复。 */
@@ -2287,7 +2506,7 @@ static void cmd_logout(void) {
     }
 
     tty_clear();
-    printk("SaylterOS v0.3 - type 'help' for commands\n\n");
+    printk("SaylterOS v0.3 Beta1 - type 'help' for commands\n\n");
     shell_refresh_prompt();
 }
 
@@ -2354,8 +2573,64 @@ static void cmd_chown(const char *args) {
 }
 static void cmd_ps(void)      { task_dump(); }
 
+/* 启动模式：读写 etc\system.cfg 的 boot.mode。
+ * 与 `nano etc\system.cfg` 完全等价，只是提供一个不用进编辑器的快捷入口。 */
+static void cmd_bootmode(const char *args) {
+    char work[32];
+    const char *p = args;
+    int n = 0;
+
+    while (p && (*p == ' ' || *p == '\t')) p++;
+    while (p && *p && n < (int)sizeof(work) - 1) work[n++] = *p++;
+    work[n] = '\0';
+    while (n > 0 && (work[n - 1] == ' ' || work[n - 1] == '\t')) {
+        work[--n] = '\0';
+    }
+
+    if (work[0] == '\0' || cmd_strcmp(work, "status") == 0) {
+        printk("boot.mode = %s\n", system_cfg_boot_gui() ? "gui" : "tty");
+        printk("config    = %s\n", SYSTEM_CFG_PATH);
+        printk("edit with : nano %s\n", SYSTEM_CFG_PATH);
+        return;
+    }
+
+    if (cmd_strcmp(work, "gui") == 0 || cmd_strcmp(work, "graphical") == 0) {
+        if (system_cfg_set_boot_gui(1)) {
+            printk("boot.mode = gui (reboot to apply)\n");
+        } else {
+            printk("bootmode: cannot write %s\n", SYSTEM_CFG_PATH);
+        }
+        return;
+    }
+
+    if (cmd_strcmp(work, "tty") == 0 || cmd_strcmp(work, "text") == 0) {
+        if (system_cfg_set_boot_gui(0)) {
+            printk("boot.mode = tty (reboot to apply)\n");
+        } else {
+            printk("bootmode: cannot write %s\n", SYSTEM_CFG_PATH);
+        }
+        return;
+    }
+
+    printk("usage: bootmode [gui|tty|status]\n");
+}
+
 /* 执行命令，返回 1 表示执行了，0 表示未找到 */
 static int exec_cmd(const char *cmd, char *args) {
+    /* GUI 终端：这些命令要么需要重新登录、要么需要密码输入，
+     * 在非交互环境下会永久阻塞，直接拒绝并指路。 */
+    if (shell_noninteractive()) {
+        if (cmd_strcmp(cmd, "logout") == 0 ||
+            cmd_strcmp(cmd, "useradd") == 0 ||
+            cmd_strcmp(cmd, "adduser") == 0 ||
+            cmd_strcmp(cmd, "passwd") == 0 ||
+            cmd_strcmp(cmd, "ask") == 0) {
+            printk("%s: needs an interactive TTY session\n", cmd);
+            printk("Use Power menu -> Exit to Terminal.\n");
+            return 1;
+        }
+    }
+
     if (cmd_strcmp(cmd, "help") == 0)      cmd_help();
     else if (cmd_strcmp(cmd, "min") == 0)   cmd_min();
     else if (cmd_strcmp(cmd, "clear") == 0) cmd_clear();
@@ -2381,7 +2656,7 @@ static int exec_cmd(const char *cmd, char *args) {
     else if (cmd_strcmp(cmd, "dd") == 0)     cmd_dd(args);
     else if (cmd_strcmp(cmd, "remove") == 0) cmd_remove(args);
 #ifdef SAYLTER_VBE
-    else if (cmd_strcmp(cmd, "gui") == 0)   gui_main();
+    else if (cmd_strcmp(cmd, "gui") == 0)   shell_enter_gui();
 #endif
     else if (cmd_strcmp(cmd, "version") == 0) cmd_version();
     else if (cmd_strcmp(cmd, "uname") == 0) cmd_uname();
@@ -2393,13 +2668,19 @@ static int exec_cmd(const char *cmd, char *args) {
              cmd_strcmp(cmd, "halt") == 0) cmd_poweroff(args);
     else if (cmd_strcmp(cmd, "acpi") == 0) cmd_acpi();
     else if (cmd_strcmp(cmd, "powercfg") == 0) cmd_powercfg(args);
+    else if (cmd_strcmp(cmd, "bootmode") == 0) cmd_bootmode(args);
     else if (cmd_strcmp(cmd, "useradd") == 0 || cmd_strcmp(cmd, "adduser") == 0) cmd_useradd(args);
     else if (cmd_strcmp(cmd, "passwd") == 0) cmd_passwd(args);
     else if (cmd_strcmp(cmd, "su") == 0)     cmd_su(args);
     else if (cmd_strcmp(cmd, "logout") == 0) cmd_logout();
     else if (cmd_strcmp(cmd, "chmod") == 0)  cmd_chmod(args);
     else if (cmd_strcmp(cmd, "chown") == 0)  cmd_chown(args);
+    else if (cmd_strcmp(cmd, "vm") == 0)     cmd_vm(args);
+    else if (cmd_strcmp(cmd, "swap") == 0)   cmd_swap();
+    else if (cmd_strcmp(cmd, "pfa") == 0)    cmd_pfa(args);
+    else if (cmd_strcmp(cmd, "protect") == 0) cmd_protect(args);
     else if (cmd_strcmp(cmd, "ps") == 0)    cmd_ps();
+    else if (cmd_strcmp(cmd, "smp") == 0 || cmd_strcmp(cmd, "cpu") == 0) smp_dump();
     else if (cmd_strcmp(cmd, "ip") == 0 || cmd_strcmp(cmd, "ifconfig") == 0) netcmd_ip(args);
     else if (cmd_strcmp(cmd, "curl") == 0)  netcmd_curl(args);
     else if (cmd_strcmp(cmd, "ping") == 0)  netcmd_ping(args);
@@ -2409,8 +2690,11 @@ static int exec_cmd(const char *cmd, char *args) {
 }
 
 /* ---------- 是/否确认 ---------- */
-/* 读取单个字符，y 返回 1，其他返回 0 */
+/* 读取单个字符，y 返回 1，其他返回 0。
+ * GUI 终端里没有可阻塞的键盘来源，直接按"否"处理，绝不进入轮询。 */
 static int read_yes_no(void) {
+    if (shell_noninteractive()) return 0;
+
     while (1) {
         char c = kb_read_char();
         if (c == 0) { tty_tick(); delay(50000); continue; }
@@ -2426,6 +2710,47 @@ static int read_yes_no(void) {
 }
 
 /* ---------- Shell 主循环 ---------- */
+
+/* ---------- 供 GUI 内嵌终端调用的入口 ---------- */
+
+const char *shell_prompt_text(void) {
+    return shell_prompt;
+}
+
+int shell_resolve_input(const char *in, char *out, int cap) {
+    if (!in || !out || cap <= 0) return 0;
+
+    char path[SHELL_PATH_MAX];
+    shell_resolve_path(path, shell_cwd, in);
+    if (path[0] == '\0') return 0;
+
+    cmd_strncpy(out, path, cap);
+    return 1;
+}
+
+int shell_exec_line(char *line) {
+    if (!line) return 0;
+
+    char *cmd = line;
+    while (*cmd == ' ' || *cmd == '\t') cmd++;
+    if (*cmd == '\0') return 1;
+
+    char *args = cmd;
+    while (*args && *args != ' ' && *args != '\t') args++;
+    if (*args) {
+        *args++ = '\0';
+        while (*args == ' ' || *args == '\t') args++;
+    }
+
+    int rc = exec_cmd(cmd, args);
+    if (rc == 2) return 2;
+    if (rc == 1) return 1;
+
+    if (try_run_slyz_by_name(cmd)) return 1;
+
+    printk("saylter: command not found: %s\n", cmd);
+    return 0;
+}
 
 void shell_main(void) {
     /* 内核堆与任务系统必须最先就绪：之后的文件系统、账户库、
@@ -2447,6 +2772,26 @@ void shell_main(void) {
         }
     }
     slyzfs_set_quiet(0);
+
+    /* ---- 分页 / 虚拟内存 / swap ----
+     * 必须在 SlyzFS 挂载之后：pagefile.os 是文件系统里的普通文件。
+     * 必须在登录之前：此时 uid 还是 0，pagefile 的创建与保护位设置
+     * 都以 root 身份完成，后续普通用户既不能删除也不能改写保护位。 */
+    vm_init();
+
+    /* ---- 启动模式分流 ----
+     * etc\system.cfg 的 boot.mode=gui 时，TTY banner 与 TTY 登录全部跳过，
+     * 直接进入图形启动画面 -> 图形登录 -> 桌面。
+     * 配置文件缺失时自动生成默认的 tty 配置，行为与旧版本一致。 */
+    slyzfs_set_quiet(1);
+    system_cfg_init();
+    slyzfs_set_quiet(0);
+
+    if (system_cfg_boot_gui() && vbe_is_enabled()) {
+        tty_clear();
+        gui_main();
+        tty_clear();
+    }
 
     /* 内核启动画面到此结束：先清屏，再从头输出 shell banner 与登录提示。
      * 不能反过来先输出再清屏，否则 banner 会被一起抹掉。 */
@@ -2492,7 +2837,7 @@ void shell_main(void) {
         shell_cwd[0] = '\0';
     }
 
-    printk("SaylterOS v0.3 - type 'help' for commands\n");
+    printk("SaylterOS v0.3 Beta1 - type 'help' for commands\n");
     printk("User: %s (uid %u)   Home: %s\n\n",
            session ? session->name : "root",
            (unsigned int)(session ? session->uid : 0),

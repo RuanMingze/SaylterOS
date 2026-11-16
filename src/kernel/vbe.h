@@ -31,6 +31,18 @@ void vbe_swap(void);
 /* 脏矩形：只 blit (x,y) 起 w×h 区域到 LFB */
 void vbe_swap_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h);
 
+/* 全局裁剪：设置后所有绘制原语只写该矩形内的像素。
+ * GUI 局部重绘用它渲染整棵场景树，再配合 vbe_swap_rect 上屏。 */
+void vbe_set_clip(int x, int y, int w, int h);
+void vbe_clear_clip(void);
+int  vbe_clip_active(void);
+void vbe_get_clip(int *x, int *y, int *w, int *h);
+
+/* 可嵌套裁剪：与当前裁剪求交，pop 时恢复上一层。
+ * 用于"脏矩形重绘 → 窗口 → 内容区"这种多层裁剪。 */
+void vbe_push_clip(int x, int y, int w, int h);
+void vbe_pop_clip(void);
+
 /* 单像素 */
 void vbe_put_pixel(uint16_t x, uint16_t y, uint32_t color);
 
@@ -43,6 +55,12 @@ void vbe_blend_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
 
 /* 实心矩形 */
 void vbe_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint32_t color);
+
+/* 按行区间填充 backbuffer，供多核并行渲染使用。
+ * 只写 [y0, y1) 行、x..x+w 的区域；调用方必须保证多个工作线程的
+ * 行区间互不重叠（每个像素只被一个核写）。 */
+void vbe_fill_rect_rows(uint16_t x, uint16_t w, uint16_t y0, uint16_t y1,
+                        uint32_t color);
 
 /* 光标双缓冲：保存/恢复矩形像素到内存 buf */
 void vbe_save_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint32_t *buf);

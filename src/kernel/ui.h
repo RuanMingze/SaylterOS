@@ -81,6 +81,22 @@ void ui_text_transparent(int x, int y, const char *s, uint32_t fg);
 void ui_text_big(int x, int y, const char *s, uint32_t fg);
 int  ui_text_width(const char *s);
 
+/* ---- 自动换行 ----
+ * 统一的文本排版入口，避免每个界面各自算字符宽度导致溢出。
+ *   max_w    : 允许的最大像素宽度（按 16px 字符宽换算成列数）
+ *   line_h   : 行高（像素），调用方按面板高度取 34 / 44 等
+ *   max_lines: 最多绘制多少行，<= 0 表示不限制
+ * '\n' 强制换行；超宽时优先在最近的空格处断行，没有空格则硬切。
+ * 返回实际占用的行数。 */
+int ui_text_wrap(int x, int y, int max_w, int line_h, const char *s,
+                 uint32_t color, int max_lines);
+
+/* 只计算换行后占用的行数，不绘制（布局预排用） */
+int ui_text_wrap_lines(int max_w, const char *s);
+
+/* 返回字符串按 max_w 换行后需要的总高度 */
+int ui_text_wrap_height(int max_w, int line_h, const char *s, int max_lines);
+
 /* 组件 */
 void ui_panel(const ui_theme *t, ui_rect r, const char *title);
 void ui_button_draw(const ui_theme *t, const ui_button *b);

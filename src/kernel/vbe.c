@@ -25,6 +25,93 @@ static inline uint32_t *back_ptr(uint16_t x, uint16_t y) {
     return (uint32_t *)((uint8_t *)back + (uint32_t)y * back_pitch_bytes + (uint32_t)x * 4);
 }
 
+/* ---- 全局裁剪矩形 ----
+ * GUI 的局部重绘依赖它：渲染整棵场景树，但只有落在裁剪矩形内的像素
+ * 会真正写入 backbuffer，然后只把该矩形 blit 到 LFB。
+ * TTY 走 vbe_fb_* 直写路径，不经过这里，不受影响。 */
+static int g_clip_active = 0;
+static int g_clip_x0 = 0;
+static int g_clip_y0 = 0;
+static int g_clip_x1 = 0;
+static int g_clip_y1 = 0;
+
+void vbe_set_clip(int x, int y, int w, int h) {
+    int x1 = x + w;
+    int y1 = y + h;
+
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (x1 > (int)vbe_current.width) x1 = (int)vbe_current.width;
+    if (y1 > (int)vbe_current.height) y1 = (int)vbe_current.height;
+    if (x1 < x) x1 = x;
+    if (y1 < y) y1 = y;
+
+    g_clip_x0 = x;
+    g_clip_y0 = y;
+    g_clip_x1 = x1;
+    g_clip_y1 = y1;
+    g_clip_active = 1;
+}
+
+void vbe_clear_clip(void) {
+    g_clip_active = 0;
+}
+
+int vbe_clip_active(void) {
+    return g_clip_active;
+}
+
+void vbe_get_clip(int *x, int *y, int *w, int *h) {
+    if (x) *x = g_clip_active ? g_clip_x0 : 0;
+    if (y) *y = g_clip_active ? g_clip_y0 : 0;
+    if (w) *w = g_clip_active ? (g_clip_x1 - g_clip_x0) : (int)vbe_current.width;
+    if (h) *h = g_clip_active ? (g_clip_y1 - g_clip_y0) : (int)vbe_current.height;
+}
+
+/* ---- 裁剪栈 ----
+ * 浏览器这类嵌套内容需要在既有脏矩形裁剪里再裁一层。直接调
+ * vbe_set_clip 会覆盖外层矩形，clear 之后外层裁剪就丢了，后续表面
+ * 会画到脏矩形外面。push/pop 让内层裁剪与外层求交，退出时恢复。 */
+
+#define VBE_CLIP_STACK 6
+
+struct VbeClipFrame {
+    int active;
+    int x0;
+    int y0;
+    int x1;
+    int y1;
+};
+
+static struct VbeClipFrame g_clip_stack[VBE_CLIP_STACK];
+static int g_clip_sp = 0;
+
+void vbe_push_clip(int x, int y, int w, int h) {
+    if (g_clip_sp < VBE_CLIP_STACK) {
+        struct VbeClipFrame *f = &g_clip_stack[g_clip_sp++];
+        f->active = g_clip_active;
+        f->x0 = g_clip_x0;
+        f->y0 = g_clip_y0;
+        f->x1 = g_clip_x1;
+        f->y1 = g_clip_y1;
+    }
+
+    vbe_set_clip(x, y, w, h);
+}
+
+void vbe_pop_clip(void) {
+    if (g_clip_sp > 0) {
+        struct VbeClipFrame *f = &g_clip_stack[--g_clip_sp];
+        g_clip_active = f->active;
+        g_clip_x0 = f->x0;
+        g_clip_y0 = f->y0;
+        g_clip_x1 = f->x1;
+        g_clip_y1 = f->y1;
+    } else {
+        g_clip_active = 0;
+    }
+}
+
 void vbe_init(void) {
     vbe_info_t *src = VBE_INFO_PTR;
     vbe_current.magic = 0;
@@ -46,6 +133,7 @@ void vbe_init(void) {
     vbe_current = *src;
     back = (uint32_t *)BACKBUFFER_PHYS;
     back_pitch_bytes = vbe_current.pitch;
+    g_clip_active = 0;
 
     /* 清掉上一轮（bootloader/BIOS）残留在物理内存里的像素，
      * 否则首次 swap 会把随机内容闪到屏幕上。 */
@@ -110,9 +198,47 @@ void vbe_fill_sky_blue(void) {
     vbe_fill_color(0x00BFE8FF);
 }
 
+/* 多核并行填充的行区间入口。
+ * 与 vbe_fill_rect 的区别：不接收 y/h 而是 [y0,y1)，让调用方按行切片；
+ * 仍遵守全局裁剪矩形，否则局部重绘时并行填充会把窗外的桌面涂掉。 */
+void vbe_fill_rect_rows(uint16_t x, uint16_t w, uint16_t y0, uint16_t y1,
+                        uint32_t color) {
+    if (!vbe_is_enabled()) return;
+    if (w == 0 || y1 <= y0) return;
+
+    int x0 = (int)x;
+    int x1 = (int)x + (int)w;
+    int yy0 = (int)y0;
+    int yy1 = (int)y1;
+
+    if (g_clip_active) {
+        if (x0 < g_clip_x0) x0 = g_clip_x0;
+        if (x1 > g_clip_x1) x1 = g_clip_x1;
+        if (yy0 < g_clip_y0) yy0 = g_clip_y0;
+        if (yy1 > g_clip_y1) yy1 = g_clip_y1;
+    }
+    if (x1 > (int)vbe_current.width) x1 = (int)vbe_current.width;
+    if (yy1 > (int)vbe_current.height) yy1 = (int)vbe_current.height;
+    if (x0 >= x1 || yy0 >= yy1) return;
+
+    uint32_t stride = back_pitch_bytes / 4;
+    for (int yy = yy0; yy < yy1; yy++) {
+        uint32_t *row = back + (uint32_t)yy * stride;
+        for (int xx = x0; xx < x1; xx++) {
+            row[xx] = color;
+        }
+    }
+}
+
 void vbe_put_pixel(uint16_t x, uint16_t y, uint32_t color) {
     if (!vbe_is_enabled()) return;
     if (x >= vbe_current.width || y >= vbe_current.height) return;
+    if (g_clip_active) {
+        if ((int)x < g_clip_x0 || (int)x >= g_clip_x1 ||
+            (int)y < g_clip_y0 || (int)y >= g_clip_y1) {
+            return;
+        }
+    }
     *back_ptr(x, y) = color;
 }
 
@@ -130,35 +256,64 @@ void vbe_blend_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
         return;
     }
 
+    int x0 = x;
+    int y0 = y;
+    int x1 = (int)x + w;
+    int y1 = (int)y + h;
+
+    if (g_clip_active) {
+        if (x0 < g_clip_x0) x0 = g_clip_x0;
+        if (y0 < g_clip_y0) y0 = g_clip_y0;
+        if (x1 > g_clip_x1) x1 = g_clip_x1;
+        if (y1 > g_clip_y1) y1 = g_clip_y1;
+    }
+    if (x0 >= x1 || y0 >= y1 || x0 >= (int)vbe_current.width ||
+        y0 >= (int)vbe_current.height) {
+        return;
+    }
+
     uint32_t a = alpha;
     uint32_t ia = 255u - a;
     uint32_t sr = ((color >> 16) & 0xFFu) * a / 255u;
     uint32_t sg = ((color >> 8) & 0xFFu) * a / 255u;
     uint32_t sb = (color & 0xFFu) * a / 255u;
 
-    for (uint16_t row = 0; row < h; row++) {
-        uint32_t py = (uint32_t)y + row;
-        if (py >= vbe_current.height) break;
-        uint32_t *line = back_ptr(x, (uint16_t)py);
-        for (uint16_t col = 0; col < w; col++) {
-            uint32_t px = (uint32_t)x + col;
-            if (px >= vbe_current.width) break;
-            uint32_t d = line[col];
+    for (int row = y0; row < y1; row++) {
+        uint32_t *line = back_ptr((uint16_t)x0, (uint16_t)row);
+        for (int col = x0; col < x1; col++) {
+            uint32_t d = line[col - x0];
             uint32_t dr = ((d >> 16) & 0xFFu) * ia / 255u;
             uint32_t dg = ((d >> 8) & 0xFFu) * ia / 255u;
             uint32_t db = (d & 0xFFu) * ia / 255u;
-            line[col] = 0xFF000000u | ((dr + sr) << 16) | ((dg + sg) << 8) | (db + sb);
+            line[col - x0] = 0xFF000000u | ((dr + sr) << 16) | ((dg + sg) << 8) | (db + sb);
         }
     }
 }
 
 void vbe_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint32_t color) {
     if (!vbe_is_enabled()) return;
-    if ((uint32_t)x + w > vbe_current.width) return;
-    if ((uint32_t)y + h > vbe_current.height) return;
-    for (uint16_t row = 0; row < h; row++) {
-        uint32_t *r = back_ptr(x, y + row);
-        for (uint16_t col = 0; col < w; col++) {
+
+    int x0 = x;
+    int y0 = y;
+    int x1 = (int)x + (int)w;
+    int y1 = (int)y + (int)h;
+
+    if (x1 > (int)vbe_current.width) x1 = (int)vbe_current.width;
+    if (y1 > (int)vbe_current.height) y1 = (int)vbe_current.height;
+    if (g_clip_active) {
+        if (x0 < g_clip_x0) x0 = g_clip_x0;
+        if (y0 < g_clip_y0) y0 = g_clip_y0;
+        if (x1 > g_clip_x1) x1 = g_clip_x1;
+        if (y1 > g_clip_y1) y1 = g_clip_y1;
+    }
+    if (x0 >= x1 || y0 >= y1 || x0 >= (int)vbe_current.width ||
+        y0 >= (int)vbe_current.height) {
+        return;
+    }
+
+    for (int row = y0; row < y1; row++) {
+        uint32_t *r = back_ptr((uint16_t)x0, (uint16_t)row);
+        for (int col = 0; col < x1 - x0; col++) {
             r[col] = color;
         }
     }
@@ -258,14 +413,18 @@ void vbe_draw_text_px(uint16_t x, uint16_t y, const char *s, uint32_t fg, uint32
 
         const uint8_t (*glyph)[2] = font16x32[(uint8_t)(*s)];
         for (int row = 0; row < FONT16_H; row++) {
-            uint32_t *line = back + (uint32_t)(y + row) * stride + px;
+            int py = (int)y + row;
+            if (g_clip_active && (py < g_clip_y0 || py >= g_clip_y1)) continue;
+
+            uint32_t *line = back + (uint32_t)py * stride + px;
             uint8_t left = glyph[row][0];
             uint8_t right = glyph[row][1];
-            for (int i = 0; i < 8; i++) {
-                line[i] = (left & (0x80 >> i)) ? fg : bg;
-            }
-            for (int i = 0; i < 8; i++) {
-                line[8 + i] = (right & (0x80 >> i)) ? fg : bg;
+            for (int i = 0; i < 16; i++) {
+                int pxx = (int)px + i;
+                if (g_clip_active && (pxx < g_clip_x0 || pxx >= g_clip_x1)) continue;
+                uint8_t bit = (i < 8) ? (uint8_t)((left >> (7 - i)) & 1u)
+                                      : (uint8_t)((right >> (15 - i)) & 1u);
+                line[i] = bit ? fg : bg;
             }
         }
 

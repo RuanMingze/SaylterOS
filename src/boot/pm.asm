@@ -53,6 +53,17 @@ VBE_MODE_BUF   equ 0x9E00   ; 0x9E00 - 0x9EFF (256B)
 ; 否则 EOI 之后电平仍有效会立刻重入，形成中断风暴。
 SCI_CALLBACK_ADDR equ 0x7DE8
 
+; #PF 处理函数地址（内核在 vm_init 中写入，0 = 未安装）。
+; 与 SCI 一样，pm.asm 是 -f bin 独立镜像，链接期无法解析 C 符号，
+; 因此通过低地址函数指针槽间接调用。
+PF_HANDLER_ADDR equ 0x7DE0
+
+; 最近一次缺页现场（诊断用）：CR2 / error code / RIP。
+; 即使嵌套缺页覆盖了寄存器保存区，这两个槽也能给出最近一次的原始值。
+PF_LAST_CR2     equ 0x7DD0
+PF_LAST_ERROR   equ 0x7DD8
+PF_LAST_RIP     equ 0x7DC8
+
 ; ============================================================
 ; 实模式入口
 ; ============================================================
@@ -69,6 +80,18 @@ pm_start:
     ; SCI 回调尚未注册
     mov dword [SCI_CALLBACK_ADDR], 0
     mov dword [SCI_CALLBACK_ADDR + 4], 0
+
+    ; #PF 处理函数尚未注册
+    mov dword [PF_HANDLER_ADDR], 0
+    mov dword [PF_HANDLER_ADDR + 4], 0
+
+    ; 缺页现场清零
+    mov dword [PF_LAST_CR2], 0
+    mov dword [PF_LAST_CR2 + 4], 0
+    mov dword [PF_LAST_ERROR], 0
+    mov dword [PF_LAST_ERROR + 4], 0
+    mov dword [PF_LAST_RIP], 0
+    mov dword [PF_LAST_RIP + 4], 0
 
     ; 键盘环形缓冲头尾清零（ISR 在进入长模式后才会写）
     mov word [0xA000], 0
@@ -592,6 +615,16 @@ build_idt64:
     mov rdi, idt_entries + 0x29 * 16
     call set_gate64
 
+    ; 向量 0xFF：LAPIC spurious（SVR 中配置的向量号）
+    mov rax, isr_spurious
+    mov rdi, idt_entries + 0xFF * 16
+    call set_gate64
+
+    ; 向量 0xF0：AP 工作唤醒 IPI（fixed delivery）
+    mov rax, isr_ipi
+    mov rdi, idt_entries + 0xF0 * 16
+    call set_gate64
+
     pop rax
     pop rdx
     pop rcx
@@ -657,6 +690,10 @@ pic_remap64:
 
 ; ============================================================
 ; 中断 / 异常入口
+; ------------------------------------------------------------
+; #PF（14）有独立的入口：CPU 会额外压入 error code，而且必须能够在
+; C 层修复后 iretq 续跑，不能走"打印后停机"的统一出口。
+; 其余异常仍然只用于诊断，因此共用 exc_common。
 ; ============================================================
 %macro EXC_STUB 1
 isr_exc%1:
@@ -666,7 +703,9 @@ isr_exc%1:
 
 %assign exc_index 0
 %rep 32
+%if exc_index != 14
     EXC_STUB exc_index
+%endif
 %assign exc_index exc_index + 1
 %endrep
 
@@ -688,6 +727,151 @@ exc_common:
     hlt
     jmp .halt
 
+; ============================================================
+; #PF（向量 14）专用入口
+; ------------------------------------------------------------
+; CPU 压栈顺序（从栈顶向高地址）：
+;   [rsp+0]  error_code
+;   [rsp+8]  rip
+;   [rsp+16] cs
+;   [rsp+24] rflags
+;   [rsp+32] rsp（CPL 变化时压入；本内核异常始终来自 ring0）
+;   [rsp+40] ss
+;
+; 调用 C 处理函数前必须满足 Win64 ABI：
+;   - 32 字节 shadow space
+;   - call 指令执行时 rsp 16 字节对齐
+; 中断可能发生在任意指令边界，进入时 rsp 不保证对齐，
+; 因此保存现场后用 and rsp, -16 动态对齐，调用结束再回到 rbp。
+;
+; C 签名：
+;   int page_fault_handler(uint64_t cr2, uint64_t error, uint64_t rip)
+; 返回 1 = 映射已建立，恢复现场后 iretq 重新执行触发缺页的指令。
+;
+; 保存 r12/r13 是必须的：它们属于 Win64 的 callee-saved 寄存器，
+; 被中断的代码可能正在使用；不保存会在成功续跑后悄悄改坏调用者状态。
+; ============================================================
+isr_exc14:
+    push rbp
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+
+    mov rbp, rsp
+    mov r12, [rbp + 96]          ; error code（12 个 push = 96 字节）
+    mov r13, [rbp + 104]         ; rip
+
+    ; 在调用 C 之前固化现场，避免嵌套缺页覆盖寄存器保存区后无法排障
+    mov rax, cr2
+    mov [PF_LAST_CR2], rax
+    mov [PF_LAST_ERROR], r12
+    mov [PF_LAST_RIP], r13
+
+    mov rax, [PF_HANDLER_ADDR]
+    test rax, rax
+    jz .fatal
+
+    and rsp, -16
+    sub rsp, 32                  ; Win64 shadow space
+    mov rcx, cr2
+    mov rdx, r12
+    mov r8, r13
+    call rax
+    mov rsp, rbp
+
+    test eax, eax
+    jz .fatal
+
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    pop rbp
+    add rsp, 8                   ; 丢弃 error code
+    iretq
+
+.fatal:
+    mov rsp, rbp
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    pop rbp
+    add rsp, 8                   ; 丢弃 error code
+
+    mov rsi, msg_pf
+    call serial_puts64
+    mov rsi, msg_pf_cr2
+    call serial_puts64
+    mov rax, [PF_LAST_CR2]
+    call serial_hex64
+    mov rsi, msg_pf_err
+    call serial_puts64
+    mov rax, [PF_LAST_ERROR]
+    call serial_hex64
+    mov rsi, msg_pf_rip
+    call serial_puts64
+    mov rax, [PF_LAST_RIP]
+    call serial_hex64
+    mov al, 13
+    call serial_putc64
+    mov al, 10
+    call serial_putc64
+.halt_pf:
+    cli
+    hlt
+    jmp .halt_pf
+
+; 输出 RAX 的 16 位十六进制（大写，无前缀）
+serial_hex64:
+    push rax
+    push rcx
+    push rdx
+    push rbx
+    mov rbx, rax
+    mov ecx, 16
+.loop:
+    mov rax, rbx
+    shr rax, 60
+    cmp al, 10
+    jb .digit
+    add al, 'A' - 10
+    jmp .emit
+.digit:
+    add al, '0'
+.emit:
+    call serial_putc64
+    shl rbx, 4
+    dec ecx
+    jnz .loop
+    pop rbx
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
 hex_nibble64:
     cmp al, 10
     jb .digit
@@ -706,6 +890,19 @@ isr_default:
     out 0xA0, al
     pop rdx
     pop rax
+    iretq
+
+; LAPIC spurious 中断（向量 0xFF）专用：直接返回。
+; spurious 不需要任何 EOI；更不能写 8259 的 EOI，否则会把 BSP
+; 正在服务的 PIC 中断提前清掉，导致后续 IRQ 丢失。
+isr_spurious:
+    iretq
+
+; LAPIC fixed IPI（向量 0xF0）：唤醒 AP 去取并行工作。
+; fixed IPI 不需要 EOI。这里绝不能像 isr_default 那样写 8259 的
+; EOI —— AP 与 BSP 共享 8259，误清 EOI 会让 BSP 丢失正在处理的
+; 键盘/定时器中断。
+isr_ipi:
     iretq
 
 ; PIT 定时器：只发 EOI，不写显存
@@ -735,6 +932,16 @@ isr_keyboard:
     push rcx
     push rdx
     push rsi
+    ; 8042 输出缓冲只有一个字节，键盘和鼠标共用。
+    ; 只有"OBF=1 且 AUX=0"才是键盘数据。
+    ; AUX=1 的鼠标字节必须读走丢弃：TTY 模式没有鼠标轮询者，
+    ; 不读的话输出缓冲会一直被鼠标包占住，键盘中断再也取不到
+    ; 数据，表现为"从 GUI 退出到 TTY 后键盘完全没反应"。
+    in al, 0x64
+    mov cl, al
+    and cl, 0x21                ; bit0=OBF, bit5=AUX
+    cmp cl, 0x01
+    jne .not_kbd
     in al, 0x60
     movzx esi, word [KB_HEAD_ADDR]
     lea edx, [esi + 1]
@@ -744,6 +951,11 @@ isr_keyboard:
     je .drop                       ; 缓冲满：丢弃最新扫描码
     mov [KB_BUF_ADDR + rsi], al
     mov [KB_HEAD_ADDR], dx
+    jmp .drop
+.not_kbd:
+    test al, 0x01                  ; OBF=0 就没什么可读
+    jz .drop
+    in al, 0x60                    ; 鼠标字节：读走丢弃
 .drop:
     mov al, 0x61                ; 特定 EOI：主片 IRQ1
     out 0x20, al
@@ -1016,3 +1228,7 @@ msg_long:     db '[PM] 64-bit long mode', 13, 10, 0
 msg_idt:      db '[PM] 64-bit IDT loaded', 13, 10, 0
 msg_irq:      db '[PM] IRQ0/IRQ1/IRQ9 enabled', 13, 10, 0
 msg_exc:      db '[PM] EXCEPTION vector=0x', 0
+msg_pf:       db '[PM] PAGE FAULT cr2=', 0
+msg_pf_cr2:   db '0x', 0
+msg_pf_err:   db ' error=', 0
+msg_pf_rip:   db ' rip=', 0

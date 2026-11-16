@@ -10,6 +10,7 @@
 #include "acpi.h"
 #include "acpica_glue.h"
 #include "vbe.h"
+#include "smp.h"
 
 /* linker.ld 定义的 BSS 边界 */
 extern char _bss_start[];
@@ -45,7 +46,7 @@ static void kernel_draw_logo(void) {
         " \\___ \\ / _` |/ _ \\ | | __/ _ \\  \\___ \\|  __||  __|  ",
         " ____) | (_| |  __/ | | || (_) | ____) | |___| |     ",
         "|_____/ \\__,_|\\___| |_|\\__\\___/ |_____/|_____|_|     ",
-        "  [ SAYLTER OPERATING SYSTEM ] v0.3 - TTY Shell   ",
+        "  [ SAYLTER OPERATING SYSTEM ] v0.3 Beta1 - TTY Shell   ",
         NULL
     };
 
@@ -157,9 +158,20 @@ void kernel_main(void) {
     if (info_row >= tty_get_rows()) info_row = (uint16_t)(tty_get_rows() - 1);
     tty_set_cursor(0, info_row);
     tty_set_color(0x0F);
-    printk("[KERNEL] SaylterOS C Kernel v0.3 booted!\n");
+    printk("[KERNEL] SaylterOS C Kernel v0.3 Beta1 booted!\n");
     printk("[KERNEL] Running in 64-bit long mode\n");
     printk("[KERNEL] Interrupts enabled (PIC remapped to 0x20)\n");
+
+    /* --- 多核 ---
+     * 解析 MADT -> 初始化 BSP LAPIC -> INIT-SIPI-SIPI 拉起所有 AP。
+     * 单个 AP 的启动超时是 400ms，最坏情况下这里会短暂停顿。 */
+    int cpus = smp_init();
+    if (cpus > 1) {
+        printk("[KERNEL] SMP: %d CPUs online, local APIC at 0x%x\n",
+               cpus, smp_lapic_base());
+    } else {
+        printk("[KERNEL] SMP: single-core mode (no MADT or one CPU)\n");
+    }
 
     if (vbe_is_enabled()) {
         printk("[KERNEL] VBE %ux%u %ubpp @ phys 0x%x\n",

@@ -47,6 +47,19 @@ void auth_logout(void);
 /* 校验用户名与口令，成功返回 uid，失败返回 -1 */
 int auth_verify(const char *name, const char *password);
 
+/* ---- GUI 登录所需的只读账户视图 ----
+ * 账户表在 auth_load 时从 etc\passwd / etc\shadow 解析，顺序稳定。
+ * 调用方不得持有返回指针跨过下一次 auth_load/auth_reload。 */
+int auth_user_count(void);
+const struct AuthUser *auth_user_at(int index);
+
+/* 非交互登录：供 GUI 登录页使用。成功后设置当前身份并把 SlyZFS
+ * 的操作者切到该 uid；成功返回 uid（root 为 0），失败返回 -1。 */
+int auth_login_as(const char *name, const char *password);
+
+/* 从磁盘重新加载账户表（GUI 刷新用户列表时使用） */
+void auth_reload(void);
+
 /* 读取一行（回显）/ 读取口令（回显 *） */
 void auth_read_line(char *buf, int max);
 void auth_read_password(char *buf, int max);

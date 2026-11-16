@@ -4,7 +4,7 @@
  * curl 是一个完整的 HTTP/1.1 客户端：
  *   - 解析 http://host[:port]/path
  *   - DNS 解析（也接受点分十进制字面量）
- *   - 自定义 User-Agent（-A，默认 SaylterOS/0.3 (x86_64)）
+ *   - 自定义 User-Agent（-A，默认 SaylterOS/0.3-Beta1 (x86_64)）
  *   - 支持 -i(输出响应头) -I(HEAD) -v(过程输出) -s(静默) -m(超时)
  *   - 处理 Content-Length 与 Transfer-Encoding: chunked
  *   - 响应体边收边显示，不整包缓存，避免大页面耗尽内核堆
@@ -499,7 +499,7 @@ void netcmd_curl(const char *args) {
     int head_only = 0;
     int verbose = 0;
     int silent = 0;
-    const char *user_agent = "SaylterOS/0.3 (x86_64)";
+    const char *user_agent = "SaylterOS/0.3-Beta1 (x86_64)";
     uint32_t timeout_ms = 15000;
     const char *url = 0;
 

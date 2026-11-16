@@ -317,6 +317,38 @@ int auth_verify(const char *name, const char *password) {
     return auth_strcmp(computed, u->hash) == 0 ? (int)u->uid : -1;
 }
 
+int auth_user_count(void) {
+    return g_user_count;
+}
+
+const struct AuthUser *auth_user_at(int index) {
+    if (index < 0 || index >= g_user_count) return 0;
+    return &g_users[index];
+}
+
+void auth_reload(void) {
+    (void)auth_load();
+}
+
+int auth_login_as(const char *name, const char *password) {
+    if (!name || *name == '\0') return -1;
+    if (!auth_load()) return -1;
+
+    struct AuthUser *u = auth_find(name);
+    if (!u) return -1;
+
+    if (u->hash[0] != '\0') {
+        char computed[65];
+        auth_hash_password(u->salt, password ? password : "", computed);
+        if (auth_strcmp(computed, u->hash) != 0) return -1;
+    }
+
+    g_current = *u;
+    g_logged_in = 1;
+    slyzfs_set_uid(u->uid);
+    return (int)u->uid;
+}
+
 /* ============================================================
  * 初始化与交互
  * ============================================================ */

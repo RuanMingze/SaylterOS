@@ -18,6 +18,8 @@
 extern "C" int printk(const char* fmt, ...);
 extern "C" void kserial_puts(const char* s);
 extern "C" void kserial_putchar(char c);
+/* 任务级磁盘写入记账（task.c） */
+extern "C" void task_account_disk(uint32_t bytes);
 
 extern "C" int slyzfs_logf(const char* fmt, ...) {
     if (!fmt) return 0;
@@ -371,6 +373,9 @@ extern "C" int slyzfs_write(void* fh, const uint8_t* buf, int n) {
     if (!slyzfs::g_inited) return 0;
     slyzfs::FileHandle* real = static_cast<slyzfs::FileHandle*>(fh);
     size_t written = slyzfs::g_fs->write(real, buf, (size_t)n);
+    if (written > 0) {
+        task_account_disk((uint32_t)written);
+    }
     slog_x2("write: wrote=", (uint32_t)written, " of ", (uint32_t)n);
     return (int)written;
 }
@@ -416,6 +421,94 @@ extern "C" int slyzfs_chown(const char* path, int uid) {
     if (uid < 0 || uid > 255) return 0;
     if (!slyzfs::g_inited) slyzfs_bridge_init();
     return slyzfs::g_fs->chown(path, (uint8_t)uid) ? 1 : 0;
+}
+
+/* 受保护标志：设置/清除要求 root，由 SlyzFS 层强制。
+ * 普通用户调用这里会直接失败，而不是靠 shell 层"自觉"。 */
+extern "C" int slyzfs_set_protected(const char* path, int on) {
+    if (!path || !*path) return 0;
+    if (!slyzfs::g_inited) slyzfs_bridge_init();
+    return slyzfs::g_fs->set_protected(path, on != 0) ? 1 : 0;
+}
+
+extern "C" int slyzfs_is_protected(const char* path) {
+    if (!path || !*path) return 0;
+    if (!slyzfs::g_inited) slyzfs_bridge_init();
+    return slyzfs::g_fs->is_protected(path) ? 1 : 0;
+}
+
+/* ======================= swap pagefile =======================
+ * swap 数据必须落在"文件"而不是裸卷上：pagefile.os 是普通 SlyzFS
+ * 文件，受保护位保证 root 也无法删除。这里持有长生命周期句柄，
+ * 直接用 SlyzFS::read/write 读写固定偏移，不走带日志的 bridge
+ * 包装函数 —— 否则每次换页都会往串口打两行 "write: wrote=..."。
+ * ============================================================ */
+static slyzfs::FileHandle* g_swap_fh = nullptr;
+
+extern "C" int slyzfs_swap_attach(void) {
+    if (!slyzfs::g_inited) slyzfs_bridge_init();
+    if (g_swap_fh) return 1;
+
+    slyzfs::DirEntry* dir = slyzfs::g_fs->stat("etc");
+    if (!dir || dir->type != slyzfs::DIR_DIR) {
+        slyzfs::g_fs->mkdir("etc");
+    }
+
+    /* 每次启动都重建 pagefile：
+     *   1. swap 内容是易失的，跨启动复用没有意义；
+     *   2. 若上次没有走 close（内核重启/断电），目录 size 与 FAT 簇链
+     *      可能不一致，直接截断可以把旧簇全部归还，避免孤儿簇让 df
+     *      显示的空间凭空消失；
+     *   3. 受保护文件不能直接 create，必须先由内核（root）显式解除，
+     *      截断后立即重新加上。用户侧仍然无法删除这个文件。 */
+    slyzfs::DirEntry* file = slyzfs::g_fs->stat("etc\\pagefile.os");
+    if (file && file->type == slyzfs::DIR_FILE) {
+        if (!slyzfs::g_fs->set_protected("etc\\pagefile.os", false)) {
+            slog("swap_attach: cannot clear protection for reset");
+            return 0;
+        }
+    }
+
+    if (!slyzfs::g_fs->create("etc\\pagefile.os")) {
+        slog("swap_attach: create pagefile failed");
+        return 0;
+    }
+
+    g_swap_fh = slyzfs::g_fs->open("etc\\pagefile.os", "a");
+    if (!g_swap_fh) {
+        slog("swap_attach: open pagefile failed");
+        return 0;
+    }
+
+    if (!slyzfs::g_fs->set_protected("etc\\pagefile.os", true)) {
+        slog("swap_attach: set_protected failed");
+    }
+    slog("swap_attach: pagefile ready");
+    return 1;
+}
+
+extern "C" int slyzfs_swap_write(uint32_t offset, const uint8_t* buf, int n) {
+    if (!g_swap_fh || !buf || n <= 0) return 0;
+    if (!slyzfs::g_fs->seek(g_swap_fh, offset)) return 0;
+    return (int)slyzfs::g_fs->write(g_swap_fh, buf, (size_t)n);
+}
+
+extern "C" int slyzfs_swap_read(uint32_t offset, uint8_t* buf, int n) {
+    if (!g_swap_fh || !buf || n <= 0) return 0;
+    if (!slyzfs::g_fs->seek(g_swap_fh, offset)) return 0;
+
+    int total = 0;
+    while (total < n) {
+        size_t got = slyzfs::g_fs->read(g_swap_fh, buf + total, (size_t)(n - total));
+        if (got == 0) break;
+        total += (int)got;
+    }
+    return total;
+}
+
+extern "C" uint32_t slyzfs_swap_bytes(void) {
+    if (!g_swap_fh) return 0;
+    return g_swap_fh->size;
 }
 
 /* ======================= 测试目录结构 ======================= */

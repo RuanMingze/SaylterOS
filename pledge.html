@@ -459,10 +459,10 @@
  |_____/ \__,_|\___| |_|\__\___/ |_____/|_____|_|     
 </pre>
     <div class="subtitle">SAYLTER · OPERATING · SYSTEM</div>
-    <div class="tagline">两天内把裸金属 x86 系统从引导到 Shell 和键盘交互跑起来</div>
+    <div class="tagline">从 512 字节引导扇区到 x86_64 长模式：裸金属 GUI、SMP、分页与网络全部自研</div>
     <div class="status-badge">
       <span class="status-dot"></span>
-      STATUS: BOOT + PM + SHELL + KEYBOARD LIVE (2 DAYS)
+      STATUS: v0.3 BETA1 · GUI + SMP + PAGING + NETWORK + ACPI
     </div>
   </header>
 
@@ -477,33 +477,31 @@
       <div><span class="prompt">root@saylter</span>:<span class="cmd">~</span>$ cat MISSION.md</div>
       <div class="output">
         <br>
-        █ MISSION: SaylterOS — 从零构建一个 x86 裸金属操作系统<br>
-        █ TYPE: Real bare-metal OS, MBR → protected mode → C/C++ kernel<br>
-        █ ARCH: x86 32-bit protected mode → future long mode + SMP<br>
+        █ MISSION: SaylterOS — 从零构建一个 x86_64 裸金属操作系统<br>
+        █ TYPE: Real bare-metal OS, MBR → protected mode → long mode → C/C++ kernel<br>
+        █ ARCH: x86_64 long mode · SMP (3 cores) · 4KB paging + swap<br>
         █ START: 2026-10-17<br>
         █ TOOLCHAIN: NASM + MinGW GCC/G++ + PowerShell + QEMU<br>
         █ OUTPUT: saylter.img / saylter-tty.img / saylter-ide.img<br>
         <br>
         <span class="success">[OK] SlyzFS：自研 FAT 风格文件系统，目录 / 文件 / 权限全部在文件系统层强制</span><br>
         <span class="success">[OK] 用户系统：etc/passwd + etc/shadow，SHA-256 加盐，root 默认无密码</span><br>
-        <span class="success">[OK] 内存与任务：1MB 内核堆、per-task 配额、OOM 回收、bg / kill</span><br>
+        <span class="success">[OK] 内存与任务：6MB 内核堆、per-task 配额、OOM 回收、bg / kill</span><br>
         <span class="success">[OK] ACPI：FADT 解析、S5 关机、电源键；reboot 走 8042 硬件复位</span><br>
         <span class="success">[OK] SLYZBIN v1：Windows 编译的二进制字节码可直接在系统里 run</span><br>
       </div>
       <br>
       <div><span class="prompt">root@saylter</span>:<span class="cmd">~</span>$ powershell -NoProfile -File build.ps1</div>
-      <div class="success">[BUILD] VBE kernel = 649412B  → build/saylter.img</div>
-      <div class="success">[BUILD] TTY kernel = 583780B  → build/saylter-tty.img</div>
-      <div class="success">[BUILD] SlyzFS @ LBA2048   → build/saylter-ide.img (32MB)</div>
+      <div class="success">[BUILD] kernel.bin = 606312B  → build/saylter-ide.img (32MB, SlyzFS @ LBA2048)</div>
       <div><span class="prompt">root@saylter</span>:<span class="cmd">~</span>$ powershell -NoProfile -File run-ide.ps1</div>
       <div class="success">[BOOT] MBR 0x7C00：分段加载 LBA1..257 → 0x7E00 / 0x10000 / 0x18000 / 0x20000</div>
-      <div class="success">[PM] GDT + IDT + PIC 就绪，进入 32 位保护模式</div>
+      <div class="success">[PM] GDT + IDT + PIC 就绪，建立 4GB 恒等映射并进入 x86_64 长模式</div>
       <div class="success">[KERNEL] ACPI PM1 ready (S5 + power button)</div>
       <div class="success">[FS] SlyzFS mounted: N root entries</div>
-      <div class="success">[INIT] kernel heap @ 0x100000 (1MB), task 0 running</div>
+      <div class="success">[INIT] kernel heap @ 0x400000 (6MB), task 0 running</div>
       <div class="success">SaylterOS login: root</div>
       <div class="success">root@os:~# </div>
-      <div class="warn">[NOTE] 内存管理与协作式任务已经落地；下一步是扩展 ACPI（MADT / MCFG / HPET）并实现 SMP：启用 local APIC、INIT-SIPI-SIPI 唤醒 AP、任务队列加锁与 per-CPU 调度。硬件分页与虚拟内存仍留到真正需要地址隔离时再做</div>
+      <div class="warn">[NOTE] v0.3 Beta1：SMP 多核工作池、4KB 按需分页与 swap 文件、E1000 网络栈、完整图形桌面均已落地；无法恢复的缺页会进入蓝屏并带出故障地址</div>
       <div><span class="prompt">root@saylter</span>:<span class="cmd">~</span>$ <span class="cursor"></span></div>
     </div>
   </div>
@@ -518,8 +516,8 @@
     <br>
     <p>
       启动方式：BIOS Legacy MBR 引导（第一阶段），后续扩展到 UEFI。
-      测试环境：QEMU (i386-softmmu)，最终能跑在真实 PC 硬件上。
-      架构路线：先在 32 位保护模式跑通所有子系统，再平滑过渡到 x86-64 长模式。
+      测试环境：QEMU (x86_64-softmmu)，最终能跑在真实 PC 硬件上。
+      架构路线：引导阶段先进入 32 位保护模式完成内核搬运与页表建立，随即切入 x86-64 长模式，所有子系统都运行在 64 位内核中。
     </p>
     <br>
     <p>
@@ -614,7 +612,7 @@
           <li>✅ 任务配额默认 64KB，申请超出即失败</li>
           <li>✅ OOM：超配额任务被标记 DEAD 并回收全部内存</li>
           <li>✅ mem 命令可观测堆状态与任务记账</li>
-          <li>⏳ 分页、页帧管理器、CR3 + CR0.PG 仍待实现</li>
+          <li>✅ 4KB 分页：PD 拆页表、16MB 按需窗口、时钟换出到受保护的 etc\pagefile.os</li>
         </ul>
       </div>
 
@@ -630,7 +628,7 @@
           <li>✅ bg 后台任务 + SLYZ WAIT 指令，可被 ps 观察</li>
           <li>✅ kill 终止任务并回收内存；内核任务拒绝终止</li>
           <li>✅ kill 0 → 蓝屏：cli + 屏蔽 8259 + 冻结 hlt，不写盘</li>
-          <li>⏳ 抢占式调度、per-CPU 运行队列待 SMP 阶段</li>
+          <li>✅ SMP：MADT + LAPIC + AP trampoline，0xF0 IPI 工作池按 rank 轮转分片</li>
         </ul>
       </div>
 
@@ -668,23 +666,28 @@
 
       <div class="phase">
         <div class="phase-header">
-          <span class="phase-badge pending">PHASE 7</span>
-          <span class="phase-title">x86-64 迁移</span>
+          <span class="phase-badge done">PHASE 7</span>
+          <span class="phase-title">x86-64 长模式迁移</span>
         </div>
-        <div class="phase-desc">PAE + Long Mode + syscall/sysret</div>
+        <div class="phase-desc">PAE + Long Mode + Win64 ABI + 4GB 恒等映射；ACPICA 已跑在 64 位内核中</div>
+        <ul class="phase-tasks">
+          <li>✅ PML4/PDPT/PD 三层页表，2MB 大页恒等映射 4GB</li>
+          <li>✅ EFER.LME + CR0.PG 切入长模式，C 内核使用 Win64 调用约定</li>
+          <li>✅ 没有 libc / crt，链接脚本固定 VMA，禁止 SSE 与红区</li>
+        </ul>
       </div>
 
       <div class="phase">
         <div class="phase-header">
-          <span class="phase-badge pending">PHASE 8</span>
-          <span class="phase-title">SMP 多核 · MADT + APIC + INIT-SIPI</span>
+          <span class="phase-badge done">PHASE 8</span>
+          <span class="phase-title">SMP 多核 · MADT + LAPIC + 并行工作池</span>
         </div>
-        <div class="phase-desc">下一阶段：先扩 ACPI（MADT/MCFG/HPET），再启用 local APIC 唤醒 AP，任务队列加锁、per-CPU 调度</div>
+        <div class="phase-desc">2026-11-16：MADT 枚举、LAPIC 初始化、INIT-SIPI-SIPI 唤醒 AP；0xF0 IPI 工作池按 rank 静态轮转分片，自检 32 分片被 3 核分成 11/11/10</div>
         <ul class="phase-tasks">
-          <li>⏳ 解析 MADT 枚举 LAPIC ID 与 IOAPIC</li>
-          <li>⏳ IA32_APIC_BASE MSR 启用 local APIC</li>
-          <li>⏳ INIT-SIPI-SIPI + 0x7000 trampoline 唤醒 AP</li>
-          <li>⏳ 任务队列自旋锁 + per-CPU current + IPI 负载均衡</li>
+          <li>✅ 解析 MADT 枚举 LAPIC ID 与 IOAPIC</li>
+          <li>✅ 不写 IA32_APIC_BASE（QEMU TCG 下写该 MSR 会让 LAPIC MMIO 失效）</li>
+          <li>✅ INIT-SIPI-SIPI + 0x7000 trampoline 唤醒 AP，-smp 3 全部在线</li>
+          <li>✅ 0xF0 fixed IPI 唤醒 + 原子分片完成计数 + 超时由 BSP 补做</li>
         </ul>
       </div>
 
@@ -693,7 +696,7 @@
           <span class="phase-badge pending">PHASE ∞</span>
           <span class="phase-title">无限扩展</span>
         </div>
-        <div class="phase-desc">分页与虚拟内存 / PCI / USB / 网络 / UEFI / x86-64</div>
+        <div class="phase-desc">按进程地址空间与跨核 TLB shootdown / PCI / USB / UEFI / 抢占式调度</div>
       </div>
 
     </div>
@@ -704,12 +707,12 @@
     <p>没有 JavaScript，没有 Electron，没有虚拟机层。直接和 CPU、内存、磁盘对话。</p>
     <div class="tech-grid">
       <div class="tech-item"><div class="tech-icon">🧠</div><div class="tech-name">C11</div><div class="tech-tag">内核主体</div></div>
-      <div class="tech-item"><div class="tech-icon">⚙️</div><div class="tech-name">NASM</div><div class="tech-tag">x86 汇编</div></div>
-      <div class="tech-item"><div class="tech-icon">🛠️</div><div class="tech-name">GCC Cross</div><div class="tech-tag">i686-elf-gcc</div></div>
+      <div class="tech-item"><div class="tech-icon">⚙️</div><div class="tech-name">NASM</div><div class="tech-tag">x86_64 汇编</div></div>
+      <div class="tech-item"><div class="tech-icon">🛠️</div><div class="tech-name">MinGW GCC</div><div class="tech-tag">x86_64 + Win64 ABI</div></div>
       <div class="tech-item"><div class="tech-icon">🔗</div><div class="tech-name">LD + linker.ld</div><div class="tech-tag">链接脚本</div></div>
-      <div class="tech-item"><div class="tech-icon">💾</div><div class="tech-name">QEMU</div><div class="tech-tag">i386-softmmu</div></div>
-      <div class="tech-item"><div class="tech-icon">📀</div><div class="tech-name">xorriso</div><div class="tech-tag">ISO 生成</div></div>
-      <div class="tech-item"><div class="tech-icon">📦</div><div class="tech-name">GNU Make</div><div class="tech-tag">构建系统</div></div>
+      <div class="tech-item"><div class="tech-icon">💾</div><div class="tech-name">QEMU</div><div class="tech-tag">x86_64-softmmu</div></div>
+      <div class="tech-item"><div class="tech-icon">📜</div><div class="tech-name">ACPICA</div><div class="tech-tag">AML 解释器</div></div>
+      <div class="tech-item"><div class="tech-icon">📦</div><div class="tech-name">PowerShell</div><div class="tech-tag">build.ps1 构建</div></div>
       <div class="tech-item"><div class="tech-icon">🐛</div><div class="tech-name">QEMU + GDB</div><div class="tech-tag">远程调试</div></div>
     </div>
   </section>
@@ -791,71 +794,67 @@
   </div>
 
 <section>
-    <h2>项目结构 · 2026-10-18 中午</h2>
+    <h2>项目结构 · v0.3 Beta1</h2>
     <pre style="background:#0d1219;border:1px solid var(--border);border-radius:8px;padding:16px;font-size:12px;color:var(--text-dim);line-height:1.8;">
 SaylterOS/
-├── pledge.html                     ← 项目纪念页 / 任务宣言
-├── linker.ld                       ← 内核链接脚本，内核装载地址 0xA100
-├── Makefile                        ← 仍可用，但当前更偏手工命令行构建
+├── build.ps1                       ← NASM / GCC / ACPICA 全量构建与镜像生成
+├── run-ide.ps1                     ← QEMU 启动（-Smp / -Persist / -Headless）
+├── linker.ld                       ← 内核链接脚本，装载地址 0x100000
 ├── src/
 │   ├── boot/
-│   │   ├── boot.asm                ← Stage 1: 512B MBR / 引导扇区
-│   │   ├── stage2.asm              ← Stage 2: 实模式输出 banner / 初始化环境
-│   │   ├── pm.asm                  ← Stage 3: GDT / IDT / PIC / IRQ / 把 scancode 放 mailbox
-│   │   ├── entry32.asm             ← 32-bit protected mode 入口
-│   │   └── pm.bin                  ← 当前构建出的保护模式中间态镜像
+│   │   ├── boot.asm                ← Stage 1: 512B MBR
+│   │   ├── stage2.asm              ← Stage 2: 实模式 banner / 环境准备
+│   │   ├── pm.asm                  ← 保护模式 → 长模式、页表、IDT、PIC、ATA 搬运内核
+│   │   ├── entry64.asm             ← 64 位入口，清 BSS 后进入 kernel_main
+│   │   └── ap_tramp.asm            ← AP 启动 trampoline（16→32→64 位）
+│   ├── fs/
+│   │   ├── slyzfs.cpp/.h           ← SlyzFS（目录 / 文件 / 权限 / 受保护位）
+│   │   ├── slyzfs_bridge.cpp       ← C++ → C 桥接，swap 文件句柄
+│   │   └── kernel_disk.cpp         ← SlyzFS 的 ATA 扇区后端
 │   └── kernel/
-│       ├── kernel.c                ← C 内核入口及初始化逻辑
-│       ├── tty.c                   ← VGA 文本模式 TTY / cursor / 清屏 / 输出
-│       ├── tty.h
-│       ├── shell.c                 ← shell prompt / 命令输入 / 回显 / Enter
-│       ├── shell.h
-│       ├── keyboard.c              ← PS/2 扫描码分析、Shift/Caps/Release 状态机
-│       └── keyboard.h
-├── build/
-│   ├── boot.bin                    ← 引导扇区二进制
-│   ├── stage2.bin                  ← Stage2 二进制
-│   ├── pm.bin                      ← 保护模式中间层二进制
-│   ├── kernel.bin                  ← 链接后内核二进制
-│   ├── kernel.elf                  ← ELF 目标文件
-│   ├── saylter.img                 ← 最终 raw floppy 镜像，QEMU 直接引导
-│   ├── saylter.iso                 ← xorriso 生成的 BIOS 可引导 ISO
-│   ├── iso_root/                   ← ISO 目录树，放 saylter.img
-│   └── qemu_boot.log               ← QEMU 串口日志
-├── .gitignore                      ← 构建产物忽略（如果存在）
-└── README (planned)               ← 后续整理开发文档 / 架构说明
+│       ├── kernel.c                ← 内核入口与启动流程
+│       ├── gui.c                   ← 图形桌面：启动页 / 登录 / 窗口 / 7 个应用
+│       ├── vm.c                    ← 4KB 页帧、按需分页、时钟换出、swap
+│       ├── smp.c / apic.c          ← MADT、LAPIC、AP 启动、0xF0 IPI 工作池
+│       ├── net.c / netcmds.c       ← E1000 + ARP/IPv4/ICMP/UDP/DNS/TCP/HTTP
+│       ├── shell.c                 ← TTY Shell 与全部命令
+│       ├── bsod.c                  ← 蓝屏：冻结中断与任务，不再写盘
+│       ├── task.c / mem.c          ← 协作式任务、内存配额、内核堆
+│       └── ui.c / vbe.c / tty.c    ← 组件库、双缓冲 framebuffer、字符终端
+├── third_party/acpica/             ← AML 解释器（ACPICA）
+└── build/
+    ├── kernel.bin                  ← 链接后的内核二进制
+    ├── saylter-ide.img             ← 32MB IDE 系统盘（SlyzFS @ LBA2048）
+    └── saylter-installer.img       ← 1.44MB 安装软盘
     </pre>
-    <h3>🗺️ 当前内存布局（已实际落地的 x86 运行模型）</h3>
+    <h3>🗺️ 当前内存布局（x86_64 长模式，v0.3 Beta1）</h3>
     <pre style="background:#0d1219;border:1px solid var(--border);border-radius:8px;padding:16px;font-size:12px;color:var(--accent2);line-height:1.8;">
-0x00000000 ─────────────────────────────
-  0x0000-0x03FF     BIOS/IDT 低地址区（后续会被我们重建）
-  0x0400-0x04FF     BIOS Data Area
-  0x0500-0x07BFF    工作区 / scratch / 可用低内存
-  0x07C00-0x07DFF   boot.bin (MBR / 引导扇区) ◀ BIOS 入口
-  0x07E00-0x085FF   stage2.bin (实模式阶段) ◀ boot.asm 载入
-  0x08600-0x0A000   pm.bin (受保护模式中间层) ◀ GDT / IDT / PIC / IRQ
-  0x0A000-0x0A001   键盘 mailbox
-                    [0xA000] = raw scancode
-                    [0xA001] = has_data flag
-  0x0A100-0x10000   kernel.bin 加载区 ◀ linker.ld 指定位置
-                    当前放置：TTY / shell / keyboard / kernel.c
-  0x9FFFF-0xA0000   内核栈顶附近（esp 向下增长）
-  0xB8000          VGA 文本缓冲区（80x25, 16 色）
-  0xF0000-0xFFFFF  BIOS ROM / 固件映射区
-0xFFFFFFFF ─────────────────────────────
+0x0000000000000000 ─────────────────────────────
+  0x000000-0x0FFFFF   引导（MBR / stage2 / pm）与 BIOS、VGA 区
+  0x060000-0x060FFF   64 位 IDT（256 × 16B）
+  0x070000-0x075FFF   页表 PML4 / PDPT / 4 × PD（2MB 大页恒等映射 4GB）
+  0x07DF0             VBE 结果结构（C 层读取）
+  0x100000-0x194200   内核镜像 .text / .rodata / .data / .reloc
+  0x3FF000            内核初始栈顶（向下增长）
+  0x400000-0xA00000   内核堆（6MB，first-fit）
+  0xA00000-0x1200000  VBE backbuffer（8MB）
+  0x1200000-0x1350700 内核 .bss
+  0x1800000-...       4KB 页帧池（24MB 起，上界为 RAM - 4MB）
+  0x20000000-0x20FFFFFF 按需分页窗口（4096 页，PD 拆成 4KB 页表）
+0xFFFFFFFFFFFFFFFF ─────────────────────────────
 
 当前真实状态：
-- 引导链路：boot -> stage2 -> pm -> kernel 已经跑通了一大半
-- 实模式 -> 保护模式：已实现 GDT + IDT + PIC 流程
-- 中断：IRQ0 timer / IRQ1 keyboard 已经在设计中/部分跑通
-- 输入层：raw scancode 通过 mailbox 传递到 C 层做 Shift/Caps/Release 语义
-- 输出层：VGA 文本模式 + TTY + shell prompt 已经存在
-- 现在重点仍是：真实机兼容层、键盘协议和稳定输入
+- 引导链路：MBR → Stage2 → 保护模式 → 长模式 → kernel_main 全链路稳定
+- 内存：4KB 页帧位图、按需分页、时钟换出到受保护文件 etc\pagefile.os
+- 多核：MADT + LAPIC + AP trampoline，3 核在线，0xF0 IPI 并行工作池
+- 图形：1600×900 桌面、窗口管理、7 个应用、滚轮与滚动条、桌面右键
+- 网络：E1000 + 完整 TCP/IP 栈，curl / ping / nslookup 可用
+- 崩溃：致命缺页进入蓝屏，冻结中断与任务且不再写盘
     </pre>
   </section>
 
   <footer>
-    SaylterOS · Real bare-metal x86 OS · Built with <span class="heart">♥</span> and assembly · v0.2.0-phase2-debugging
+    SaylterOS · Real bare-metal x86_64 OS · Built with <span class="heart">♥</span> and assembly · v0.3 Beta1
   </footer>
 
 </div>
@@ -868,7 +867,7 @@ const bootLines = [
   '[BOOT] Boot pledge.html from HD0',
   '[BOOT] Loading GDT... OK',
   '[BOOT] Loading IDT... OK',
-  '[BOOT] Enabling protected mode... OK',
+  '[BOOT] Enabling long mode (x86_64)... OK',
   '[OK]  Welcome to SaylterOS. Let\'s write a real OS.',
 ];
 

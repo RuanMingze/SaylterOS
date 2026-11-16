@@ -686,6 +686,18 @@ static int tty_vsprintf(char *buf, const char *fmt, va_list args) {
 }
 
 /* ------------------------------------------------------------
+ * 输出重定向
+ * ------------------------------------------------------------
+ * GUI 内嵌终端需要一个"和 TTY 同源"的命令输出通道：命令本身仍然
+ * 调用 printk，只是字符流向从 LFB/串口改成终端的字符网格。
+ * hook 非 NULL 时 printk 不写屏幕也不写串口，避免把 GUI 画面打花。 */
+static void (*g_out_hook)(const char *s, int len) = 0;
+
+void tty_set_output_hook(void (*fn)(const char *s, int len)) {
+    g_out_hook = fn;
+}
+
+/* ------------------------------------------------------------
  * printk —— 格式化输出到屏幕（并回显串口）
  * ------------------------------------------------------------ */
 void printk(const char *fmt, ...) {
@@ -694,6 +706,12 @@ void printk(const char *fmt, ...) {
     va_start(args, fmt);
     int len = tty_vsprintf(buf, fmt, args);
     va_end(args);
+
+    if (g_out_hook) {
+        g_out_hook(buf, len);
+        return;
+    }
+
     /* 一次 printk 的所有字符只做一次帧缓冲回写：
      * 逐字符 swap 在 1600x1200 下会产生大量 MMIO 写，是卡顿的主要来源。 */
     tty_begin_batch();

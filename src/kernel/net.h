@@ -104,6 +104,14 @@ int  net_tcp_send(const void *data, uint32_t len, uint32_t timeout_ms);
 int  net_tcp_recv(void *buf, uint32_t buflen, uint32_t timeout_ms);
 void net_tcp_close(void);
 
+/* HTTP GET（GUI 浏览器）。
+ * out/cap 是响应体缓冲（建议 >= 64KB），头部会在缓冲内就地前移覆盖。
+ * status_out 返回 HTTP 状态码（拿不到时为 0），ctype_out 返回 Content-Type。
+ * 返回响应体长度；-1 = URL/连接失败；-2 = 响应头不完整。
+ * 只支持 http://，不跟随重定向，不发送 Accept-Encoding（避免 gzip）。 */
+int net_http_get(const char *url, char *out, int cap, int *status_out,
+                 char *ctype_out, int ctype_cap);
+
 /* ---------- shell 命令入口 ---------- */
 void netcmd_ip(const char *args);
 void netcmd_curl(const char *args);

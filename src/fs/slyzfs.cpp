@@ -864,6 +864,12 @@ bool SlyzFS::create(const char* path) {
             SLYZ_FPRINTF(stderr, "[SlyzFS] create: '%s' is a directory\n", name);
             return false;
         }
+        /* 保护检查必须在 free_chain 之前：如果先释放 FAT 链再因为保护
+         * 拒绝删除，目录条目仍然指向已被释放的簇，文件会被静默损坏。 */
+        if (existing->mode & MODE_PROTECTED) {
+            SLYZ_FPRINTF(stderr, "[SlyzFS] create: '%s' is protected\n", name);
+            return false;
+        }
         free_chain(existing->start_cluster);
         remove(path);
     }
@@ -963,6 +969,13 @@ bool SlyzFS::remove(const char* path) {
     DirEntry* de = find_entry_in_dir(parent_cluster, name);
     if (!de || de->type != DIR_FILE) return false;
 
+    /* 受保护文件：root 也不允许删除。解除必须走 set_protected(false)，
+     * 而该接口自身要求 root，形成显式提权门槛。 */
+    if (de->mode & MODE_PROTECTED) {
+        SLYZ_FPRINTF(stderr, "[SlyzFS] remove: '%s' is protected\n", name);
+        return false;
+    }
+
     free_chain(de->start_cluster);
 
     /* 标记 DIR_DELETED —— 和 rmdir 同样的遍历写回逻辑 */
@@ -1008,7 +1021,7 @@ bool SlyzFS::remove(const char* path) {
 /* ======================= 元数据修改 ======================= */
 
 bool SlyzFS::update_meta(const char* path, uint16_t mode, uint8_t uid,
-                         bool set_mode, bool set_uid) {
+                         bool set_mode, bool set_uid, int protect) {
     char parent[512], name[SLYZ_NAME_MAX];
     if (!split_path(path, parent, name)) return false;
 
@@ -1026,8 +1039,20 @@ bool SlyzFS::update_meta(const char* path, uint16_t mode, uint8_t uid,
                 DirEntry* de = reinterpret_cast<DirEntry*>(sector + e * SLYZ_DIRENTRY_SIZE);
                 if (de->type == DIR_EMPTY || de->type == DIR_DELETED) continue;
                 if (!names_equal(de->name, name)) continue;
-                if (set_mode) de->mode = mode;
+                /* 受保护文件拒绝 chmod / chown（protect < 0）；
+                 * 显式 set_protected 才能改写保护位本身。 */
+                if (protect < 0 && (de->mode & MODE_PROTECTED)) return false;
+                if (set_mode) {
+                    de->mode = (uint16_t)((mode & 07777u) | (de->mode & MODE_PROTECTED));
+                }
                 if (set_uid) de->uid = uid;
+                if (protect >= 0) {
+                    if (protect) {
+                        de->mode = (uint16_t)(de->mode | MODE_PROTECTED);
+                    } else {
+                        de->mode = (uint16_t)(de->mode & (uint16_t)~MODE_PROTECTED);
+                    }
+                }
                 return slyz_disk_write(lba + s, sector);
             }
         }
@@ -1045,8 +1070,18 @@ bool SlyzFS::update_meta(const char* path, uint16_t mode, uint8_t uid,
         for (int e = 0; e < entries_per_cluster; e++) {
             if (entries[e].type == DIR_EMPTY || entries[e].type == DIR_DELETED) continue;
             if (!names_equal(entries[e].name, name)) continue;
-            if (set_mode) entries[e].mode = mode;
+            if (protect < 0 && (entries[e].mode & MODE_PROTECTED)) return false;
+            if (set_mode) {
+                entries[e].mode = (uint16_t)((mode & 07777u) | (entries[e].mode & MODE_PROTECTED));
+            }
             if (set_uid) entries[e].uid = uid;
+            if (protect >= 0) {
+                if (protect) {
+                    entries[e].mode = (uint16_t)(entries[e].mode | MODE_PROTECTED);
+                } else {
+                    entries[e].mode = (uint16_t)(entries[e].mode & (uint16_t)~MODE_PROTECTED);
+                }
+            }
             return write_cluster(chain[i], buf);
         }
     }
@@ -1074,6 +1109,29 @@ bool SlyzFS::chown(const char* path, uint8_t uid) {
      * 或反过来抢占别人的文件。 */
     if (g_current_uid != 0) return false;
     return update_meta(path, 0, uid, false, true);
+}
+
+bool SlyzFS::set_protected(const char* path, bool on) {
+    if (!path || !*path) return false;
+    /* 只有 root 才能触碰保护位本身；这是"手动提权"的唯一入口。 */
+    if (g_current_uid != 0) return false;
+
+    char parent[512], name[SLYZ_NAME_MAX];
+    if (!split_path(path, parent, name)) return false;
+
+    uint16_t parent_cluster = resolve_dir(parent);
+    if (parent_cluster == FAT_END) return false;
+
+    DirEntry* de = find_entry_in_dir(parent_cluster, name);
+    if (!de || de->type != DIR_FILE) return false;
+
+    return update_meta(path, 0, 0, false, false, on ? 1 : 0);
+}
+
+bool SlyzFS::is_protected(const char* path) {
+    DirEntry* de = stat(path);
+    if (!de || de->type != DIR_FILE) return false;
+    return (de->mode & MODE_PROTECTED) != 0;
 }
 
 /* ======================= 打开/关闭 ======================= */
@@ -1117,7 +1175,13 @@ FileHandle* SlyzFS::open(const char* path, const char* mode) {
     }
 
     if (truncate) {
-        /* w 模式：如已存在先删，再创建空文件 */
+        /* w 模式：如已存在先删，再创建空文件。
+         * 受保护文件不允许被清空 —— 否则"保护"只挡住了删除，
+         * 却挡不住 open("w") 这种更隐蔽的破坏方式。 */
+        if (de && (de->mode & MODE_PROTECTED)) {
+            release_handle(fh);
+            return nullptr;
+        }
         SLYZ_PRINTF("[open] truncate: existing=%p\n", (void*)de);
         if (de) {
             remove(path);

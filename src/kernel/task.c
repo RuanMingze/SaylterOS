@@ -100,6 +100,7 @@ void task_init(void) {
         g_tasks[i].allocs = 0;
         g_tasks[i].faults = 0;
         g_tasks[i].steps = 0;
+        g_tasks[i].disk_written = 0;
         g_tasks[i].exit_code = 0;
         g_tasks[i].block_count = 0;
         g_tasks[i].name[0] = '\0';
@@ -151,6 +152,7 @@ int task_spawn(const char *name, void (*entry)(void), uint32_t quota) {
     t->allocs = 0;
     t->faults = 0;
     t->steps = 0;
+    t->disk_written = 0;
     t->exit_code = 0;
     t->block_count = 0;
     t->entry = entry;
@@ -378,6 +380,20 @@ uint32_t task_total_used(void) {
     uint32_t total = 0;
     for (int i = 0; i < TASK_MAX; i++) {
         total += g_tasks[i].used;
+    }
+    return total;
+}
+
+void task_account_disk(uint32_t bytes) {
+    if (!g_initialized) return;
+    if (g_current < 0 || g_current >= TASK_MAX) return;
+    g_tasks[g_current].disk_written += bytes;
+}
+
+uint32_t task_total_disk_written(void) {
+    uint32_t total = 0;
+    for (int i = 0; i < TASK_MAX; i++) {
+        total += g_tasks[i].disk_written;
     }
     return total;
 }

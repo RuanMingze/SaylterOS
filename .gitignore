@@ -36,7 +36,6 @@ slyz-vscode-extension/node_modules/
 .vscode/
 .workbuddy/
 .trae/
-.hintrc
 
 # ---- 操作系统垃圾文件 ----
 Thumbs.db

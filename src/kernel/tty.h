@@ -35,6 +35,10 @@ void tty_commit_reserved(void);
 void tty_putchar_vga(char c);
 void printk(const char *fmt, ...);
 
+/* 输出重定向：fn 非 NULL 时 printk 的字符全部交给它，不写屏幕/串口。
+ * GUI 内嵌终端用它在窗口里显示 shell 命令输出。传 NULL 恢复默认。 */
+void tty_set_output_hook(void (*fn)(const char *s, int len));
+
 /* ---- 直接单元格绘制（编辑器 / 蓝屏 / shell 行编辑使用） ---- */
 
 /* 整行用指定颜色属性填充为空格 */
