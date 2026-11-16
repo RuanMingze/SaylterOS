@@ -159,6 +159,57 @@
 
   @keyframes blink { 0%, 50% { opacity: 1; } 51%, 100% { opacity: 0; } }
 
+  /* 交互终端（默认不可见，点击终端后出现输入行） */
+  #tty-body { max-height: 560px; overflow-y: auto; cursor: text; }
+  .tty-input-line { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .tty-echo { color: var(--text); white-space: pre-wrap; word-break: break-all; }
+  .tty-hidden-input {
+    position: absolute;
+    opacity: 0;
+    width: 1px;
+    height: 1px;
+    border: 0;
+    padding: 0;
+    pointer-events: none;
+  }
+  .tty-editor {
+    display: block;
+    width: 100%;
+    min-height: 260px;
+    margin: 8px 0;
+    padding: 12px;
+    background: #0b1118;
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font-family: var(--mono);
+    font-size: 13px;
+    line-height: 1.7;
+    resize: vertical;
+    outline: none;
+  }
+  .tty-bsod {
+    position: fixed;
+    inset: 0;
+    z-index: 9999;
+    background: #0b4a9c;
+    color: #ffffff;
+    padding: 8vh 8vw;
+    font-family: var(--mono);
+    font-size: 16px;
+    line-height: 2;
+    cursor: pointer;
+  }
+  .tty-bsod b { font-size: 24px; letter-spacing: 2px; }
+  .tty-desktop {
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 16px;
+    margin: 8px 0;
+    background: #0b1118;
+    line-height: 2;
+  }
+
   section {
     background: var(--bg-card);
     backdrop-filter: blur(10px);
@@ -473,7 +524,7 @@
       <span class="dot green"></span>
       <span class="terminal-title">root@saylter — ~/SaylterOS</span>
     </div>
-    <div class="terminal-body">
+    <div class="terminal-body" id="tty-body">
       <div><span class="prompt">root@saylter</span>:<span class="cmd">~</span>$ cat MISSION.md</div>
       <div class="output">
         <br>
@@ -929,6 +980,1227 @@ function draw() {
   }
 }
 setInterval(draw, 50);
+</script>
+
+<script>
+/* ------------------------------------------------------------
+ * 终端交互层（隐藏功能：点击上面的终端即可获得一个可用的 shell）
+ * 所有命令都是本地模拟，不访问真实磁盘；curl 受浏览器 CORS 限制。
+ * ------------------------------------------------------------ */
+(function () {
+  'use strict';
+
+  var body = document.getElementById('tty-body');
+  if (!body) return;
+
+  /* ---------------- DOM ---------------- */
+  var live = document.createElement('div');
+  body.appendChild(live);
+
+  var inputLine = document.createElement('div');
+  inputLine.className = 'tty-input-line';
+  inputLine.style.display = 'none';
+
+  function mkSpan(cls, text) {
+    var s = document.createElement('span');
+    if (cls) s.className = cls;
+    if (text) s.textContent = text;
+    return s;
+  }
+
+  var spUser = mkSpan('prompt');
+  var spPath = mkSpan('cmd');
+  var spHash = mkSpan('output', '#\u00a0');
+  var spEcho = mkSpan('tty-echo');
+  var spCursor = mkSpan('cursor');
+  inputLine.appendChild(spUser);
+  inputLine.appendChild(spPath);
+  inputLine.appendChild(spHash);
+  inputLine.appendChild(spEcho);
+  inputLine.appendChild(spCursor);
+  body.appendChild(inputLine);
+
+  var hidden = document.createElement('input');
+  hidden.className = 'tty-hidden-input';
+  hidden.type = 'text';
+  hidden.autocomplete = 'off';
+  hidden.spellcheck = false;
+  body.appendChild(hidden);
+
+  /* ---------------- 输出 ---------------- */
+  function print(text, cls) {
+    var d = document.createElement('div');
+    if (cls) d.className = cls;
+    d.textContent = text;
+    live.appendChild(d);
+    body.scrollTop = body.scrollHeight;
+    return d;
+  }
+
+  function clearScreen() {
+    while (live.firstChild) live.removeChild(live.firstChild);
+  }
+
+  /* ---------------- 虚拟文件系统 ---------------- */
+  function F(data, mode, uid, prot) {
+    return {
+      kind: 'f',
+      data: data === undefined ? '' : data,
+      mode: mode === undefined ? 0o644 : mode,
+      uid: uid === undefined ? 0 : uid,
+      prot: !!prot
+    };
+  }
+
+  function D(children, mode, uid) {
+    return {
+      kind: 'd',
+      children: children || {},
+      mode: mode === undefined ? 0o755 : mode,
+      uid: uid === undefined ? 0 : uid
+    };
+  }
+
+  var fs = D({
+    home: D({
+      root: D({
+        'profile.txt': F('# SaylterOS root profile\n# created by mklazy\n')
+      }),
+      user: D({
+        'notes.txt': F('hello from /home/user\n')
+      })
+    }),
+    etc: D({
+      'system.cfg': F('boot.mode=tty\ntimezone=8\n'),
+      'passwd': F('root:x:0:0:root:/home/root\nuser:x:1:1:user:/home/user\n'),
+      'shadow': F('root:5f4dcc3b5aa765d61d8327deb882cf99:0\nuser:6cb75f652a9b52798eb6cf22010598f2:0\n'),
+      'pagefile.os': F('', 0o600, 0, true)
+    }),
+    usr: D({ bin: D({}) }),
+    tmp: D({}),
+    'README.txt': F('Welcome to SaylterOS v0.3 Beta1!\nSlyzFS filesystem is ready.\n')
+  });
+
+  var state = {
+    cwd: '/home/root',
+    user: 'root',
+    uid: 0,
+    gui: false,
+    dead: false,
+    bootmode: 'tty',
+    history: [],
+    histIdx: 0,
+    net: {
+      ip: '10.0.2.15',
+      mask: '255.255.255.0',
+      gw: '10.0.2.2',
+      dns: '10.0.2.3'
+    },
+    vm: {
+      faults: 8192,
+      swapOut: 6144,
+      swapIn: 4096,
+      resident: 2048,
+      slots: 1536
+    },
+    tasks: [
+      { pid: 0, name: 'kernel', state: 'running', cpu: 12, mem: 2144, disk: 412 },
+      { pid: 1, name: 'gui-session', state: 'running', cpu: 7, mem: 812, disk: 96 },
+      { pid: 2, name: 'slyzfs-d', state: 'ready', cpu: 1, mem: 128, disk: 2048 },
+      { pid: 3, name: '(free)', state: 'free', cpu: 0, mem: 0, disk: 0 }
+    ],
+    bootTime: Date.now()
+  };
+
+  /* ---------------- 路径工具 ---------------- */
+  function normPath(p) {
+    var base = p.charAt(0) === '/'
+      ? p
+      : (state.cwd === '/' ? '' : state.cwd) + '/' + p;
+    var segs = base.split('/');
+    var out = [];
+    for (var i = 0; i < segs.length; i++) {
+      var s = segs[i];
+      if (!s || s === '.') continue;
+      if (s === '..') { out.pop(); continue; }
+      out.push(s);
+    }
+    return '/' + out.join('/');
+  }
+
+  function getNode(path) {
+    var p = normPath(path);
+    if (p === '/') return fs;
+    var n = fs;
+    var segs = p.slice(1).split('/');
+    for (var i = 0; i < segs.length; i++) {
+      if (!n || n.kind !== 'd' || !n.children[segs[i]]) return null;
+      n = n.children[segs[i]];
+    }
+    return n;
+  }
+
+  function parentOf(path) {
+    var p = normPath(path);
+    if (p === '/') return null;
+    var idx = p.lastIndexOf('/');
+    var parentPath = idx <= 0 ? '/' : p.slice(0, idx);
+    var name = p.slice(idx + 1);
+    var parent = getNode(parentPath);
+    if (!parent || parent.kind !== 'd') return null;
+    return { parentPath: parentPath, name: name, parent: parent, path: p };
+  }
+
+  function homeDir() {
+    return state.uid === 0 ? '/home/root' : '/home/user';
+  }
+
+  function shortPath() {
+    var home = homeDir();
+    if (state.cwd === home) return '~';
+    if (state.cwd.indexOf(home + '/') === 0) return '~' + state.cwd.slice(home.length);
+    return state.cwd;
+  }
+
+  function modeString(n) {
+    var s = n.kind === 'd' ? 'd' : '-';
+    var rwx = 'rwx';
+    for (var i = 0; i < 9; i++) {
+      s += (n.mode & (1 << (8 - i))) ? rwx.charAt(i % 3) : '-';
+    }
+    return (n.prot ? 'P' : ' ') + s.slice(1);
+  }
+
+  function sizeOf(n) {
+    if (n.kind === 'd') return 0;
+    if (n.prot) return 16 * 1024 * 1024;
+    return n.data.length;
+  }
+
+  function canRead(n) {
+    if (state.uid === 0) return true;
+    if (n.uid === state.uid) return (n.mode & 0o400) !== 0;
+    return (n.mode & 0o004) !== 0;
+  }
+
+  function canWrite(n) {
+    if (state.uid === 0) return true;
+    if (n.uid === state.uid) return (n.mode & 0o200) !== 0;
+    return (n.mode & 0o002) !== 0;
+  }
+
+  /* ---------------- 提示符与输入 ---------------- */
+  function refreshPrompt() {
+    spUser.textContent = state.user + '@saylter';
+    spPath.textContent = shortPath();
+    body.scrollTop = body.scrollHeight;
+  }
+
+  function showPrompt() {
+    refreshPrompt();
+    inputLine.style.display = 'flex';
+    hidden.value = '';
+    spEcho.textContent = '';
+    try { hidden.focus({ preventScroll: true }); } catch (e) { hidden.focus(); }
+  }
+
+  function hidePrompt() {
+    inputLine.style.display = 'none';
+    hidden.blur();
+  }
+
+  function activate() {
+    if (state.dead) return;
+    if (document.querySelector('.tty-bsod')) return;
+    if (document.querySelector('.tty-editor')) return;
+    if (inputLine.style.display === 'flex') {
+      try { hidden.focus({ preventScroll: true }); } catch (e) { hidden.focus(); }
+      return;
+    }
+    showPrompt();
+  }
+
+  body.addEventListener('mousedown', function (e) {
+    if (e.target && e.target.classList && e.target.classList.contains('tty-editor')) return;
+    activate();
+  });
+
+  hidden.addEventListener('input', function () {
+    spEcho.textContent = hidden.value;
+  });
+
+  /* ---------------- 命令表 ---------------- */
+  var COMMANDS = [
+    'help', 'clear', 'cls', 'echo', 'version', 'ver', 'uname', 'whoami', 'date',
+    'pwd', 'dir', 'ls', 'cd', 'mkdir', 'md', 'rmdir', 'rd', 'rm', 'del', 'cat',
+    'nano', 'edit', 'chmod', 'chown', 'protect', 'mem', 'ps', 'smp', 'cpu',
+    'vm', 'swap', 'pfa', 'ip', 'curl', 'ping', 'nslookup', 'acpi', 'powercfg',
+    'bootmode', 'gui', 'reboot', 'poweroff', 'shutdown', 'halt', 'kill',
+    'useradd', 'adduser', 'passwd', 'su', 'logout', 'exit', 'quit'
+  ];
+
+  function suggest(word) {
+    var best = '';
+    var bestD = 99;
+    for (var i = 0; i < COMMANDS.length; i++) {
+      var c = COMMANDS[i];
+      var d = levenshtein(word, c);
+      if (d < bestD) { bestD = d; best = c; }
+    }
+    return bestD <= 2 ? best : '';
+  }
+
+  function levenshtein(a, b) {
+    var m = a.length, n = b.length;
+    var prev = new Array(n + 1);
+    for (var j = 0; j <= n; j++) prev[j] = j;
+    for (var i = 1; i <= m; i++) {
+      var cur = [i];
+      for (var k = 1; k <= n; k++) {
+        var cost = a.charAt(i - 1) === b.charAt(k - 1) ? 0 : 1;
+        cur[k] = Math.min(prev[k] + 1, cur[k - 1] + 1, prev[k - 1] + cost);
+      }
+      prev = cur;
+    }
+    return prev[n];
+  }
+
+  /* ---------------- 命令实现 ---------------- */
+  function cmdHelp() {
+    print('  help                            Show this help');
+    print('  clear / cls                     Clear the screen');
+    print('  echo <text>                     Print text');
+    print('  version / ver                   Show OS version');
+    print('  uname                           Show kernel info');
+    print('  whoami                          Show current user');
+    print('  date                            Show current date and time');
+    print('  pwd                             Print working directory');
+    print('  dir / ls [path]                 List a directory (default: current)');
+    print('  cd <path>                       Change directory');
+    print('  mkdir <path>                    Create a directory');
+    print('  rmdir <path>                    Remove an empty directory');
+    print('  rm [-f] <file>                  Delete files');
+    print('  cat <file>                      Print file contents');
+    print('  nano <file>                     Mini editor (Ctrl+S save, Esc exit)');
+    print('  chmod <octal> <path>            Change permissions');
+    print('  chown <uid> <path>              Change owner (root only)');
+    print('  protect [on|off --force] <path> Protected-file flag');
+    print('  mem                             Kernel heap statistics');
+    print('  ps                              Tasks, quotas and memory');
+    print('  smp / cpu                       CPUs, APIC IDs and parallel units');
+    print('  vm                              Paging, frame pool and fault counters');
+    print('  swap                            Swap file, slots and page traffic');
+    print('  pfa                             Demand paging self-test');
+    print('  ip [set <ip> <mask> [gw] [dns]] Show or set IPv4 configuration');
+    print('  curl <url>                      HTTP GET (browser CORS limits apply)');
+    print('  ping <host> [count]             ICMP echo test');
+    print('  nslookup <host>                 Resolve an A record');
+    print('  acpi                            ACPI / PM1 status');
+    print('  powercfg /a                     List sleep states');
+    print('  bootmode [gui|tty|status]       Startup mode');
+    print('  gui                             Enter the desktop session');
+    print('  reboot                          Reboot the machine');
+    print('  poweroff / shutdown / halt      ACPI S5 shutdown');
+    print('  kill 0                          Terminate the kernel task (BSOD)');
+    print('  useradd <name> / passwd / su / logout');
+    print('  exit / quit                     End this shell');
+  }
+
+  function cmdDir(arg) {
+    var target = arg || state.cwd;
+    var path = normPath(target);
+    var n = getNode(path);
+    if (!n) {
+      print("dir: cannot access '" + target + "': no such file or directory", 'danger');
+      return;
+    }
+    if (n.kind === 'f') {
+      print('File: ' + path);
+      print('  MODE         UID  SIZE  NAME');
+      print('  ' + modeString(n) + '  ' + String(n.uid).padStart(4) +
+            '  ' + String(sizeOf(n)).padStart(5) + '  ' + path.slice(path.lastIndexOf('/') + 1));
+      return;
+    }
+    if (!canRead(n)) {
+      print("dir: cannot open '" + target + "': permission denied", 'danger');
+      return;
+    }
+    print('Directory of ' + path);
+    var names = Object.keys(n.children).sort(function (a, b) {
+      var A = n.children[a], B = n.children[b];
+      if (A.kind !== B.kind) return A.kind === 'd' ? -1 : 1;
+      return a.toLowerCase() < b.toLowerCase() ? -1 : (a.toLowerCase() > b.toLowerCase() ? 1 : 0);
+    });
+    if (names.length === 0) {
+      print('(empty directory)');
+      return;
+    }
+    print('  MODE         UID  SIZE  NAME');
+    for (var i = 0; i < names.length; i++) {
+      var c = n.children[names[i]];
+      print('  ' + modeString(c) +
+            '  ' + String(c.uid).padStart(4) +
+            '  ' + String(sizeOf(c)).padStart(5) +
+            '  ' + names[i] + (c.kind === 'd' ? '\\' : ''));
+    }
+    print(names.length + ' item(s)');
+  }
+
+  function cmdCd(arg) {
+    if (!arg) {
+      state.cwd = homeDir();
+      print(state.cwd);
+      return;
+    }
+    var path = normPath(arg);
+    var n = getNode(path);
+    if (!n) {
+      print("cd: '" + arg + "' does not exist", 'danger');
+      return;
+    }
+    if (n.kind !== 'd') {
+      print("cd: '" + arg + "' is not a directory", 'danger');
+      return;
+    }
+    state.cwd = path;
+    print('cwd: ' + path);
+  }
+
+  function cmdMkdir(arg) {
+    if (!arg) { print('usage: mkdir <path>'); return; }
+    var info = parentOf(arg);
+    if (!info) { print("mkdir: cannot create '" + arg + "'", 'danger'); return; }
+    if (info.parent.children[info.name]) {
+      print("mkdir: '" + arg + "' already exists", 'danger');
+      return;
+    }
+    info.parent.children[info.name] = D({}, 0o755, state.uid);
+    print("mkdir: '" + arg + "' created");
+  }
+
+  function cmdRmdir(arg) {
+    if (!arg) { print('usage: rmdir <path>'); return; }
+    var info = parentOf(arg);
+    if (!info || !info.parent.children[info.name]) {
+      print("rmdir: '" + arg + "' not found", 'danger');
+      return;
+    }
+    var n = info.parent.children[info.name];
+    if (n.kind !== 'd') { print('rmdir: not a directory', 'danger'); return; }
+    if (Object.keys(n.children).length > 0) {
+      print("rmdir: '" + arg + "' is not empty", 'danger');
+      return;
+    }
+    if (!canWrite(info.parent)) {
+      print('rmdir: permission denied', 'danger');
+      return;
+    }
+    delete info.parent.children[info.name];
+    print("rmdir: '" + arg + "' removed");
+  }
+
+  function cmdRm(args) {
+    var force = false;
+    var target = '';
+    for (var i = 0; i < args.length; i++) {
+      if (args[i] === '-f') force = true;
+      else if (!target) target = args[i];
+    }
+    if (!target) { print('usage: rm [-f] <file>'); return; }
+    var info = parentOf(target);
+    if (!info || !info.parent.children[info.name]) {
+      if (!force) print("rm: '" + target + "' not found", 'danger');
+      return;
+    }
+    var n = info.parent.children[info.name];
+    if (n.kind === 'd') {
+      print("rm: '" + target + "' is a directory (use rmdir)", 'danger');
+      return;
+    }
+    if (n.prot) {
+      print("rm: '" + target + "': permission denied (protected file, root cannot delete)", 'danger');
+      return;
+    }
+    if (!canWrite(info.parent)) {
+      print("rm: '" + target + "': permission denied", 'danger');
+      return;
+    }
+    delete info.parent.children[info.name];
+    print("rm: '" + target + "' removed");
+  }
+
+  function cmdCat(arg) {
+    if (!arg) { print('usage: cat <file>'); return; }
+    var n = getNode(arg);
+    if (!n) { print("cat: '" + arg + "' not found", 'danger'); return; }
+    if (n.kind === 'd') { print('cat: is a directory', 'danger'); return; }
+    if (!canRead(n)) { print('cat: permission denied', 'danger'); return; }
+    if (n.prot) { print('cat: protected file (root only)', 'danger'); return; }
+    var text = n.data;
+    var lines = text.split('\n');
+    for (var i = 0; i < lines.length; i++) {
+      if (i === lines.length - 1 && lines[i] === '') break;
+      print(lines[i] === '' ? '\u00a0' : lines[i]);
+    }
+  }
+
+  function cmdNano(arg) {
+    if (!arg) { print('usage: nano <file>'); return; }
+
+    var path = normPath(arg);
+    var existing = getNode(path);
+    if (existing && existing.kind === 'd') {
+      print('nano: is a directory', 'danger');
+      return;
+    }
+    if (existing && existing.prot) {
+      print('nano: permission denied (protected file)', 'danger');
+      return;
+    }
+    if (existing && !canRead(existing)) {
+      print('nano: permission denied', 'danger');
+      return;
+    }
+
+    var ed = document.createElement('textarea');
+    ed.className = 'tty-editor';
+    ed.value = existing ? existing.data : '';
+    ed.spellcheck = false;
+    live.appendChild(ed);
+    print('nano: ' + path + '   Ctrl+S save   Esc exit', 'warn');
+    hidePrompt();
+    ed.focus();
+
+    var closed = false;
+
+    function close(msg) {
+      if (closed) return;
+      closed = true;
+      ed.remove();
+      if (msg) print(msg);
+      showPrompt();
+    }
+
+    function save() {
+      var info = parentOf(path);
+      if (!info) { print('nano: cannot write ' + path, 'danger'); return; }
+      var node = info.parent.children[info.name];
+      if (node && node.prot) { print('nano: protected file', 'danger'); return; }
+      if (node) {
+        node.data = ed.value;
+      } else {
+        info.parent.children[info.name] = F(ed.value, 0o644, state.uid, false);
+      }
+      print('nano: wrote ' + path + ' (' + ed.value.length + ' bytes)', 'success');
+    }
+
+    ed.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        close('nano: closed');
+      } else if (e.ctrlKey && (e.key === 's' || e.key === 'S')) {
+        e.preventDefault();
+        save();
+      }
+      e.stopPropagation();
+    });
+  }
+
+  function cmdMem() {
+    print('kernel heap @ 0x400000  total 6291456 bytes');
+    print('  used   : 3249152');
+    print('  free   : 3042304');
+    print('  peak   : 3871744');
+    print('  allocs : 1842   frees: 1179   failed: 0');
+    print('  tasks  : 3 alive, 3084 bytes accounted');
+  }
+
+  function cmdPs() {
+    print('PID  NAME          STATE     CPU%   MEM(B)   DISK(B)');
+    for (var i = 0; i < state.tasks.length; i++) {
+      var t = state.tasks[i];
+      print(
+        String(t.pid).padEnd(5) +
+        t.name.padEnd(14) +
+        t.state.padEnd(10) +
+        String(t.cpu).padStart(4) + '   ' +
+        String(t.mem).padStart(6) + '   ' +
+        String(t.disk).padStart(7));
+    }
+  }
+
+  function cmdSmp() {
+    print('SMP: 3 CPU(s) reported, 3 online');
+    print('  cpu0  apic_id=0  online  units=11');
+    print('  cpu1  apic_id=1  online  units=11');
+    print('  cpu2  apic_id=2  online  units=10');
+    print('  local APIC: 0xFEE00000');
+    print('  parallel pool: ready (timeouts=0)');
+  }
+
+  function cmdVm() {
+    print('Virtual memory / paging');
+    print('  page size    : 4096 bytes');
+    print('  demand base  : 0x20000000');
+    print('  demand size  : 4096 pages (16 MB)');
+    print('  phys frames  : 9216 total, 6112 free, 3104 used');
+    print('  frame pool   : 0x1800000 .. 0x7800000');
+    print('  resident     : ' + state.vm.resident + ' / 2048 pages (8192 KB)');
+    print('  page tables  : 8 x 4KB (PD split from 2MB pages)');
+    print('  faults       : ' + state.vm.faults + ' total, 4096 demand, ' + state.vm.swapIn + ' swap-in');
+    print('  rejected     : 0 protection, 0 reserved-bit, 0 outside');
+    print('  swap-out     : ' + state.vm.swapOut + ' pages, evictions ' + state.vm.swapOut + ', oom 0');
+  }
+
+  function cmdSwap() {
+    print('Swap file');
+    print('  path         : etc\\pagefile.os');
+    print('  protected    : yes (root cannot delete)');
+    print('  capacity     : 4096 slots x 4096 bytes = 16384 KB');
+    print('  file size    : 6291456 bytes (6144 KB)');
+    print('  slots in use : ' + state.vm.slots + ' / 4096');
+    print('  swapped out  : ' + state.vm.swapOut + ' pages (24576 KB)');
+    print('  swapped in   : ' + state.vm.swapIn + ' pages (16384 KB)');
+  }
+
+  function cmdPfa() {
+    print('pfa: writing 4096 pages (quota 2048), this exercises faults and swap');
+    var t = 0;
+    var timer = setInterval(function () {
+      t += 512;
+      print('pfa: write ' + Math.min(t, 4096) + ' / 4096');
+      if (t >= 4096) {
+        clearInterval(timer);
+        state.vm.faults += 8192;
+        state.vm.swapOut += 6144;
+        state.vm.swapIn += 4096;
+        state.vm.slots = 2048;
+        print('pfa: verifying');
+        print('pfa: faults=' + state.vm.faults + ' swap-out=' + state.vm.swapOut +
+              ' swap-in=' + state.vm.swapIn + ' resident=2048');
+        print('pfa: PASS', 'success');
+        print('pfa: self-test finished successfully');
+      }
+    }, 220);
+  }
+
+  function cmdIp(args) {
+    if (args[0] === 'set') {
+      if (!args[1] || !args[2]) {
+        print('usage: ip set <ip> <mask> [gw] [dns]');
+        return;
+      }
+      state.net.ip = args[1];
+      state.net.mask = args[2];
+      if (args[3]) state.net.gw = args[3];
+      if (args[4]) state.net.dns = args[4];
+      print('ip: address configured', 'success');
+    }
+    print('eth0: E1000  link up  speed 1000 Mbps');
+    print('  mac     : 52:54:00:12:34:56');
+    print('  ip      : ' + state.net.ip);
+    print('  netmask : ' + state.net.mask);
+    print('  gateway : ' + state.net.gw);
+    print('  dns     : ' + state.net.dns);
+    print('  rx      : 128 packets / 14336 bytes');
+    print('  tx      : 96 packets / 9216 bytes');
+  }
+
+  function cmdCurl(args) {
+    var url = '';
+    for (var i = 0; i < args.length; i++) {
+      if (args[i].charAt(0) !== '-') url = args[i];
+    }
+    if (!url) {
+      print('usage: curl <url>');
+      return;
+    }
+    print('* Host ' + url + ' was resolved.');
+    print('* Trying to connect...');
+    print('curl: (7) Failed to connect: request blocked by the browser CORS policy.', 'danger');
+    print('  This terminal runs inside pledge.html. Cross-origin requests are rejected by the', 'warn');
+    print('  browser before they reach the network, so real HTTP cannot work here.', 'warn');
+    print('  The actual SaylterOS image ships an E1000 driver and a full TCP/IP stack;', 'output');
+    print('  boot build\\saylter-ide.img to use curl without CORS restrictions.', 'output');
+  }
+
+  function cmdPing(args) {
+    var host = args[0];
+    if (!host) { print('usage: ping <host> [count]'); return; }
+    var count = parseInt(args[1] || '4', 10);
+    if (!(count > 0) || count > 10) count = 4;
+    print('PING ' + host + ' (' + state.net.gw + ') 56(84) bytes of data.');
+    var i = 0;
+    var timer = setInterval(function () {
+      i++;
+      var rtt = 8 + ((i * 7) % 12);
+      print('64 bytes from ' + state.net.gw + ': icmp_seq=' + i + ' ttl=64 time=' + rtt + ' ms');
+      if (i >= count) {
+        clearInterval(timer);
+        print('--- ' + host + ' ping statistics ---');
+        print(count + ' packets transmitted, ' + count + ' received, 0% packet loss');
+      }
+    }, 320);
+  }
+
+  function cmdNslookup(args) {
+    var host = args[0];
+    if (!host) { print('usage: nslookup <host>'); return; }
+    print('Server:  ' + state.net.dns);
+    print('Address: ' + state.net.dns + '#53');
+    print('');
+    print('Non-authoritative answer:');
+    print('Name:    ' + host);
+    print('Address: ' + state.net.gw);
+  }
+
+  function cmdAcpi() {
+    print('ACPI: RSDP @ 0xE0000  FADT @ 0xE0200');
+    print('  PM1a_CNT : 0x0604  PM1b_CNT: 0x0000');
+    print('  SLP_TYP  : S5 = 0x0A (SLP_EN + SLP_TYP)');
+    print('  power button: GPE 0x02, SCI IRQ9');
+    print('  AML interpreter: ACPICA tables loaded');
+  }
+
+  function cmdPowercfg(args) {
+    if (args[0] === '/sleep') {
+      print('powercfg: entering sleep state ' + (args[1] || 'S3') + ' ...');
+      print('powercfg: wake source = power button');
+      return;
+    }
+    print('The following sleep states are available:');
+    print('  S0  working');
+    print('  S1  sleep (CPU stopped, RAM refreshed)');
+    print('  S2  deprecated');
+    print('  S3  suspend to RAM');
+    print('  S4  hibernate (not implemented)');
+    print('  S5  soft off (ACPI shutdown)');
+  }
+
+  function cmdBootmode(args) {
+    var mode = args[0] || '';
+    if (!mode || mode === 'status') {
+      print('boot.mode = ' + state.bootmode + '   (etc\\system.cfg)');
+      return;
+    }
+    if (mode !== 'gui' && mode !== 'tty') {
+      print('usage: bootmode [gui|tty|status]');
+      return;
+    }
+    state.bootmode = mode;
+    var node = getNode('/etc/system.cfg');
+    if (node) {
+      node.data = 'boot.mode=' + mode + '\ntimezone=8\n';
+    }
+    print('bootmode: saved ' + mode + ' (reboot to apply)', 'success');
+  }
+
+  function cmdProtect(args) {
+    if (args.length === 0) {
+      print('usage: protect <path> | protect on <path> | protect off <path> --force');
+      return;
+    }
+    var action = args[0];
+    if (action !== 'on' && action !== 'off') {
+      var n = getNode(action);
+      if (!n) { print("protect: '" + action + "' not found", 'danger'); return; }
+      print(action + ': ' + (n.prot ? 'protected (root cannot delete)' : 'not protected'));
+      return;
+    }
+    var path = args[1];
+    if (!path) { print('protect: missing path'); return; }
+    if (state.uid !== 0) { print('protect: root only', 'danger'); return; }
+    var node = getNode(path);
+    if (!node || node.kind !== 'f') {
+      print("protect: cannot '" + path + "'", 'danger');
+      return;
+    }
+    if (action === 'on') {
+      node.prot = true;
+      print('protect: ' + path + ' is now protected (root cannot delete)', 'success');
+      return;
+    }
+    var force = args.indexOf('--force') >= 0;
+    if (!force) {
+      print('protect: removing protection requires an explicit override', 'warn');
+      print('         protect off <path> --force');
+      return;
+    }
+    node.prot = false;
+    print('protect: ' + path + ' is no longer protected', 'success');
+  }
+
+  function cmdChmod(args) {
+    if (args.length < 2) { print('usage: chmod <octal-mode> <path>'); return; }
+    var mode = parseInt(args[0], 8);
+    if (isNaN(mode)) { print('chmod: mode must be octal, e.g. chmod 600 secret.txt', 'danger'); return; }
+    var n = getNode(args[1]);
+    if (!n) { print('chmod: permission denied or not found', 'danger'); return; }
+    if (n.prot) { print('chmod: protected file', 'danger'); return; }
+    n.mode = mode & 0o7777;
+    print('chmod: ' + args[1] + ' updated');
+  }
+
+  function cmdChown(args) {
+    if (args.length < 2) { print('usage: chown <uid> <path>'); return; }
+    if (state.uid !== 0) { print('chown: permission denied (root only)', 'danger'); return; }
+    var uid = parseInt(args[0], 10);
+    if (isNaN(uid) || uid < 0 || uid > 255) { print('chown: uid must be 0..255', 'danger'); return; }
+    var n = getNode(args[1]);
+    if (!n) { print('chown: permission denied (root only) or not found', 'danger'); return; }
+    if (n.prot) { print('chown: protected file', 'danger'); return; }
+    n.uid = uid;
+    print('chown: ' + args[1] + ' -> uid ' + uid);
+  }
+
+  function cmdUseradd(args) {
+    if (!args[0]) { print('usage: useradd <name>'); return; }
+    if (state.uid !== 0) { print('useradd: root only', 'danger'); return; }
+    var name = args[0];
+    if (getNode('/home/' + name)) { print('useradd: user already exists', 'danger'); return; }
+    getNode('/home').children[name] = D({}, 0o755, 1);
+    print('useradd: ' + name + ' created (home /home/' + name + ')', 'success');
+  }
+
+  function cmdSu(args) {
+    var name = args[0] || 'root';
+    if (name === 'root') {
+      state.user = 'root';
+      state.uid = 0;
+      state.cwd = '/home/root';
+      print('Welcome, root (uid 0)', 'success');
+      return;
+    }
+    if (!getNode('/home/' + name)) { print('su: user not found', 'danger'); return; }
+    state.user = name;
+    state.uid = 1;
+    state.cwd = '/home/' + name;
+    print('Welcome, ' + name + ' (uid 1)', 'success');
+  }
+
+  function cmdLogout() {
+    state.user = 'root';
+    state.uid = 0;
+    state.cwd = '/home/root';
+    print('logged out; session reset to root', 'warn');
+  }
+
+  function cmdReboot() {
+    clearScreen();
+    state.dead = true;
+    hidePrompt();
+    var seq = [
+      '[BOOT] SaylterOS MBR 0x7C00',
+      '[PM] page tables ready',
+      '[PM] 64-bit long mode',
+      '[PM] IRQ0/IRQ1/IRQ9 enabled',
+      '[SMP] ap1 online, ap2 online',
+      '[SMP] parallel pool: ready',
+      '[FS] SlyzFS mounted',
+      '[VM] pagefile etc\\pagefile.os ready',
+      'SaylterOS v0.3 Beta1 - type \'help\' for commands'
+    ];
+    var i = 0;
+    var timer = setInterval(function () {
+      if (i >= seq.length) {
+        clearInterval(timer);
+        state.dead = false;
+        showPrompt();
+        return;
+      }
+      print(seq[i], i < 4 ? 'output' : 'success');
+      i++;
+    }, 240);
+  }
+
+  function cmdPoweroff() {
+    state.dead = true;
+    hidePrompt();
+    print('[ACPI] S5: writing SLP_TYP | SLP_EN to PM1a_CNT ...', 'warn');
+    print('Power off.', 'output');
+    print('Press any key to power on.', 'warn');
+    setTimeout(function () {
+      document.addEventListener('keydown', function powerOn() {
+        document.removeEventListener('keydown', powerOn);
+        state.dead = false;
+        clearScreen();
+        print('SaylterOS v0.3 Beta1 - type \'help\' for commands', 'success');
+        showPrompt();
+      }, { once: true });
+    }, 320);
+  }
+
+  function cmdGui() {
+    state.gui = true;
+    print('[GUI] starting desktop session ...', 'success');
+    var box = document.createElement('div');
+    box.className = 'tty-desktop';
+    box.textContent =
+      '+---------------------------------------------------+\n' +
+      '|  Files       Text Editor   Terminal    Browser    |\n' +
+      '|  Settings    Task Manager  Calculator           |\n' +
+      '+---------------------------------------------------+\n' +
+      '|  CPU: 19%   MEM: 3104 KB / 6 MB   DISK: 12 KB/s  |\n' +
+      '|  SLYZFS: 5 root entries   SWAP: 1536 / 4096      |\n' +
+      '+---------------------------------------------------+';
+    live.appendChild(box);
+    print("Desktop session is simulated. Type 'exit' to return to the TTY.", 'warn');
+  }
+
+  function cmdKill(args) {
+    if ((args[0] || '') !== '0') {
+      print('usage: kill <pid>   (pid 0 terminates the kernel task)');
+      return;
+    }
+    var ov = document.createElement('div');
+    ov.className = 'tty-bsod';
+    var b = document.createElement('b');
+    b.textContent = 'SAYLTER OS  v0.3 Beta1';
+    ov.appendChild(b);
+    var lines = [
+      '',
+      'A fatal exception has occurred. The system has been halted.',
+      '',
+      '*** STOP: 0x00000000',
+      '',
+      'Reason: kernel task terminated by user request',
+      '',
+      'Hardware state protection:',
+      '  - interrupts disabled, 8259 fully masked',
+      '  - all tasks frozen, no further scheduling',
+      '  - no disk writes performed after this point',
+      '',
+      'Press any key or click to restart.'
+    ];
+    for (var i = 0; i < lines.length; i++) {
+      var d = document.createElement('div');
+      d.textContent = lines[i] || '\u00a0';
+      ov.appendChild(d);
+    }
+    document.body.appendChild(ov);
+    hidePrompt();
+
+    function restart() {
+      ov.remove();
+      document.removeEventListener('keydown', restart);
+      clearScreen();
+      print('SaylterOS v0.3 Beta1 - type \'help\' for commands', 'success');
+      showPrompt();
+    }
+    setTimeout(function () {
+      document.addEventListener('keydown', restart, { once: true });
+      ov.addEventListener('click', restart, { once: true });
+    }, 300);
+  }
+
+  function cmdDate() {
+    var d = new Date();
+    print(d.toString());
+  }
+
+  function cmdVersion() {
+    print('SaylterOS v0.3 Beta1 (TTY shell)');
+  }
+
+  function cmdUname() {
+    print('SaylterOS 0.3 Beta1 x86_64 long mode');
+    print('  build: ' + new Date().toISOString().slice(0, 10) + '  kernel: 592 KB');
+    print('  SMP: 3 CPUs  paging: 4KB  swap: etc\\pagefile.os');
+  }
+
+  /* ---------------- 分发 ---------------- */
+  function execute(raw) {
+    var line = raw.trim();
+    if (!line) { showPrompt(); return; }
+
+    state.history.push(line);
+    if (state.history.length > 100) state.history.shift();
+    state.histIdx = state.history.length;
+
+    print(state.user + '@saylter:' + shortPath() + '# ' + line, 'cmd');
+
+    var tokens = line.split(/\s+/);
+    var cmd = tokens.shift().toLowerCase();
+    var args = tokens;
+
+    if (state.gui) {
+      if (cmd === 'exit' || cmd === 'quit') {
+        state.gui = false;
+        print('[GUI] session closed', 'warn');
+        showPrompt();
+      } else if (cmd === 'help') {
+        print("desktop session: type 'exit' to return to the TTY");
+        showPrompt();
+      } else {
+        print("desktop session: only 'exit' is available here", 'warn');
+        showPrompt();
+      }
+      return;
+    }
+
+    switch (cmd) {
+      case 'help':
+        cmdHelp();
+        break;
+
+      case 'clear':
+      case 'cls':
+        clearScreen();
+        break;
+
+      case 'echo':
+        print(args.join(' '));
+        break;
+
+      case 'version':
+      case 'ver':
+        cmdVersion();
+        break;
+
+      case 'uname':
+        cmdUname();
+        break;
+
+      case 'whoami':
+        print(state.user + ' (uid ' + state.uid + ')');
+        break;
+
+      case 'date':
+        cmdDate();
+        break;
+
+      case 'pwd':
+        print(state.cwd);
+        break;
+
+      case 'dir':
+      case 'ls':
+        cmdDir(args[0]);
+        break;
+
+      case 'cd':
+        cmdCd(args[0]);
+        break;
+
+      case 'mkdir':
+      case 'md':
+        cmdMkdir(args[0]);
+        break;
+
+      case 'rmdir':
+      case 'rd':
+        cmdRmdir(args[0]);
+        break;
+
+      case 'rm':
+      case 'del':
+        cmdRm(args);
+        break;
+
+      case 'cat':
+        cmdCat(args[0]);
+        break;
+
+      case 'nano':
+      case 'edit':
+        cmdNano(args[0]);
+        return;
+
+      case 'chmod':
+        cmdChmod(args);
+        break;
+
+      case 'chown':
+        cmdChown(args);
+        break;
+
+      case 'protect':
+        cmdProtect(args);
+        break;
+
+      case 'mem':
+        cmdMem();
+        break;
+
+      case 'ps':
+        cmdPs();
+        break;
+
+      case 'smp':
+      case 'cpu':
+        cmdSmp();
+        break;
+
+      case 'vm':
+        if (args[0] === 'swap') cmdSwap();
+        else cmdVm();
+        break;
+
+      case 'swap':
+        cmdSwap();
+        break;
+
+      case 'pfa':
+        cmdPfa();
+        return;
+
+      case 'ip':
+      case 'ifconfig':
+        cmdIp(args);
+        break;
+
+      case 'curl':
+        cmdCurl(args);
+        break;
+
+      case 'ping':
+        cmdPing(args);
+        break;
+
+      case 'nslookup':
+        cmdNslookup(args);
+        break;
+
+      case 'acpi':
+        cmdAcpi();
+        break;
+
+      case 'powercfg':
+        cmdPowercfg(args);
+        break;
+
+      case 'bootmode':
+        cmdBootmode(args);
+        break;
+
+      case 'gui':
+        cmdGui();
+        break;
+
+      case 'reboot':
+        cmdReboot();
+        return;
+
+      case 'poweroff':
+      case 'shutdown':
+      case 'halt':
+        cmdPoweroff();
+        return;
+
+      case 'kill':
+        cmdKill(args);
+        return;
+
+      case 'useradd':
+      case 'adduser':
+        cmdUseradd(args);
+        break;
+
+      case 'passwd':
+        print('passwd: password updated (simulated)');
+        break;
+
+      case 'su':
+        cmdSu(args);
+        break;
+
+      case 'logout':
+        cmdLogout();
+        break;
+
+      case 'exit':
+      case 'quit':
+        print('Bye.');
+        break;
+
+      default: {
+        var hint = suggest(cmd);
+        print(cmd + ': command not found', 'danger');
+        if (hint) print('Did you mean: ' + hint + ' ?', 'warn');
+        break;
+      }
+    }
+
+    showPrompt();
+  }
+
+  /* ---------------- 键盘 ---------------- */
+  hidden.addEventListener('keydown', function (e) {
+    if (state.dead) {
+      e.preventDefault();
+      return;
+    }
+
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      var value = hidden.value;
+      hidden.value = '';
+      spEcho.textContent = '';
+      execute(value);
+      return;
+    }
+
+    if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (state.history.length === 0) return;
+      if (state.histIdx > 0) state.histIdx--;
+      hidden.value = state.history[state.histIdx] || '';
+      spEcho.textContent = hidden.value;
+      return;
+    }
+
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      if (state.history.length === 0) return;
+      if (state.histIdx < state.history.length - 1) {
+        state.histIdx++;
+        hidden.value = state.history[state.histIdx];
+      } else {
+        state.histIdx = state.history.length;
+        hidden.value = '';
+      }
+      spEcho.textContent = hidden.value;
+      return;
+    }
+
+    if (e.key === 'Tab') {
+      e.preventDefault();
+      var prefix = hidden.value.trim().toLowerCase();
+      if (!prefix) return;
+      var matches = COMMANDS.filter(function (c) { return c.indexOf(prefix) === 0; });
+      if (matches.length === 1) {
+        hidden.value = matches[0] + ' ';
+        spEcho.textContent = hidden.value;
+      } else if (matches.length > 1) {
+        print(state.user + '@saylter:' + shortPath() + '# ' + hidden.value, 'cmd');
+        print(matches.join('  '));
+      }
+      return;
+    }
+
+    if (e.ctrlKey && (e.key === 'l' || e.key === 'L')) {
+      e.preventDefault();
+      clearScreen();
+      refreshPrompt();
+      return;
+    }
+
+    if (e.ctrlKey && (e.key === 'c' || e.key === 'C')) {
+      e.preventDefault();
+      print('^C');
+      hidden.value = '';
+      spEcho.textContent = '';
+      showPrompt();
+      return;
+    }
+  });
+
+  /* 页面加载后终端本身仍然保持安静；只有点击过终端才会出现提示符。 */
+  body.addEventListener('click', function (e) {
+    if (e.target && e.target.tagName === 'TEXTAREA') return;
+    activate();
+  });
+})();
 </script>
 
 </body>
