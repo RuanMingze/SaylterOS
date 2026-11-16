@@ -18,6 +18,7 @@
 #include "task.h"
 #include "bsod.h"
 #include "ui.h"
+#include "net.h"
 
 /* ---- SlyzFS 目录项镜像结构 ----
  * 必须与 slyzfs.h 的 DirEntry 以及 bridge 层的 SlyzDirEntry 逐字节一致：
@@ -342,6 +343,11 @@ static const char *help_text[] = {
     "  logout                          End session and show login prompt",
     "  chmod <octal> <path>            Change permissions, e.g. chmod 600 secret.txt",
     "  chown <uid> <path>              Change owner (root only)",
+    "  ip / ifconfig                   Show NIC, MAC, IPv4 and packet counters",
+    "  ip set <ip> <mask> [gw] [dns]   Configure static IPv4 (default 10.0.2.15)",
+    "  curl [-iIvs] [-A ua] [-m sec] <url>   HTTP/1.1 GET with a custom User-Agent",
+    "  ping <host> [count]             ICMP echo test (default 4 packets)",
+    "  nslookup <host>                 Resolve an A record through DNS",
     0
 };
 
@@ -750,7 +756,8 @@ static const char *builtin_cmds[] = {
     "help","min","clear","cls","echo","dir","ls","pwd","cd","run","ask","dd","remove",
     "mkdir","rmdir","rm","del","df","nano","edit","cat","run","bg","kill","gui","version","uname","whoami","date","mem",
     "reboot","poweroff","shutdown","halt","acpi","powercfg","ps",
-    "useradd","passwd","su","logout","chmod","chown", 0
+    "useradd","passwd","su","logout","chmod","chown",
+    "ip","ifconfig","curl","ping","nslookup", 0
 };
 
 /* 找最接近的内置命令，仅返回编辑距离 <= 2 的 */
@@ -1570,7 +1577,7 @@ static int try_run_slyz_by_name(const char *name) {
 }
 
 static void cmd_help(void)  { for (int i = 0; help_text[i]; i++) printk("%s\n", help_text[i]); }
-static void cmd_min(void)  { printk("help clear echo dir ls pwd cd dd mkdir rmdir rm del df nano cat run bg kill gui ps version uname whoami date mem reboot poweroff acpi useradd passwd su logout chmod chown\n"); }
+static void cmd_min(void)  { printk("help clear echo dir ls pwd cd dd mkdir rmdir rm del df nano cat run bg kill gui ps version uname whoami date mem reboot poweroff acpi useradd passwd su logout chmod chown ip curl ping nslookup\n"); }
 static void cmd_clear(void){ tty_clear(); }
 static void cmd_echo(const char *args)  { printk("%s\n", args); }
 
@@ -2393,6 +2400,10 @@ static int exec_cmd(const char *cmd, char *args) {
     else if (cmd_strcmp(cmd, "chmod") == 0)  cmd_chmod(args);
     else if (cmd_strcmp(cmd, "chown") == 0)  cmd_chown(args);
     else if (cmd_strcmp(cmd, "ps") == 0)    cmd_ps();
+    else if (cmd_strcmp(cmd, "ip") == 0 || cmd_strcmp(cmd, "ifconfig") == 0) netcmd_ip(args);
+    else if (cmd_strcmp(cmd, "curl") == 0)  netcmd_curl(args);
+    else if (cmd_strcmp(cmd, "ping") == 0)  netcmd_ping(args);
+    else if (cmd_strcmp(cmd, "nslookup") == 0) netcmd_nslookup(args);
     else return 0;
     return 1;
 }
