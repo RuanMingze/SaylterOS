@@ -20,9 +20,14 @@
 #include "ui.h"
 #include "gui.h"
 #include "system_cfg.h"
+#include "lang.h"
+#include "audio.h"
 #include "net.h"
 #include "smp.h"
 #include "vm.h"
+#include "ime.h"
+#include "ime_pinyin.h"
+#include "unicode.h"
 
 /* ---- SlyzFS 目录项镜像结构 ----
  * 必须与 slyzfs.h 的 DirEntry 以及 bridge 层的 SlyzDirEntry 逐字节一致：
@@ -93,7 +98,7 @@ static void delay(uint32_t count) {
 #define ATA_DRIVE_PORT   0x1F6
 #define ATA_CMD_PORT     0x1F7
 #define ATA_CTRL_PORT    0x3F6
-#define DISK_TEST_LBA    2048u
+#define DISK_TEST_LBA    8192u
 #define DISK_MAX_SECTORS 65536u
 
 static uint8_t disk_test_shadow = 0;
@@ -344,6 +349,7 @@ static const char *help_text[] = {
     "  gui                             Enter the graphical desktop session",
     "  version                         Show OS version",
     "  uname                           Show kernel info",
+    "  cjk                             Run the UTF-8 / Chinese font self-test",
     "  whoami                          Show current user",
     "  date                            Show fake system date",
     "  mem                             Show kernel heap statistics",
@@ -476,23 +482,114 @@ static void shell_load_history(char *buf, int maxlen, int direction) {
     cmd_strncpy(buf, shell_history[shell_history_index], maxlen);
 }
 
+/* 计算 UTF-8 串在 avail 列内能完整显示的字节数。
+ * 多字节字符不能被劈开：宁可少显示一个字，也不能让解码器
+ * 收到半个序列后在下一行拼出一个乱码。 */
+static int line_fit_bytes(const char *s, int len, int avail) {
+    int i = 0;
+    int cols = 0;
+    while (i < len) {
+        uint32_t cp = 0;
+        int used = utf8_decode((const uint8_t *)s + i, len - i, &cp);
+        if (used <= 0) break;
+        int w = utf32_width(cp);
+        if (cols + w > avail) break;
+        cols += w;
+        i += used;
+    }
+    return i;
+}
+
+/* ---- 输入法候选栏 ----
+ * 优先画在输入行右侧；右侧放不下就借用上一行。无论画在哪里，
+ * 下一次重绘都会先按记录的位置擦掉，屏幕上不会留下残影。 */
+static uint16_t g_ime_row;
+static uint16_t g_ime_col;
+static int      g_ime_w;
+static int      g_ime_shown;
+
+static void shell_ime_bar_clear(void) {
+    if (!g_ime_shown) return;
+    for (int i = 0; i < g_ime_w; i++) {
+        tty_put_at((uint16_t)(g_ime_col + i), g_ime_row, ' ', 0x07);
+    }
+    g_ime_shown = 0;
+    g_ime_w = 0;
+}
+
+static void shell_ime_bar_draw(uint16_t prompt_x, int line_cols) {
+    shell_ime_bar_clear();
+    if (!ime_chinese_enabled()) return;
+    if (ime_composing()[0] == '\0') return;
+
+    char text[200];
+    int p = 0;
+
+    const char *comp = ime_composing();
+    for (int i = 0; comp[i] && p < 20; i++) text[p++] = comp[i];
+    text[p++] = ' ';
+
+    for (int i = 0; i < IME_PAGE_SIZE; i++) {
+        char cand[16];
+        int n = ime_candidate_text(i, cand, sizeof(cand));
+        if (n <= 0) break;
+        if (p + n + 3 >= (int)sizeof(text)) break;
+        text[p++] = (char)('1' + i);
+        for (int k = 0; k < n; k++) text[p++] = cand[k];
+        text[p++] = ' ';
+    }
+    text[p] = '\0';
+
+    int width = utf8_width(text);
+    uint16_t cols = tty_get_cols();
+    uint16_t row = tty_get_cursor_y();
+    uint16_t col = (uint16_t)(prompt_x + line_cols + 2);
+
+    if ((int)col + width >= (int)cols) {
+        if (row == 0) return;
+        row = (uint16_t)(row - 1);
+        col = 1;
+        int blank = width + 1;
+        if (col + blank > cols) blank = cols - col;
+        for (int i = 0; i < blank; i++) {
+            tty_put_at((uint16_t)(col + i), row, ' ', 0x07);
+        }
+    }
+
+    int drawn = tty_put_text_at(col, row, text, 0x0E);
+    g_ime_row = row;
+    g_ime_col = col;
+    g_ime_w = drawn;
+    g_ime_shown = 1;
+}
+
 /* 重绘当前输入行：先清掉提示符右侧内容，再逐字符重画。
- * 行宽来自 tty（图形终端通常 > 80 列），不再假设 80x25。 */
+ * 行宽来自 tty（图形终端通常 > 80 列），不再假设 80x25。
+ * 中文按显示列排版，光标位置也用显示列而不是字节数。 */
 static void redraw_line(char *buf, int len, int pos, uint16_t prompt_x) {
     uint16_t row = tty_get_cursor_y();
     uint16_t cols = tty_get_cols();
 
-    /* 清行 + 重画整行一次回写，避免编辑每个字符都触发一次屏幕交换 */
+    int avail = (int)cols - (int)prompt_x;
+    if (avail < 0) avail = 0;
+    int shown = line_fit_bytes(buf, len, avail);
+
+    int cpos = utf8_width_n(buf, pos);
+    if (cpos > avail) cpos = avail;
+
     tty_begin_batch();
+    shell_ime_bar_clear();
     tty_clear_from(prompt_x, row);
     tty_set_cursor(prompt_x, row);
-    for (int i = 0; i < len; i++) {
-        if ((uint32_t)prompt_x + (uint32_t)i >= (uint32_t)cols) break;
-        tty_putchar(buf[i]);
+    for (int i = 0; i < shown; i++) {
+        /* 重绘不是真实输出：只刷新屏幕，不回显串口。
+         * 否则每编辑一个字符，串口日志里就会多一整行重复内容。 */
+        tty_putchar_vga(buf[i]);
     }
-
-    tty_set_cursor((uint16_t)(prompt_x + pos), row);
+    tty_set_cursor((uint16_t)(prompt_x + cpos), row);
     tty_end_batch();
+
+    shell_ime_bar_draw(prompt_x, utf8_width_n(buf, len));
 }
 
 /* 提交当前输入行：
@@ -501,8 +598,30 @@ static void redraw_line(char *buf, int len, int pos, uint16_t prompt_x) {
  * 不能直接用 tty_putchar('\n')：那会在保留区里触发一次滚动，
  * 把光标拉到滚动区末行却不搬运输入行，结果是旧命令行既不上屏也不被清空。 */
 static void shell_commit_input_line(void) {
+    /* 提交时清掉输入法状态与候选栏，避免残留到历史输出里 */
+    ime_reset();
+    shell_ime_bar_clear();
     kserial_putchar('\n');
     tty_commit_reserved();
+}
+
+/* 把一段 UTF-8 文本插入到缓冲区的 pos 处（输入法上屏用） */
+static int shell_insert_utf8(char *buf, int *len, int *pos, int maxlen,
+                             const char *text) {
+    int n = 0;
+    while (text[n]) n++;
+    if (n <= 0) return 0;
+    if (*len + n > maxlen - 1) return 0;
+
+    for (int i = *len; i >= *pos; i--) {
+        buf[i + n] = buf[i];
+    }
+    for (int i = 0; i < n; i++) {
+        buf[*pos + i] = text[i];
+    }
+    *len += n;
+    *pos += n;
+    return 1;
 }
 
 static void readline(char *buf, int maxlen, uint16_t prompt_x) {
@@ -549,6 +668,23 @@ static void readline(char *buf, int maxlen, uint16_t prompt_x) {
             continue;
         }
 
+        /* 输入法优先处理：只有它放行，按键才进入命令行的编辑逻辑。
+         * 上屏文本按 UTF-8 插入到光标处，之后整行重绘。 */
+        {
+            char commit[64];
+            int ir = ime_key((int)(unsigned char)c, commit, sizeof(commit));
+            if (ir == IME_CONSUMED) {
+                redraw_line(buf, len, pos, prompt_x);
+                continue;
+            }
+            if (ir == IME_COMMIT) {
+                if (shell_insert_utf8(buf, &len, &pos, maxlen, commit)) {
+                    redraw_line(buf, len, pos, prompt_x);
+                }
+                continue;
+            }
+        }
+
         if (c == 3) {
             printk("^C");
             buf[0] = '\0';
@@ -566,7 +702,8 @@ static void readline(char *buf, int maxlen, uint16_t prompt_x) {
         if (c == (char)0xF0) {
             insert_mode = !insert_mode;
             tty_set_cursor_shape(insert_mode ? 0x0F : 0x06, insert_mode ? 0x0F : 0x06);
-            tty_set_cursor(prompt_x + pos, tty_get_cursor_y());
+            tty_set_cursor((uint16_t)(prompt_x + utf8_width_n(buf, pos)),
+                           tty_get_cursor_y());
             continue;
         }
 
@@ -588,27 +725,31 @@ static void readline(char *buf, int maxlen, uint16_t prompt_x) {
 
         if (c == (char)0xF1) {
             if (pos > 0) {
-                pos--;
-                tty_set_cursor(prompt_x + pos, tty_get_cursor_y());
+                pos = utf8_prev_char(buf, pos);
+                tty_set_cursor((uint16_t)(prompt_x + utf8_width_n(buf, pos)),
+                               tty_get_cursor_y());
             }
             continue;
         }
 
         if (c == (char)0xF2) {
             if (pos < len) {
-                pos++;
-                tty_set_cursor(prompt_x + pos, tty_get_cursor_y());
+                pos = utf8_next_char(buf, pos);
+                tty_set_cursor((uint16_t)(prompt_x + utf8_width_n(buf, pos)),
+                               tty_get_cursor_y());
             }
             continue;
         }
 
         if (c == '\b') {
             if (pos > 0) {
-                pos--;
-                for (int i = pos; i < len - 1; i++) {
-                    buf[i] = buf[i + 1];
+                int prev = utf8_prev_char(buf, pos);
+                int del = pos - prev;
+                for (int i = prev; i + del <= len; i++) {
+                    buf[i] = buf[i + del];
                 }
-                len--;
+                len -= del;
+                pos = prev;
                 buf[len] = '\0';
                 redraw_line(buf, len, pos, prompt_x);
             }
@@ -617,10 +758,12 @@ static void readline(char *buf, int maxlen, uint16_t prompt_x) {
 
         if (c == (char)0xF5) {
             if (pos < len) {
-                for (int i = pos; i < len - 1; i++) {
-                    buf[i] = buf[i + 1];
+                int next = utf8_next_char(buf, pos);
+                int del = next - pos;
+                for (int i = pos; i + del <= len; i++) {
+                    buf[i] = buf[i + del];
                 }
-                len--;
+                len -= del;
                 buf[len] = '\0';
                 redraw_line(buf, len, pos, prompt_x);
             }
@@ -1383,19 +1526,9 @@ static void cmd_ask(const char *args) {
     }
 }
 
-/* SLYZ 执行缓冲：二进制镜像上限 8KB+32，支持两层脚本嵌套调用。
- * 文本脚本也复用这块缓冲，深度由 slyz_depth 选择不同副本。 */
-static uint8_t slyz_image[2][SLYZVM_MAX_FILE];
+/* SLYZ v2 镜像按文件实际大小从内核堆分配，嵌套层数由 slyz_depth 限制，
+ * 每层在执行期间各自持有一份独立副本。 */
 static int slyz_depth = 0;
-
-static void slyz_op_print(const char *text) {
-    printk("%s\n", text);
-}
-
-static int slyz_op_ask(const char *prompt) {
-    cmd_ask(prompt);
-    return slyz_last_answer;
-}
 
 static int slyz_op_run(const char *line) {
     static char buffer[256];
@@ -1432,6 +1565,441 @@ static void *slyz_op_alloc(uint32_t bytes) {
     return 0;
 }
 
+/* ---------- SLYZ v2 宿主：系统调用实现 ----------
+ * 虚拟机只搬运参数，具体行为全部在这里落地：屏幕输出、SlyzFS、
+ * system.cfg、RTC 与 shell 命令。图形调用在 TTY 会话里没有窗口
+ * 承载，统一返回 -1 并提示一次，程序应自行降级。 */
+
+static uint8_t slyz_text_buf[4096];
+static int slyz_gui_warned = 0;
+
+static const char *slyz_arg_text(struct SlyzVal *args, uint16_t argc, int index) {
+    if (index < 0 || index >= (int)argc) return "";
+    int n = 0;
+    const char *s = slyz_val_str(&args[index], &n);
+    return s ? s : "";
+}
+
+static int64_t slyz_arg_int(struct SlyzVal *args, uint16_t argc, int index) {
+    if (index < 0 || index >= (int)argc) return 0;
+
+    struct SlyzVal *v = &args[index];
+    if (v->type == SLYZ_T_INT) return v->u.i;
+
+    int n = 0;
+    const char *s = slyz_val_str(v, &n);
+    if (!s) return 0;
+
+    int i = 0;
+    int neg = 0;
+    int64_t out = 0;
+    while (i < n && (s[i] == ' ' || s[i] == '\t')) i++;
+    if (i < n && (s[i] == '-' || s[i] == '+')) {
+        neg = (s[i] == '-');
+        i++;
+    }
+    while (i < n && s[i] >= '0' && s[i] <= '9') {
+        out = out * 10 + (s[i] - '0');
+        i++;
+    }
+    return neg ? -out : out;
+}
+
+static void slyz_host_log(const char *text) {
+    printk("slyz: %s\n", text);
+}
+
+static void slyz_print_value(struct SlyzVm *vm, struct SlyzVal *v, int newline) {
+    char buf[512];
+    int n = slyz_val_to_text(vm, v, buf, (int)sizeof(buf));
+    if (n > 0) printk("%s", buf);
+    if (newline) printk("\n");
+}
+
+static void slyz_path_of(const char *input, char *out) {
+    shell_resolve_path(out, shell_cwd, input);
+}
+
+static int slyz_fs_read(struct SlyzVm *vm, const char *path, struct SlyzVal *ret) {
+    char full[SHELL_PATH_MAX];
+    slyz_path_of(path, full);
+
+    void *fh = slyzfs_open(full, "r");
+    if (!fh) {
+        slyz_ret_nil(ret);
+        return 0;
+    }
+
+    int total = 0;
+    while (total < (int)sizeof(slyz_text_buf) - 1) {
+        int n = slyzfs_read(fh, slyz_text_buf + total,
+                            (int)sizeof(slyz_text_buf) - 1 - total);
+        if (n <= 0) break;
+        total += n;
+    }
+    slyzfs_close(fh);
+
+    slyz_text_buf[total] = '\0';
+    if (!slyz_ret_str(vm, ret, (const char *)slyz_text_buf, total)) {
+        return -1;
+    }
+    return 0;
+}
+
+static int slyz_fs_write(const char *path, const char *text, int len) {
+    char full[SHELL_PATH_MAX];
+    slyz_path_of(path, full);
+
+    void *fh = slyzfs_open(full, "w");
+    if (!fh) return -1;
+
+    int written = 0;
+    while (written < len) {
+        int n = slyzfs_write(fh, (const uint8_t *)text + written, len - written);
+        if (n <= 0) break;
+        written += n;
+    }
+    slyzfs_close(fh);
+
+    return written == len ? written : -1;
+}
+
+static int slyz_fs_list(struct SlyzVm *vm, const char *path, struct SlyzVal *ret) {
+    char full[SHELL_PATH_MAX];
+    slyz_path_of(path, full);
+
+    static struct SlyzDirEntry entries[64];
+    int n = slyzfs_list_dir(full, entries, 64);
+    if (n < 0) n = 0;
+
+    if (!slyz_ret_arr(vm, ret, n)) return -1;
+
+    for (int i = 0; i < n; i++) {
+        char name[53];
+        int k = 0;
+        while (k < 52 && entries[i].name[k]) {
+            name[k] = (char)entries[i].name[k];
+            k++;
+        }
+        name[k] = '\0';
+
+        struct SlyzVal item;
+        if (!slyz_ret_str(vm, &item, name, k)) return -1;
+        slyz_arr_set(vm, ret, i, item);
+    }
+
+    return 0;
+}
+
+static int slyz_cfg_get(const char *key, char *out, int cap) {
+    out[0] = '\0';
+
+    void *fh = slyzfs_open(SYSTEM_CFG_PATH, "r");
+    if (!fh) return 0;
+
+    int n = slyzfs_read(fh, slyz_text_buf, (int)sizeof(slyz_text_buf) - 1);
+    slyzfs_close(fh);
+    if (n <= 0) return 0;
+    slyz_text_buf[n] = '\0';
+
+    int key_len = 0;
+    while (key[key_len]) key_len++;
+
+    int i = 0;
+    while (i < n) {
+        int start = i;
+        while (i < n && slyz_text_buf[i] != '\n') i++;
+        int end = i;
+        if (i < n) i++;
+
+        if (end > start && slyz_text_buf[start] == '#') continue;
+
+        int eq = -1;
+        for (int k = start; k < end; k++) {
+            if (slyz_text_buf[k] == '=') { eq = k; break; }
+        }
+        if (eq < 0) continue;
+        if (eq - start != key_len) continue;
+
+        int same = 1;
+        for (int k = 0; k < key_len; k++) {
+            if (slyz_text_buf[start + k] != key[k]) { same = 0; break; }
+        }
+        if (!same) continue;
+
+        int v = eq + 1;
+        while (v < end && (slyz_text_buf[v] == ' ' || slyz_text_buf[v] == '\t')) v++;
+        while (end > v && (slyz_text_buf[end - 1] == '\r' ||
+                           slyz_text_buf[end - 1] == ' ' ||
+                           slyz_text_buf[end - 1] == '\t')) {
+            end--;
+        }
+
+        int len = end - v;
+        if (len > cap - 1) len = cap - 1;
+        for (int k = 0; k < len; k++) out[k] = (char)slyz_text_buf[v + k];
+        out[len] = '\0';
+        return 1;
+    }
+
+    return 0;
+}
+
+static int slyz_cfg_set(const char *key, const char *value) {
+    if (cmd_strcmp(key, "boot.mode") == 0) {
+        int gui = (cmd_strcmp(value, "gui") == 0) ? 1 : 0;
+        return system_cfg_set_boot_gui(gui) ? 0 : -1;
+    }
+    if (cmd_strcmp(key, "lang") == 0) {
+        int id = (cmd_strcmp(value, "zh") == 0) ? 1 : 0;
+        return system_cfg_set_lang(id) ? 0 : -1;
+    }
+    if (cmd_strcmp(key, "timezone") == 0) {
+        int hours = 0;
+        int neg = 0;
+        int i = 0;
+        if (value[0] == '-') { neg = 1; i = 1; }
+        while (value[i] >= '0' && value[i] <= '9') {
+            hours = hours * 10 + (value[i] - '0');
+            i++;
+        }
+        if (neg) hours = -hours;
+        return system_cfg_set_timezone(hours) ? 0 : -1;
+    }
+    return -1;
+}
+
+static int slyz_is_leap(int y) {
+    return (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
+}
+
+static int64_t slyz_unix_seconds(void) {
+    int y = 1970, mo = 1, d = 1, h = 0, mi = 0, s = 0;
+    rtc_get(&y, &mo, &d, &h, &mi, &s);
+
+    int64_t days = 0;
+    for (int yy = 1970; yy < y; yy++) {
+        days += slyz_is_leap(yy) ? 366 : 365;
+    }
+
+    static const int month_days[12] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    for (int mm = 1; mm < mo; mm++) {
+        days += month_days[mm - 1];
+        if (mm == 2 && slyz_is_leap(y)) days++;
+    }
+    days += d - 1;
+
+    return days * 86400 + (int64_t)h * 3600 + (int64_t)mi * 60 + s;
+}
+
+static void slyz_put2(char *out, int v) {
+    out[0] = (char)('0' + (v / 10) % 10);
+    out[1] = (char)('0' + v % 10);
+}
+
+static int slyz_time_text(char *out, int cap, int with_date) {
+    int y = 1970, mo = 1, d = 1, h = 0, mi = 0, s = 0;
+    rtc_get(&y, &mo, &d, &h, &mi, &s);
+
+    int tz = system_cfg_timezone();
+    h += tz;
+    while (h >= 24) { h -= 24; d++; }
+    while (h < 0) { h += 24; d--; }
+
+    if (with_date) {
+        if (cap < 11) return 0;
+        char tmp[6];
+        int yy = y;
+        tmp[0] = (char)('0' + (yy / 1000) % 10);
+        tmp[1] = (char)('0' + (yy / 100) % 10);
+        tmp[2] = (char)('0' + (yy / 10) % 10);
+        tmp[3] = (char)('0' + yy % 10);
+        out[0] = tmp[0]; out[1] = tmp[1]; out[2] = tmp[2]; out[3] = tmp[3];
+        out[4] = '-';
+        slyz_put2(out + 5, mo);
+        out[7] = '-';
+        slyz_put2(out + 8, d);
+        out[10] = '\0';
+        return 10;
+    }
+
+    if (cap < 9) return 0;
+    slyz_put2(out + 0, h);
+    out[2] = ':';
+    slyz_put2(out + 3, mi);
+    out[5] = ':';
+    slyz_put2(out + 6, s);
+    out[8] = '\0';
+    return 8;
+}
+
+static int slyz_host_sys(struct SlyzVm *vm, uint16_t id,
+                         struct SlyzVal *args, uint16_t argc,
+                         struct SlyzVal *ret) {
+    switch (id) {
+        case SLE_SYS_PRINT:
+            if (argc >= 1) slyz_print_value(vm, &args[0], 0);
+            slyz_ret_nil(ret);
+            return 0;
+
+        case SLE_SYS_PRINTLN:
+            if (argc >= 1) slyz_print_value(vm, &args[0], 1);
+            else printk("\n");
+            slyz_ret_nil(ret);
+            return 0;
+
+        case SLE_SYS_EPRINT:
+            if (argc >= 1) slyz_print_value(vm, &args[0], 1);
+            slyz_ret_nil(ret);
+            return 0;
+
+        case SLE_SYS_FS_READ:
+            return slyz_fs_read(vm, slyz_arg_text(args, argc, 0), ret);
+
+        case SLE_SYS_FS_WRITE: {
+            const char *path = slyz_arg_text(args, argc, 0);
+            int len = 0;
+            const char *text = slyz_arg_text(args, argc, 1);
+            if (argc >= 2) text = slyz_val_str(&args[1], &len);
+            if (!text) { text = ""; len = 0; }
+            slyz_ret_int(ret, (int64_t)slyz_fs_write(path, text, len));
+            return 0;
+        }
+
+        case SLE_SYS_FS_EXISTS: {
+            char full[SHELL_PATH_MAX];
+            slyz_path_of(slyz_arg_text(args, argc, 0), full);
+            struct SlyzDirEntry ent;
+            slyz_ret_int(ret, slyzfs_stat(full, &ent) ? 1 : 0);
+            return 0;
+        }
+
+        case SLE_SYS_FS_LIST:
+            return slyz_fs_list(vm, slyz_arg_text(args, argc, 0), ret);
+
+        case SLE_SYS_FS_REMOVE: {
+            char full[SHELL_PATH_MAX];
+            slyz_path_of(slyz_arg_text(args, argc, 0), full);
+            slyz_ret_int(ret, slyzfs_remove(full) ? 0 : -1);
+            return 0;
+        }
+
+        case SLE_SYS_FS_MKDIR: {
+            char full[SHELL_PATH_MAX];
+            slyz_path_of(slyz_arg_text(args, argc, 0), full);
+            slyz_ret_int(ret, slyzfs_mkdir(full) ? 0 : -1);
+            return 0;
+        }
+
+        case SLE_SYS_CFG_GET: {
+            char value[128];
+            if (!slyz_cfg_get(slyz_arg_text(args, argc, 0), value, (int)sizeof(value))) {
+                if (!slyz_ret_str(vm, ret, "", 0)) return -1;
+            } else {
+                int n = 0;
+                while (value[n]) n++;
+                if (!slyz_ret_str(vm, ret, value, n)) return -1;
+            }
+            return 0;
+        }
+
+        case SLE_SYS_CFG_SET:
+            slyz_ret_int(ret, (int64_t)slyz_cfg_set(slyz_arg_text(args, argc, 0),
+                                                    slyz_arg_text(args, argc, 1)));
+            return 0;
+
+        case SLE_SYS_CFG_KEYS: {
+            static const char *keys[3] = { "boot.mode", "lang", "timezone" };
+            if (!slyz_ret_arr(vm, ret, 3)) return -1;
+            for (int i = 0; i < 3; i++) {
+                struct SlyzVal item;
+                int n = 0;
+                while (keys[i][n]) n++;
+                if (!slyz_ret_str(vm, &item, keys[i], n)) return -1;
+                slyz_arr_set(vm, ret, i, item);
+            }
+            return 0;
+        }
+
+        case SLE_SYS_TIME_NOW:
+            slyz_ret_int(ret, slyz_unix_seconds());
+            return 0;
+
+        case SLE_SYS_TIME_MS:
+            slyz_ret_int(ret, (int64_t)net_now_ms());
+            return 0;
+
+        case SLE_SYS_TIME_TEXT: {
+            char buf[16];
+            int n = slyz_time_text(buf, (int)sizeof(buf), 0);
+            if (!slyz_ret_str(vm, ret, buf, n)) return -1;
+            return 0;
+        }
+
+        case SLE_SYS_DATE_TEXT: {
+            char buf[16];
+            int n = slyz_time_text(buf, (int)sizeof(buf), 1);
+            if (!slyz_ret_str(vm, ret, buf, n)) return -1;
+            return 0;
+        }
+
+        case SLE_SYS_SLEEP: {
+            int64_t ms = slyz_arg_int(args, argc, 0);
+            if (ms < 0) ms = 0;
+            uint32_t start = net_now_ms();
+            while ((uint32_t)(net_now_ms() - start) < (uint32_t)ms) {
+                task_yield();
+            }
+            slyz_ret_nil(ret);
+            return 0;
+        }
+
+        case SLE_SYS_BEEP:
+            slyz_ret_nil(ret);
+            return 0;
+
+        case SLE_SYS_EXEC: {
+            const char *cmd = slyz_arg_text(args, argc, 0);
+            int ok = slyz_op_run(cmd);
+            slyz_ret_int(ret, ok ? 0 : -1);
+            return 0;
+        }
+
+        case SLE_SYS_EXIT: {
+            int64_t code = slyz_arg_int(args, argc, 0);
+            slyzvm_request_exit(vm, (int)code);
+            slyz_ret_nil(ret);
+            return 0;
+        }
+
+        case SLE_SYS_WIN_OPEN:
+        case SLE_SYS_WIN_CLOSE:
+        case SLE_SYS_WIN_SIZE:
+        case SLE_SYS_WIN_HEIGHT:
+        case SLE_SYS_WIN_TITLE:
+        case SLE_SYS_GFX_CLEAR:
+        case SLE_SYS_GFX_RECT:
+        case SLE_SYS_GFX_FRAME:
+        case SLE_SYS_GFX_TEXT:
+        case SLE_SYS_GFX_TWIDTH:
+        case SLE_SYS_GFX_LINE:
+        case SLE_SYS_GFX_CIRCLE:
+        case SLE_SYS_GFX_FLUSH:
+        case SLE_SYS_EVT_POLL:
+        case SLE_SYS_EVT_WAIT:
+            if (!slyz_gui_warned) {
+                slyz_gui_warned = 1;
+                printk("slyz: graphics calls need the GUI session (tty has no window)\n");
+            }
+            slyz_ret_int(ret, -1);
+            return 0;
+
+        default:
+            slyz_ret_int(ret, -1);
+            return 0;
+    }
+}
+
 static void slyz_op_free(void *ptr) {
     task_free(ptr);
 }
@@ -1441,20 +2009,17 @@ static void slyz_op_tick(void) {
 }
 
 static const struct SlyzVmOps slyz_vm_ops = {
-    slyz_op_print,
-    slyz_op_ask,
-    slyz_op_run,
-    cmd_clear,
-    cmd_help,
+    slyz_host_sys,
     slyz_op_alloc,
     slyz_op_free,
     slyz_op_tick,
-    task_yield
+    slyz_host_log
 };
 
-/* 脚本作为独立任务执行时的镜像副本。任务运行期间 shell 在 task_wait 中
- * 让出 CPU，因此这块缓冲不会被其他 run 复用。 */
-static uint8_t slyz_task_image[SLYZVM_MAX_FILE];
+/* 脚本作为独立任务执行时的镜像。v2 镜像最大约 320KB，静态数组会
+ * 撑爆 BSS，因此由任务自行持有并在退出时释放；同一时间只允许
+ * 一个 SLYZ 任务运行，避免镜像引用互相覆盖。 */
+static uint8_t *slyz_task_image = 0;
 static int slyz_task_size = 0;
 static char slyz_task_name[SHELL_PATH_MAX];
 static int slyz_run_background = 0;
@@ -1462,10 +2027,23 @@ static int slyz_run_background = 0;
 static void slyz_task_entry(void) {
     struct Task *t = task_current();
     if (!t) {
+        if (slyz_task_image) { kfree(slyz_task_image); slyz_task_image = 0; }
         task_exit(-1);
         return;
     }
+
+    slyz_depth++;
     int rc = slyzvm_run(slyz_task_image, slyz_task_size, &slyz_vm_ops, slyz_task_name);
+    slyz_depth--;
+
+    /* 镜像所有权归任务：无论成功失败都在这里归还堆，
+     * 前台 task_wait 之后不再触碰 slyz_task_image。 */
+    if (slyz_task_image) {
+        kfree(slyz_task_image);
+        slyz_task_image = 0;
+    }
+    slyz_task_size = 0;
+
     task_exit(rc ? 0 : 1);
 }
 
@@ -1475,11 +2053,14 @@ static int try_run_slyz_by_name(const char *name) {
         printk("run: script nesting too deep\n");
         return 0;
     }
+    if (slyz_task_image) {
+        printk("run: another SLYZ program is still running\n");
+        return 2;
+    }
 
-    /* 通过 SlyzFS 打开脚本，不再扫描原始扇区。
-     * 先按用户给的名字找，找不到再补 .slyz 后缀。 */
+    /* 先按用户给的名字找，找不到再补 .slyz 后缀。 */
     char path[SHELL_PATH_MAX];
-    uint8_t *image = slyz_image[slyz_depth];
+    uint8_t *image = 0;
     int got = 0;
 
     for (int attempt = 0; attempt < 2 && !got; attempt++) {
@@ -1501,14 +2082,45 @@ static int try_run_slyz_by_name(const char *name) {
             shell_resolve_path(path, shell_cwd, with_ext);
         }
 
+        struct SlyzDirEntry ent;
+        if (!slyzfs_stat(path, &ent)) continue;
+        if (ent.type == SLYZFS_DIR_DIR || ent.size == 0) continue;
+        if (ent.size > SLYZ_MAX_FILE) {
+            printk("run: image is too large (max %u bytes)\n", (unsigned)SLYZ_MAX_FILE);
+            return 2;
+        }
+
+        uint8_t *buf = (uint8_t *)kmalloc(ent.size + 1);
+        if (!buf) {
+            printk("run: out of memory for image\n");
+            return 2;
+        }
+
         void *fh = slyzfs_open(path, "r");
-        if (!fh) continue;
-        int n = slyzfs_read(fh, image, SLYZVM_MAX_FILE - 1);
+        if (!fh) {
+            kfree(buf);
+            continue;
+        }
+
+        int total = 0;
+        while (total < (int)ent.size) {
+            int n = slyzfs_read(fh, buf + total, (int)ent.size - total);
+            if (n <= 0) break;
+            total += n;
+        }
         slyzfs_close(fh);
-        if (n > 0) got = n;
+
+        if (total <= 0) {
+            kfree(buf);
+            continue;
+        }
+
+        buf[total] = 0;
+        image = buf;
+        got = total;
     }
 
-    if (!got) {
+    if (!got || !image) {
         return 0;
     }
 
@@ -1516,34 +2128,37 @@ static int try_run_slyz_by_name(const char *name) {
     if (slyzvm_is_binary(image, got)) {
         struct Task *cur = task_current();
 
-        /* 已经在脚本任务里：直接在当前任务中执行，避免嵌套覆盖任务镜像缓冲。
+        /* 已经在脚本任务里：直接在当前任务中执行。
          * 此时内存申请仍走该任务的配额。 */
         if (cur && cur->id != 0) {
             slyz_depth++;
             int rc = slyzvm_run(image, got, &slyz_vm_ops, path);
             slyz_depth--;
+            kfree(image);
             return rc ? 1 : 2;
         }
 
         /* shell 任务：把脚本放进独立任务，便于配额记账与 OOM 回收。
-         * 任务镜像缓冲只有一份，已有活动脚本任务时拒绝再启动。 */
+         * 镜像所有权交给任务，任务退出时释放。 */
         for (int i = 1; i < TASK_MAX; i++) {
             struct Task *other = task_by_id(i);
             if (other && (other->state == TASK_READY || other->state == TASK_RUNNING)) {
                 printk("run: task slot %d busy (%s)\n", i, other->name);
+                kfree(image);
                 return 2;
             }
         }
 
-        for (int i = 0; i < got; i++) {
-            slyz_task_image[i] = image[i];
-        }
+        slyz_task_image = image;
         slyz_task_size = got;
         cmd_strncpy(slyz_task_name, path, sizeof(slyz_task_name));
 
         int tid = task_spawn(path, slyz_task_entry, TASK_QUOTA_DEFAULT);
         if (tid < 0) {
             printk("run: no free task slot\n");
+            slyz_task_image = 0;
+            slyz_task_size = 0;
+            kfree(image);
             return 2;
         }
 
@@ -1627,7 +2242,9 @@ static int try_run_slyz_by_name(const char *name) {
         return 1;
     }
 
-    return parse_block(0, line_count) ? 1 : 2;
+    int parsed = parse_block(0, line_count) ? 1 : 2;
+    kfree(image);
+    return parsed;
 }
 
 static void cmd_help(void)  { for (int i = 0; help_text[i]; i++) printk("%s\n", help_text[i]); }
@@ -1987,6 +2604,21 @@ static void shell_enter_gui(void) {
 #endif
 static void cmd_version(void) { printk("SaylterOS v0.3 Beta1 (TTY shell)\n"); }
 static void cmd_uname(void)   { printk("SaylterOS x86_64 64-bit long mode\n"); }
+
+/* 中文与输入法自检：一次跑完 UTF-8 输出、字库覆盖与候选数据三个环节，
+ * 装机现场不需要输入法也能确认中文链路是否正常。 */
+static void cmd_cjk(void) {
+    printk("SaylterOS 中文自检\n");
+    printk("----------------------------------------\n");
+    printk("常用汉字：你好世界，中文输入法，操作系统内核\n");
+    printk("中文标点：，。？！：；、“”《》【】\n");
+    printk("全角字符：ＡＢＣ　１２３（全角）\n");
+    printk("中英混排：SaylterOS 是一个 64 位操作系统，原生支持 UTF-8。\n");
+    printk("输入法：Ctrl+Space 切换，空格或 1-9 选字，- 与 = 翻页。\n");
+    printk("音节表：%d 个音节，%d 个候选字。\n",
+           (int)IME_SYLLABLE_COUNT, (int)IME_POOL_COUNT);
+    printk("当前模式：%s\n", ime_chinese_enabled() ? "中文" : "英文");
+}
 static void cmd_whoami(void) {
     const struct AuthUser *u = auth_current();
     if (u) {
@@ -2575,6 +3207,83 @@ static void cmd_ps(void)      { task_dump(); }
 
 /* 启动模式：读写 etc\system.cfg 的 boot.mode。
  * 与 `nano etc\system.cfg` 完全等价，只是提供一个不用进编辑器的快捷入口。 */
+static int find_home_mp3(char *out, int cap) {
+    static struct SlyzDirEntry entries[32];
+    int n = slyzfs_list_dir("home\\root", entries, 32);
+    if (n < 0) n = 0;
+
+    for (int i = 0; i < n; i++) {
+        const char *name = (const char *)entries[i].name;
+        int len = 0;
+        while (len < 52 && name[len]) len++;
+
+        if (len < 5) continue;
+        if (name[len - 4] != '.' ||
+            (name[len - 3] != 'm' && name[len - 3] != 'M') ||
+            (name[len - 2] != 'p' && name[len - 2] != 'P') ||
+            (name[len - 1] != '3')) {
+            continue;
+        }
+
+        int o = 0;
+        const char *prefix = "home\\root\\";
+        while (prefix[o] && o < cap - 1) {
+            out[o] = prefix[o];
+            o++;
+        }
+        for (int k = 0; k < len && o < cap - 1; k++) out[o++] = name[k];
+        out[o] = '\0';
+        return 1;
+    }
+    return 0;
+}
+
+static void cmd_audiotest(const char *args) {
+    char path_buf[160];
+    const char *path = args;
+    while (path && (*path == ' ' || *path == '\t')) path++;
+
+    if (!path || !*path) {
+        if (!find_home_mp3(path_buf, (int)sizeof(path_buf))) {
+            printk("audiotest: no .mp3 found in home\\root\n");
+            return;
+        }
+        path = path_buf;
+    }
+
+    audio_init();
+    printk("audiotest: AC'97 %s\n", audio_available() ? "ready" : "not found");
+
+    /* 先发一个 PC 扬声器音，用来区分"QEMU 音频后端没声音"和
+     * "AC'97 PCM 通路没声音"。 */
+    printk("audiotest: beep 880 Hz\n");
+    audio_beep(880, 600);
+
+    printk("audiotest: source %s\n", path);
+
+    if (audio_play(path) != 0) {
+        printk("audiotest: cannot open the MP3 file\n");
+        return;
+    }
+
+    printk("audiotest: duration %u ms, volume %d%%\n",
+           audio_duration_ms(), audio_volume());
+
+    uint32_t start = net_now_ms();
+    while (net_now_ms() - start < 20000u) {
+        /* GUI 模式下解码由 audio.slys 后台任务完成，这里必须让出
+         * CPU，否则终端窗口里的命令会把整帧占满、音频任务饿死。
+         * TTY 模式没有后台任务，audio_pump 同步推进 DMA。 */
+        audio_pump();
+        task_yield();
+        __asm__ volatile ("pause");
+    }
+
+    printk("audiotest: done at %u ms, state=%d\n",
+           audio_position_ms(), audio_state());
+    audio_stop();
+}
+
 static void cmd_bootmode(const char *args) {
     char work[32];
     const char *p = args;
@@ -2660,6 +3369,7 @@ static int exec_cmd(const char *cmd, char *args) {
 #endif
     else if (cmd_strcmp(cmd, "version") == 0) cmd_version();
     else if (cmd_strcmp(cmd, "uname") == 0) cmd_uname();
+    else if (cmd_strcmp(cmd, "cjk") == 0)   cmd_cjk();
     else if (cmd_strcmp(cmd, "whoami") == 0) cmd_whoami();
     else if (cmd_strcmp(cmd, "date") == 0)  cmd_date();
     else if (cmd_strcmp(cmd, "mem") == 0)   cmd_mem();
@@ -2669,6 +3379,7 @@ static int exec_cmd(const char *cmd, char *args) {
     else if (cmd_strcmp(cmd, "acpi") == 0) cmd_acpi();
     else if (cmd_strcmp(cmd, "powercfg") == 0) cmd_powercfg(args);
     else if (cmd_strcmp(cmd, "bootmode") == 0) cmd_bootmode(args);
+    else if (cmd_strcmp(cmd, "audiotest") == 0) cmd_audiotest(args);
     else if (cmd_strcmp(cmd, "useradd") == 0 || cmd_strcmp(cmd, "adduser") == 0) cmd_useradd(args);
     else if (cmd_strcmp(cmd, "passwd") == 0) cmd_passwd(args);
     else if (cmd_strcmp(cmd, "su") == 0)     cmd_su(args);
@@ -2757,6 +3468,7 @@ void shell_main(void) {
      * 脚本执行都可能申请内存或依赖任务上下文。 */
     mem_init();
     task_init();
+    ime_init();
 
     /* 启动页静默挂载 SlyzFS：
      * 先把 bridge 的画面日志关掉，挂载/格式化完成后再打印 banner，
@@ -2785,6 +3497,7 @@ void shell_main(void) {
      * 配置文件缺失时自动生成默认的 tty 配置，行为与旧版本一致。 */
     slyzfs_set_quiet(1);
     system_cfg_init();
+    lang_init();
     slyzfs_set_quiet(0);
 
     if (system_cfg_boot_gui() && vbe_is_enabled()) {

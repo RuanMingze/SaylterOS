@@ -433,13 +433,16 @@ static uint32_t vm_swap_in_page(uint32_t slot) {
  * ============================================================ */
 
 /* 无法恢复的缺页：先保留完整串口现场，再进入蓝屏。
- * 蓝屏会冻结中断与全部任务，不会在崩溃后继续写盘。 */
-static void vm_panic_page_fault(uint64_t va, uint64_t error_code, const char *why) {
-    static char reason[96];
+ * 蓝屏会冻结中断与全部任务，不会在崩溃后继续写盘。
+ * RIP 必须一起打印：只有虚拟地址无法定位是哪条指令越界，
+ * 有了 RIP 就能直接对照 nm 的符号表找到出错函数。 */
+static void vm_panic_page_fault(uint64_t va, uint64_t error_code,
+                                const char *why, uint64_t rip) {
+    static char reason[128];
     int p = 0;
 
     const char *prefix = "unhandled page fault at 0x";
-    while (*prefix && p < 60) reason[p++] = *prefix++;
+    while (*prefix && p < 40) reason[p++] = *prefix++;
 
     for (int shift = 28; shift >= 0; shift -= 4) {
         uint32_t nib = (uint32_t)((va >> (uint32_t)shift) & 0xFull);
@@ -455,11 +458,23 @@ static void vm_panic_page_fault(uint64_t va, uint64_t error_code, const char *wh
         uint32_t nib = (uint32_t)((error_code >> (uint32_t)shift) & 0xFull);
         reason[p++] = (char)((nib < 10u) ? ('0' + nib) : ('A' + nib - 10u));
     }
+
+    const char *rip_tag = " rip=0x";
+    while (*rip_tag && p < 60) reason[p++] = *rip_tag++;
+    for (int shift = 28; shift >= 0; shift -= 4) {
+        uint32_t nib = (uint32_t)((rip >> (uint32_t)shift) & 0xFull);
+        reason[p++] = (char)((nib < 10u) ? ('0' + nib) : ('A' + nib - 10u));
+    }
+
     reason[p++] = ' ';
     reason[p++] = '-';
     reason[p++] = ' ';
-    while (*why && p < 90) reason[p++] = *why++;
+    while (*why && p < 120) reason[p++] = *why++;
     reason[p] = '\0';
+
+    kserial_puts("[VM] fatal fault, rip=0x");
+    kserial_hex32((uint32_t)rip);
+    kserial_puts("\r\n");
 
     bsod(0x0000000Eu, reason);
 }
@@ -478,14 +493,14 @@ int page_fault_handler(uint64_t fault_addr, uint64_t error_code, uint64_t rip) {
     if (error_code & 0x1ull) {
         g_prot_faults++;
         kserial_puts("[VM] fault rejected: protection violation\r\n");
-        vm_panic_page_fault(fault_addr, error_code, "protection violation");
+        vm_panic_page_fault(fault_addr, error_code, "protection violation", rip);
         return 0;
     }
     /* bit3 = 1：PTE 使用了保留位，属于页表损坏 */
     if (error_code & 0x8ull) {
         g_reserved_faults++;
         kserial_puts("[VM] fault rejected: reserved bit set\r\n");
-        vm_panic_page_fault(fault_addr, error_code, "reserved PTE bit set");
+        vm_panic_page_fault(fault_addr, error_code, "reserved PTE bit set", rip);
         return 0;
     }
 
@@ -497,7 +512,7 @@ int page_fault_handler(uint64_t fault_addr, uint64_t error_code, uint64_t rip) {
         kserial_puts("[VM] fault outside demand window at 0x");
         kserial_hex32((uint32_t)va);
         kserial_puts("\r\n");
-        vm_panic_page_fault(va, error_code, "outside demand window");
+        vm_panic_page_fault(va, error_code, "outside demand window", rip);
         return 0;
     }
 
@@ -512,7 +527,7 @@ int page_fault_handler(uint64_t fault_addr, uint64_t error_code, uint64_t rip) {
         kserial_puts("[VM] fault on present PTE at 0x");
         kserial_hex32((uint32_t)va);
         kserial_puts("\r\n");
-        vm_panic_page_fault(va, error_code, "fault on present PTE");
+        vm_panic_page_fault(va, error_code, "fault on present PTE", rip);
         return 0;
     }
 
@@ -527,7 +542,7 @@ int page_fault_handler(uint64_t fault_addr, uint64_t error_code, uint64_t rip) {
             kserial_puts(" slots_used=");
             kserial_dec32(g_swap_slots_used);
             kserial_puts("\r\n");
-            vm_panic_page_fault(va, error_code, "swap-in failed");
+            vm_panic_page_fault(va, error_code, "swap-in failed", rip);
             return 0;
         }
         pt[pti] = (uint64_t)frame | VM_PTE_PRESENT | VM_PTE_WRITE | VM_PTE_ACCESSED;
@@ -550,7 +565,7 @@ int page_fault_handler(uint64_t fault_addr, uint64_t error_code, uint64_t rip) {
         kserial_puts(" free_frames=");
         kserial_dec32(g_frame_free);
         kserial_puts("\r\n");
-        vm_panic_page_fault(va, error_code, "out of memory");
+        vm_panic_page_fault(va, error_code, "out of memory", rip);
         return 0;
     }
     vm_zero_page(frame);

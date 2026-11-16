@@ -1,0 +1,410 @@
+// ============================================================
+// settings.slyzcode - 桌面设置（SLYZ 独立应用）
+// ------------------------------------------------------------
+// 通过 cfg.get / cfg.set 读写 etc\system.cfg：
+//   boot.mode  gui | tty
+//   lang       zh  | en
+//   timezone   -12 .. +14
+//   wallpaper  system\wallpapers\<name>.bmp
+//   avatar     system\avatars\<name>.bmp
+//
+// 壁纸列表来自 fs.entries("system\wallpapers")，头像列表来自
+// fs.entries("system\avatars")：用户在文件管理器里放进去的
+// BMP 也会自动出现在设置里，不需要重新编译应用。
+//
+// 修改壁纸/头像后，内核收到 cfg.set 会请求整屏重绘，因此桌面
+// 背景立即变化，不需要重启。
+// ============================================================
+
+let LEFT_X = 20
+let LEFT_W = 290
+let RIGHT_X = 330
+let RIGHT_W = 270
+
+let mode = "tty"
+let lang = "en"
+let tz = 8
+let wallpaper = ""
+let avatar = ""
+let walls = []
+let avatars = []
+let msg = ""
+let msg_until = 0
+
+// 列出目录里的 BMP 文件名。名字保持原样，点击时再拼成完整路径。
+fn list_bmp(dir) {
+    let out = []
+    let items = fs.entries(dir)
+    let i = 0
+    while i < len(items) {
+        let row = items.at(i)
+        let name = row.at(0)
+        let kind = row.at(1)
+        if kind == 1 {
+            if index_of(lower(name), ".bmp") > 0 {
+                push(out, name)
+            }
+        }
+        i += 1
+    }
+    return out
+}
+
+fn load_all() {
+    mode = cfg.get("boot.mode")
+    if mode == "" {
+        mode = "tty"
+    }
+    lang = cfg.get("lang")
+    if lang == "" {
+        lang = "en"
+    }
+    tz = int(cfg.get("timezone"))
+    wallpaper = cfg.get("wallpaper")
+    avatar = cfg.get("avatar")
+    walls = list_bmp("system\\wallpapers")
+    avatars = list_bmp("system\\avatars")
+}
+
+fn notice(text) {
+    msg = text
+    msg_until = time.ms() + 2500
+}
+
+fn pick_mode(value) {
+    if cfg.set("boot.mode", value) == 0 {
+        mode = value
+        notice("Startup mode saved. Reboot to apply.")
+    } else {
+        notice("Cannot write etc\\system.cfg")
+    }
+}
+
+fn pick_lang(value) {
+    if cfg.set("lang", value) == 0 {
+        lang = value
+        notice("Language saved. Reboot to apply.")
+    } else {
+        notice("Cannot write etc\\system.cfg")
+    }
+}
+
+fn shift_tz(delta) {
+    let next = tz + delta
+    if next < -12 {
+        next = -12
+    }
+    if next > 14 {
+        next = 14
+    }
+    if cfg.set("timezone", str(next)) == 0 {
+        tz = next
+        notice("Timezone saved. Clock updates on next boot.")
+    } else {
+        notice("Cannot write etc\\system.cfg")
+    }
+}
+
+fn pick_wallpaper(path) {
+    if cfg.set("wallpaper", path) == 0 {
+        wallpaper = path
+        notice("Wallpaper applied.")
+    } else {
+        notice("Cannot write etc\\system.cfg")
+    }
+}
+
+fn pick_avatar(path) {
+    if cfg.set("avatar", path) == 0 {
+        avatar = path
+        notice("Avatar applied.")
+    } else {
+        notice("Cannot write etc\\system.cfg")
+    }
+}
+
+fn draw_tab(x, y, w, h, label, active) {
+    let bg = 0x1B2532
+    let fg = 0x8EA0B4
+    if active != 0 {
+        bg = 0x2F6FE0
+        fg = 0xFFFFFF
+    }
+    gfx.rect(x, y, w, h, bg)
+    let lw = gfx.text_width(label)
+    gfx.text(x + (w - lw) / 2, y + (h - 32) / 2, label, fg)
+}
+
+// ---- 小头像选项：0 = 默认首字母，1..N = system\avatars 里的图 ----
+fn draw_avatar_option(cx, cy, r, index, selected) {
+    if selected != 0 {
+        gfx.circle(cx, cy, r + 3, 0x7FB2FF)
+    }
+
+    if index == 0 {
+        gfx.circle(cx, cy, r, 0x33507A)
+        gfx.circle(cx, cy - 4, 5, 0xC7D6EA)
+        gfx.rect(cx - 8, cy + 4, 16, 8, 0xC7D6EA)
+        return
+    }
+
+    let path = "system\\avatars\\" + avatars.at(index - 1)
+    let handle = img.load(path)
+    if handle >= 0 {
+        img.draw_circle(handle, cx, cy, r)
+    } else {
+        gfx.circle(cx, cy, r, 0x6B2C52)
+    }
+}
+
+fn draw_wallpaper_card() {
+    gfx.rect(RIGHT_X, 96, RIGHT_W, 240, 0x141C27)
+    gfx.text(RIGHT_X + 16, 110, "Wallpaper", 0xE9EFF7)
+    gfx.text(RIGHT_X + 16, 142, "Click to apply", 0x8EA0B4)
+
+    let active = 0
+    if wallpaper == "" {
+        active = 1
+    }
+    draw_tab(RIGHT_X + 14, 168, RIGHT_W - 28, 30, "Default", active)
+
+    let i = 0
+    while i < len(walls) && i < 4 {
+        let name = walls.at(i)
+        let path = "system\\wallpapers\\" + name
+        let on = 0
+        if path == wallpaper {
+            on = 1
+        }
+        let label = substr(name, 0, len(name) - 4)
+        draw_tab(RIGHT_X + 14, 168 + (i + 1) * 32, RIGHT_W - 28, 30,
+                 label, on)
+        i += 1
+    }
+
+    if len(walls) == 0 {
+        gfx.text(RIGHT_X + 16, 200, "No wallpapers found.", 0x8EA0B4)
+    }
+}
+
+fn draw_avatar_card() {
+    gfx.rect(RIGHT_X, 348, RIGHT_W, 180, 0x141C27)
+    gfx.text(RIGHT_X + 16, 360, "Avatar", 0xE9EFF7)
+    gfx.text(RIGHT_X + 16, 388, "Pick a portrait", 0x8EA0B4)
+
+    // 左侧大预览
+    let pcx = RIGHT_X + 52
+    let pcy = 462
+    if avatar == "" {
+        gfx.circle(pcx, pcy, 36, 0x1F3A5F)
+        gfx.circle(pcx, pcy - 6, 9, 0xC7D6EA)
+        gfx.rect(pcx - 14, pcy + 7, 28, 14, 0xC7D6EA)
+    } else {
+        let handle = img.load(avatar)
+        if handle >= 0 {
+            gfx.circle(pcx, pcy, 39, 0x7FB2FF)
+            img.draw_circle(handle, pcx, pcy, 36)
+        } else {
+            gfx.circle(pcx, pcy, 36, 0x6B2C52)
+        }
+    }
+
+    // 右侧一排候选头像
+    let i = 0
+    while i < len(avatars) + 1 && i < 5 {
+        let cx = RIGHT_X + 116 + i * 28
+        let cy = 454
+        let sel = 0
+        if i == 0 && avatar == "" {
+            sel = 1
+        }
+        if i > 0 {
+            let p = "system\\avatars\\" + avatars.at(i - 1)
+            if p == avatar {
+                sel = 1
+            }
+        }
+        draw_avatar_option(cx, cy, 12, i, sel)
+        i += 1
+    }
+}
+
+fn draw() {
+    gfx.clear(0x0B1017)
+
+    gfx.text(LEFT_X, 16, "Settings", 0xE9EFF7)
+    gfx.text(LEFT_X, 52, "Values are written to etc\\system.cfg", 0x8EA0B4)
+
+    // ---- 启动模式 ----
+    let card_h = 148
+    gfx.rect(LEFT_X, 96, LEFT_W, card_h, 0x141C27)
+    gfx.text(LEFT_X + 16, 110, "Startup mode", 0xE9EFF7)
+    gfx.text(LEFT_X + 16, 146, "Startup session", 0x8EA0B4)
+
+    let gui_active = 0
+    if mode == "gui" {
+        gui_active = 1
+    }
+    draw_tab(LEFT_X + 16, 182, 120, 44, "Desktop", gui_active)
+
+    let tty_active = 0
+    if mode == "tty" {
+        tty_active = 1
+    }
+    draw_tab(LEFT_X + 146, 182, 120, 44, "Shell", tty_active)
+
+    // ---- 语言 ----
+    gfx.rect(LEFT_X, 264, LEFT_W, card_h, 0x141C27)
+    gfx.text(LEFT_X + 16, 278, "Language", 0xE9EFF7)
+    gfx.text(LEFT_X + 16, 314, "UI language", 0x8EA0B4)
+
+    let en_active = 0
+    if lang == "en" {
+        en_active = 1
+    }
+    draw_tab(LEFT_X + 16, 350, 120, 44, "English", en_active)
+
+    let zh_active = 0
+    if lang == "zh" {
+        zh_active = 1
+    }
+    draw_tab(LEFT_X + 146, 350, 120, 44, "中文", zh_active)
+
+    // ---- 时区 ----
+    gfx.rect(LEFT_X, 432, LEFT_W, 92, 0x141C27)
+    gfx.text(LEFT_X + 16, 444, "Timezone", 0xE9EFF7)
+
+    let sign = ""
+    if tz >= 0 {
+        sign = "+"
+    }
+    let tz_text = "UTC " + sign + str(tz)
+    gfx.text(LEFT_X + 16, 474, tz_text, 0xE9EFF7)
+
+    draw_tab(LEFT_X + 130, 470, 48, 34, "-", 0)
+    draw_tab(LEFT_X + 186, 470, 48, 34, "+", 0)
+
+    // ---- 外观 ----
+    draw_wallpaper_card()
+    draw_avatar_card()
+
+    if msg != "" && time.ms() < msg_until {
+        gfx.text(LEFT_X, 538, msg, 0x34D399)
+    }
+
+    gfx.flush()
+}
+
+fn hit_mode(px, py) {
+    if py < 182 || py > 226 {
+        return ""
+    }
+    if px >= LEFT_X + 16 && px < LEFT_X + 136 {
+        return "gui"
+    }
+    if px >= LEFT_X + 146 && px < LEFT_X + 266 {
+        return "tty"
+    }
+    return ""
+}
+
+fn hit_lang(px, py) {
+    if py < 350 || py > 394 {
+        return ""
+    }
+    if px >= LEFT_X + 16 && px < LEFT_X + 136 {
+        return "en"
+    }
+    if px >= LEFT_X + 146 && px < LEFT_X + 266 {
+        return "zh"
+    }
+    return ""
+}
+
+// 返回壁纸行号：0 = 默认，1.. = walls 下标 + 1；点在外返回 -1。
+fn hit_wallpaper(px, py) {
+    if px < RIGHT_X + 14 || px > RIGHT_X + RIGHT_W - 14 {
+        return -1
+    }
+    if py < 168 || py >= 328 {
+        return -1
+    }
+    return (py - 168) / 32
+}
+
+// 返回头像选项号：0 = 默认，1.. = avatars 下标 + 1；点在外返回 -1。
+fn hit_avatar(px, py) {
+    let i = 0
+    while i < 5 {
+        let cx = RIGHT_X + 116 + i * 28
+        let cy = 454
+        let dx = px - cx
+        let dy = py - cy
+        if dx * dx + dy * dy <= 256 {
+            return i
+        }
+        i += 1
+    }
+    return -1
+}
+
+fn click(px, py) {
+    let m = hit_mode(px, py)
+    if m != "" {
+        pick_mode(m)
+    }
+
+    let l = hit_lang(px, py)
+    if l != "" {
+        pick_lang(l)
+    }
+
+    if py >= 470 && py <= 504 {
+        if px >= LEFT_X + 130 && px < LEFT_X + 178 {
+            shift_tz(-1)
+        }
+        if px >= LEFT_X + 186 && px < LEFT_X + 234 {
+            shift_tz(1)
+        }
+    }
+
+    let wi = hit_wallpaper(px, py)
+    if wi >= 0 {
+        if wi == 0 {
+            pick_wallpaper("")
+        } else if wi - 1 < len(walls) {
+            pick_wallpaper("system\\wallpapers\\" + walls.at(wi - 1))
+        }
+    }
+
+    let ai = hit_avatar(px, py)
+    if ai >= 0 {
+        if ai == 0 {
+            pick_avatar("")
+        } else if ai - 1 < len(avatars) {
+            pick_avatar("system\\avatars\\" + avatars.at(ai - 1))
+        }
+    }
+}
+
+fn main() {
+    let handle = win.open("Settings", 640, 640)
+    if handle < 0 {
+        return
+    }
+
+    load_all()
+
+    let running = 1
+    while running {
+        draw()
+
+        let ev = event.poll()
+        if ev != nil {
+            let kind = ev.at(0)
+            if kind == 3 {
+                click(ev.at(1), ev.at(2))
+            }
+        }
+    }
+}

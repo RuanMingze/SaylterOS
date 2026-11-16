@@ -1,0 +1,259 @@
+// ============================================================
+// files.slyzcode - 文件管理器（SLYZ 独立应用）
+// ------------------------------------------------------------
+// 功能：
+//   - 浏览 SlyzFS 目录，点击目录进入；
+//   - Up 返回上级；
+//   - New folder 生成不重名的目录；
+//   - Delete 删除选中项（目录用 fs.remove，与内核 rm 语义一致）；
+//   - 滚轮滚动列表。
+//
+// 目录数据来自 fs.entries(path)，每一项是 [name, type, size]。
+// 应用崩溃只会关闭自己的窗口，文件系统操作由内核完成，不会
+// 把桌面或其他应用一起拖下水。
+// ============================================================
+
+let ROW_H = 36
+let ROWS = 12
+let LIST_Y = 96
+let LIST_X = 16
+let LIST_W = 848
+
+let path = "home"
+let offset = 0
+let sel = -1
+let msg = ""
+let msg_until = 0
+let last_open_idx = -1
+let last_open_ms = 0
+
+fn say(text) {
+    msg = text
+    msg_until = time.ms() + 2500
+}
+
+fn join(base, name) {
+    if base == "" {
+        return name
+    }
+    return base + "\\" + name
+}
+
+fn parent_of(p) {
+    let i = len(p) - 1
+    while i >= 0 && str_at(p, i) != "\\" {
+        i -= 1
+    }
+    if i <= 0 {
+        return ""
+    }
+    return substr(p, 0, i)
+}
+
+fn fmt_size(v) {
+    if v >= 1048576 {
+        return str(v / 1048576) + " MB"
+    }
+    if v >= 1024 {
+        return str(v / 1024) + " KB"
+    }
+    return str(v) + " B"
+}
+
+fn draw_tool(x, y, w, h, label) {
+    gfx.rect(x, y, w, h, 0x1B2532)
+    gfx.frame(x, y, w, h, 0x2B3949, 1)
+    let lw = gfx.text_width(label)
+    gfx.text(x + (w - lw) / 2, y + 2, label, 0xE9EFF7)
+}
+
+fn draw() {
+    gfx.clear(0x0B1017)
+
+    let shown = path
+    if shown == "" {
+        shown = "\\"
+    }
+    gfx.rect(16, 8, 848, 36, 0x0C141E)
+    gfx.frame(16, 8, 848, 36, 0x2B3949, 1)
+    gfx.text(28, 12, shown, 0xE9EFF7)
+
+    draw_tool(16, 52, 100, 34, "Up")
+    draw_tool(124, 52, 150, 34, "New folder")
+    draw_tool(282, 52, 110, 34, "Delete")
+
+    let items = fs.entries(path)
+
+    gfx.rect(LIST_X, LIST_Y - 4, LIST_W, 30, 0x1B2532)
+    gfx.text(LIST_X + 12, LIST_Y - 2, "NAME", 0x8EA0B4)
+    gfx.text(LIST_X + 600, LIST_Y - 2, "TYPE", 0x8EA0B4)
+    gfx.text(LIST_X + 720, LIST_Y - 2, "SIZE", 0x8EA0B4)
+
+    for i in 0..ROWS {
+        let idx = offset + i
+        if idx < items.length {
+            let row = items.at(idx)
+            let name = row.at(0)
+            let kind = row.at(1)
+            let size = row.at(2)
+            let y = LIST_Y + 28 + i * ROW_H
+
+            let bg = 0x101722
+            if idx == sel {
+                bg = 0x1B3150
+            }
+            gfx.rect(LIST_X, y - 4, LIST_W, ROW_H - 2, bg)
+
+            let fg = 0xE9EFF7
+            let type_text = "file"
+            if kind == 2 {
+                fg = 0x7FB2FF
+                type_text = "dir"
+            }
+            gfx.text(LIST_X + 12, y, name, fg)
+            gfx.text(LIST_X + 600, y, type_text, 0x8EA0B4)
+            if kind != 2 {
+                gfx.text(LIST_X + 720, y, fmt_size(size), 0x8EA0B4)
+            }
+        }
+    }
+
+    let foot = str(items.length) + " item(s)"
+    if offset > 0 {
+        foot = foot + "   scroll " + str(offset)
+    }
+    gfx.text(16, 524, foot, 0x5A6B7E)
+
+    if msg != "" && time.ms() < msg_until {
+        gfx.text(200, 524, msg, 0x34D399)
+    }
+
+    gfx.flush()
+}
+
+fn activate(idx, items) {
+    if idx < 0 || idx >= items.length {
+        return
+    }
+    let row = items.at(idx)
+    let name = row.at(0)
+    let kind = row.at(1)
+
+    if kind == 2 {
+        path = join(path, name)
+        offset = 0
+        sel = -1
+        last_open_idx = -1
+    } else {
+        sel = idx
+        say(name + "  " + fmt_size(row.at(2)))
+
+        // 双击打开：同一个文件在 450ms 内再次被点击。
+        // .mp3 由桌面交给媒体播放器，其他文件进入编辑器/应用。
+        let now = time.ms()
+        if idx == last_open_idx && now - last_open_ms < 450 {
+            os.open(join(path, name))
+            last_open_idx = -1
+        } else {
+            last_open_idx = idx
+            last_open_ms = now
+        }
+    }
+}
+
+fn click(px, py) {
+    let items = fs.entries(path)
+
+    if py >= 52 && py <= 86 {
+        if px >= 16 && px < 116 {
+            let up = parent_of(path)
+            if up != path {
+                path = up
+            }
+            offset = 0
+            sel = -1
+            return
+        }
+        if px >= 124 && px < 274 {
+            let n = 1
+            let name = "NewFolder"
+            while fs.exists(join(path, name)) && n < 99 {
+                n += 1
+                name = "NewFolder" + str(n)
+            }
+            if fs.mkdir(join(path, name)) == 0 {
+                say("created " + name)
+            } else {
+                say("cannot create folder")
+            }
+            return
+        }
+        if px >= 282 && px < 392 {
+            if sel < 0 {
+                say("select an item first")
+                return
+            }
+            if sel >= items.length {
+                say("item is gone")
+                return
+            }
+            let row = items.at(sel)
+            let name = row.at(0)
+            if fs.remove(join(path, name)) == 0 {
+                say("removed " + name)
+                sel = -1
+            } else {
+                say("cannot remove " + name)
+            }
+            return
+        }
+    }
+
+    if py >= LIST_Y + 28 && py < LIST_Y + 28 + ROWS * ROW_H {
+        if px >= LIST_X && px < LIST_X + LIST_W {
+            let idx = offset + (py - LIST_Y - 28) / ROW_H
+            activate(idx, items)
+        }
+    }
+}
+
+fn scroll(delta) {
+    let items = fs.entries(path)
+    let max_offset = items.length - ROWS
+    if max_offset < 0 {
+        max_offset = 0
+    }
+    offset -= delta
+    if offset < 0 {
+        offset = 0
+    }
+    if offset > max_offset {
+        offset = max_offset
+    }
+}
+
+fn main() {
+    let handle = win.open("Files", 900, 600)
+    if handle < 0 {
+        return
+    }
+
+    if !fs.exists(path) {
+        path = ""
+    }
+
+    while true {
+        draw()
+
+        let ev = event.poll()
+        if ev != nil {
+            let kind = ev.at(0)
+            if kind == 3 {
+                click(ev.at(1), ev.at(2))
+            }
+            if kind == 4 {
+                scroll(ev.at(1))
+            }
+        }
+    }
+}

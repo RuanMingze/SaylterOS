@@ -32,9 +32,16 @@ extern int   slyzfs_get_uid(void);
 #define CFG_MAX_BYTES 2048
 #define CFG_TZ_MIN    (-12)
 #define CFG_TZ_MAX    14
+#define CFG_PATH_MAX  160
 
 static int g_boot_gui = 0;
 static int g_timezone = 8;
+/* 界面语言：0 = English，1 = 简体中文。首次生成配置时默认中文，
+ * 因为本机面向中文用户；改成 lang=en 即可回到英文界面。 */
+static int g_lang = 1;
+/* 外观：壁纸与头像都是 SlyzFS 绝对路径，空表示使用内置样式。 */
+static char g_wallpaper[CFG_PATH_MAX] = "";
+static char g_avatar[CFG_PATH_MAX] = "";
 static int g_loaded = 0;
 
 /* 最近一次从磁盘读到的原始内容。写回时以它为底稿过滤托管行。 */
@@ -53,6 +60,16 @@ static int cfg_strcmp(const char *a, const char *b) {
         b++;
     }
     return (int)(unsigned char)*a - (int)(unsigned char)*b;
+}
+
+static void cfg_copy_str(char *dst, const char *src, int cap) {
+    int i = 0;
+    if (cap <= 0) return;
+    while (src && src[i] && i < cap - 1) {
+        dst[i] = src[i];
+        i++;
+    }
+    dst[i] = '\0';
 }
 
 static int cfg_is_space(char c) {
@@ -159,7 +176,7 @@ static void cfg_parse(const char *buf, int len) {
 
         while (i < len && (buf[i] == ' ' || buf[i] == '\t')) i++;
 
-        char value[32];
+        char value[CFG_PATH_MAX];
         int vn = 0;
         while (i < len && buf[i] != '\n' && buf[i] != '\r' && vn < (int)sizeof(value) - 1) {
             value[vn++] = buf[i];
@@ -186,6 +203,21 @@ static void cfg_parse(const char *buf, int len) {
                 if (tz > CFG_TZ_MAX) tz = CFG_TZ_MAX;
                 g_timezone = tz;
             }
+        } else if (cfg_strcmp(key, "lang") == 0 ||
+                   cfg_strcmp(key, "language") == 0) {
+            if (cfg_strcmp(value, "en") == 0 ||
+                cfg_strcmp(value, "english") == 0) {
+                g_lang = 0;
+            } else if (cfg_strcmp(value, "zh") == 0 ||
+                       cfg_strcmp(value, "zh-cn") == 0 ||
+                       cfg_strcmp(value, "cn") == 0 ||
+                       cfg_strcmp(value, "chinese") == 0) {
+                g_lang = 1;
+            }
+        } else if (cfg_strcmp(key, "wallpaper") == 0) {
+            cfg_copy_str(g_wallpaper, value, CFG_PATH_MAX);
+        } else if (cfg_strcmp(key, "avatar") == 0) {
+            cfg_copy_str(g_avatar, value, CFG_PATH_MAX);
         }
     }
 }
@@ -246,8 +278,9 @@ static int cfg_buf_append_int(char *out, int cap, int *o, int v) {
     return 1;
 }
 
-/* 用原始内容 + 新的 boot.mode / timezone 组装配置文件并落盘。 */
-static int cfg_save_state(int gui, int tz) {
+/* 用原始内容 + 新的托管键组装配置文件并落盘。 */
+static int cfg_save_state(int gui, int tz, int lang,
+                          const char *wallpaper, const char *avatar) {
     char out[CFG_MAX_BYTES];
     int o = 0;
 
@@ -264,6 +297,16 @@ static int cfg_save_state(int gui, int tz) {
                 "# timezone = UTC offset in hours, -12 .. 14")) return 0;
         if (!cfg_buf_append_line(out, (int)sizeof(out), &o, "#")) return 0;
         if (!cfg_buf_append_line(out, (int)sizeof(out), &o,
+                "# lang = zh : 简体中文界面")) return 0;
+        if (!cfg_buf_append_line(out, (int)sizeof(out), &o,
+                "# lang = en : English interface")) return 0;
+        if (!cfg_buf_append_line(out, (int)sizeof(out), &o, "#")) return 0;
+        if (!cfg_buf_append_line(out, (int)sizeof(out), &o,
+                "# wallpaper = system\\wallpapers\\<name>.bmp (empty = gradient)")) return 0;
+        if (!cfg_buf_append_line(out, (int)sizeof(out), &o,
+                "# avatar    = system\\avatars\\<name>.bmp   (empty = initial)")) return 0;
+        if (!cfg_buf_append_line(out, (int)sizeof(out), &o, "#")) return 0;
+        if (!cfg_buf_append_line(out, (int)sizeof(out), &o,
                 "# Edit with: nano etc\\system.cfg   then reboot.")) return 0;
     } else {
         int i = 0;
@@ -276,7 +319,11 @@ static int cfg_save_state(int gui, int tz) {
             if (cfg_line_owns_key(g_raw + start, end - start, "boot.mode") ||
                 cfg_line_owns_key(g_raw + start, end - start, "mode") ||
                 cfg_line_owns_key(g_raw + start, end - start, "timezone") ||
-                cfg_line_owns_key(g_raw + start, end - start, "tz")) {
+                cfg_line_owns_key(g_raw + start, end - start, "tz") ||
+                cfg_line_owns_key(g_raw + start, end - start, "lang") ||
+                cfg_line_owns_key(g_raw + start, end - start, "language") ||
+                cfg_line_owns_key(g_raw + start, end - start, "wallpaper") ||
+                cfg_line_owns_key(g_raw + start, end - start, "avatar")) {
                 continue;
             }
 
@@ -294,6 +341,17 @@ static int cfg_save_state(int gui, int tz) {
     if (o >= (int)sizeof(out) - 1) return 0;
     out[o++] = '\n';
 
+    if (!cfg_buf_append_line(out, (int)sizeof(out), &o,
+            lang ? "lang=zh" : "lang=en")) return 0;
+
+    if (!cfg_buf_append_line(out, (int)sizeof(out), &o, "wallpaper=")) return 0;
+    if (!cfg_buf_append(out, (int)sizeof(out), &o, wallpaper ? wallpaper : "")) return 0;
+    if (!cfg_buf_append_line(out, (int)sizeof(out), &o, "")) return 0;
+
+    if (!cfg_buf_append_line(out, (int)sizeof(out), &o, "avatar=")) return 0;
+    if (!cfg_buf_append(out, (int)sizeof(out), &o, avatar ? avatar : "")) return 0;
+    if (!cfg_buf_append_line(out, (int)sizeof(out), &o, "")) return 0;
+
     if (!cfg_write_all(out, o)) return 0;
 
     g_raw_len = o;
@@ -302,6 +360,9 @@ static int cfg_save_state(int gui, int tz) {
 
     g_boot_gui = gui ? 1 : 0;
     g_timezone = tz;
+    g_lang = lang ? 1 : 0;
+    cfg_copy_str(g_wallpaper, wallpaper ? wallpaper : "", CFG_PATH_MAX);
+    cfg_copy_str(g_avatar, avatar ? avatar : "", CFG_PATH_MAX);
     return 1;
 }
 
@@ -317,10 +378,13 @@ void system_cfg_init(void) {
 
     if (n < 0) {
         g_raw_len = 0;
-        if (!cfg_save_state(0, 8)) {
+        g_wallpaper[0] = '\0';
+        g_avatar[0] = '\0';
+        if (!cfg_save_state(0, 8, 1, "", "")) {
             /* 文件系统不可写（未挂载/只读）时保持 TTY 默认模式 */
             g_boot_gui = 0;
             g_timezone = 8;
+            g_lang = 1;
         }
         g_loaded = 1;
         return;
@@ -339,7 +403,7 @@ int system_cfg_boot_gui(void) {
 }
 
 int system_cfg_set_boot_gui(int gui) {
-    return cfg_save_state(gui ? 1 : 0, g_timezone);
+    return cfg_save_state(gui ? 1 : 0, g_timezone, g_lang, g_wallpaper, g_avatar);
 }
 
 int system_cfg_timezone(void) {
@@ -349,5 +413,34 @@ int system_cfg_timezone(void) {
 int system_cfg_set_timezone(int hours) {
     if (hours < CFG_TZ_MIN) hours = CFG_TZ_MIN;
     if (hours > CFG_TZ_MAX) hours = CFG_TZ_MAX;
-    return cfg_save_state(g_boot_gui, hours);
+    return cfg_save_state(g_boot_gui, hours, g_lang, g_wallpaper, g_avatar);
+}
+
+int system_cfg_lang(void) {
+    return g_lang;
+}
+
+int system_cfg_set_lang(int id) {
+    return cfg_save_state(g_boot_gui, g_timezone, id ? 1 : 0,
+                          g_wallpaper, g_avatar);
+}
+
+const char *system_cfg_wallpaper(void) {
+    return g_wallpaper;
+}
+
+int system_cfg_set_wallpaper(const char *path) {
+    char value[CFG_PATH_MAX];
+    cfg_copy_str(value, path ? path : "", (int)sizeof(value));
+    return cfg_save_state(g_boot_gui, g_timezone, g_lang, value, g_avatar);
+}
+
+const char *system_cfg_avatar(void) {
+    return g_avatar;
+}
+
+int system_cfg_set_avatar(const char *path) {
+    char value[CFG_PATH_MAX];
+    cfg_copy_str(value, path ? path : "", (int)sizeof(value));
+    return cfg_save_state(g_boot_gui, g_timezone, g_lang, g_wallpaper, value);
 }

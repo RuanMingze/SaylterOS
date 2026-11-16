@@ -221,6 +221,12 @@ char kb_read_char(void) {
         return 0;
     }
 
+    /* Ctrl+Space 是输入法的标准切换键；空格不是字母，无法走下面的
+     * Ctrl+字母映射，这里单独给出一个专用键码 0xFE。 */
+    if (ctrl_pressed && code == 0x39) {
+        return (char)0xFE;
+    }
+
     /* Ctrl + 字母 → ASCII 控制码（Ctrl+A=1 ... Ctrl+Z=26）。
      * 编辑器依赖这套通用映射实现 Ctrl+S 保存 / Ctrl+X 退出等快捷键；
      * shell 的 readline 会把除 Ctrl+C 之外的控制字符当作不可打印输入忽略，
@@ -324,6 +330,12 @@ char scancode_to_char(uint8_t sc) {
     if (code == 0x2A || code == 0x36) {
         shift_pressed = 1;
         return 0;
+    }
+
+    /* Ctrl+Space 是输入法的标准切换键；空格不是字母，无法走下面的
+     * Ctrl+字母映射，这里单独给出一个专用键码 0xFE。 */
+    if (ctrl_pressed && code == 0x39) {
+        return (char)0xFE;
     }
 
     /* Ctrl + 字母 → ASCII 控制码（Ctrl+A=1 ... Ctrl+Z=26）。

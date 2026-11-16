@@ -1,0 +1,49 @@
+// ============================================================
+// textstats.slyzcode - 字符串与数组处理示例
+// ------------------------------------------------------------
+// 覆盖：split/join、replace、trim、substr、数组遍历、函数返回数组。
+// ============================================================
+
+fn words_of(text) {
+    let normalized = replace(lower(text), ",", " ")
+    normalized = replace(normalized, ".", " ")
+    normalized = replace(normalized, "  ", " ")
+    return split(trim(normalized), " ")
+}
+
+fn longest(words) {
+    let best = ""
+    for i in 0..words.length {
+        let w = words.at(i)
+        if len(w) > len(best) {
+            best = w
+        }
+    }
+    return best
+}
+
+fn count_of(words, target) {
+    let n = 0
+    for i in 0..words.length {
+        if words.at(i) == target {
+            n += 1
+        }
+    }
+    return n
+}
+
+fn main() {
+    let text = "The quick brown fox jumps over the lazy dog. The fox is quick."
+    let words = words_of(text)
+
+    println("word count = " + str(words.length))
+    println("longest    = " + longest(words))
+    println("fox count  = " + str(count_of(words, "fox")))
+    println("joined     = " + join(words, "|"))
+
+    let head = substr(text, 0, 19)
+    println("head       = " + head)
+    println("has dog    = " + str(index_of(text, "dog") >= 0))
+    println("hex 255    = " + hex(255))
+    println("bin 10     = " + bin(10))
+}

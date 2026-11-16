@@ -1,0 +1,231 @@
+// ============================================================
+// media.slyzcode - 媒体播放器（SLYZ 独立应用）
+// ------------------------------------------------------------
+// 只在双击 .mp3 时由桌面启动：桌面把路径放进 audio 服务的
+// 待播放槽，应用启动后通过 media.request() 取走路径并播放。
+//
+// 播放、暂停、停止、进度和音量全部由内核音频服务完成：
+//   audio.play / audio.pause / audio.stop / audio.state
+//   audio.position / audio.duration / audio.volume / audio.set_volume
+// 应用本身不保存解码状态，窗口关闭后播放也会停止。
+// ============================================================
+
+let W = 576
+let H = 474
+
+let path = ""
+let msg = ""
+let last_click = 0
+
+fn base_name(p) {
+    let slash = 0
+    let i = 0
+    while i < len(p) {
+        if str_at(p, i) == "\\" {
+            slash = i + 1
+        }
+        i += 1
+    }
+    return substr(p, slash, len(p) - slash)
+}
+
+fn fmt_time(ms) {
+    if ms < 0 {
+        ms = 0
+    }
+    let total = ms / 1000
+    let m = total / 60
+    let s = total % 60
+    let st = str(s)
+    if s < 10 {
+        st = "0" + st
+    }
+    return str(m) + ":" + st
+}
+
+fn draw_button(x, y, w, h, label, primary) {
+    let bg = 0x1B2532
+    let fg = 0xE9EFF7
+    if primary != 0 {
+        bg = 0x2F6FE0
+    }
+    gfx.rect(x, y, w, h, bg)
+    let tw = gfx.text_width(label)
+    gfx.text(x + (w - tw) / 2, y + (h - 32) / 2, label, fg)
+}
+
+fn draw() {
+    gfx.clear(0x0B1017)
+
+    let state = audio.state()
+    let pos = audio.position()
+    let dur = audio.duration()
+    let vol = audio.volume()
+
+    gfx.text(20, 16, "Media Player", 0xE9EFF7)
+
+    let name = "No media file"
+    if path != "" {
+        name = base_name(path)
+    }
+    if len(name) > 32 {
+        name = substr(name, 0, 32) + "..."
+    }
+    gfx.text(20, 52, name, 0x8EA0B4)
+
+    // 唱片图案：静止时也不闪烁
+    let cx = W / 2
+    let cy = 150
+    gfx.circle(cx, cy, 78, 0x141C27)
+    gfx.circle(cx, cy, 70, 0x1B2532)
+    gfx.circle(cx, cy, 54, 0x223041)
+    gfx.circle(cx, cy, 34, 0x1B2532)
+    gfx.circle(cx, cy, 14, 0x2F6FE0)
+    gfx.circle(cx, cy, 5, 0x0B1017)
+
+    // 进度
+    let bar_x = 20
+    let bar_y = 262
+    let bar_w = W - 40
+    gfx.rect(bar_x, bar_y, bar_w, 10, 0x223041)
+    if dur > 0 {
+        let filled = bar_w * pos / dur
+        if filled > bar_w {
+            filled = bar_w
+        }
+        if filled > 0 {
+            gfx.rect(bar_x, bar_y, filled, 10, 0x4F8EF7)
+        }
+    }
+
+    gfx.text(bar_x, bar_y + 22, fmt_time(pos), 0x8EA0B4)
+    let dt = fmt_time(dur)
+    gfx.text(bar_x + bar_w - gfx.text_width(dt), bar_y + 22, dt, 0x8EA0B4)
+
+    // 主要按钮
+    let play_label = "Play"
+    if state == 1 {
+        play_label = "Pause"
+    } else if state == 2 {
+        play_label = "Resume"
+    }
+    draw_button(20, 330, 170, 52, play_label, 1)
+    draw_button(206, 330, 120, 52, "Stop", 0)
+    draw_button(342, 330, 70, 52, "-", 0)
+    draw_button(422, 330, 70, 52, "+", 0)
+
+    // 音量
+    gfx.text(20, 404, "Volume", 0x8EA0B4)
+    gfx.rect(120, 406, 340, 10, 0x223041)
+    let vw = 340 * vol / 100
+    if vw > 0 {
+        gfx.rect(120, 406, vw, 10, 0x34D399)
+    }
+    let vt = str(vol) + "%"
+    gfx.text(476, 396, vt, 0xE9EFF7)
+
+    if msg != "" && time.ms() < last_click {
+        gfx.text(20, 436, msg, 0xFBBF24)
+    }
+
+    gfx.flush()
+}
+
+fn toggle_play() {
+    let state = audio.state()
+    if state == 1 {
+        audio.pause(1)
+    } else if state == 2 {
+        audio.pause(0)
+    } else if path != "" {
+        if audio.play(path) != 0 {
+            msg = "Cannot open this file"
+            last_click = time.ms() + 2500
+        }
+    }
+}
+
+fn click(px, py) {
+    if py >= 330 && py <= 382 {
+        if px >= 20 && px < 190 {
+            toggle_play()
+            return
+        }
+        if px >= 206 && px < 326 {
+            audio.stop()
+            return
+        }
+        if px >= 342 && px < 412 {
+            let v = audio.volume() - 5
+            if v < 0 {
+                v = 0
+            }
+            audio.set_volume(v)
+            return
+        }
+        if px >= 422 && px < 492 {
+            let v = audio.volume() + 5
+            if v > 100 {
+                v = 100
+            }
+            audio.set_volume(v)
+            return
+        }
+    }
+
+    if py >= 396 && py <= 424 {
+        if px >= 120 && px <= 460 {
+            let v = (px - 120) * 100 / 340
+            audio.set_volume(v)
+            return
+        }
+    }
+}
+
+fn key(ch) {
+    if ch == 32 {
+        toggle_play()
+    }
+}
+
+fn main() {
+    let handle = win.open("Media Player", 600, 540)
+    if handle < 0 {
+        return
+    }
+
+    let pending = media.request()
+    if pending != "" {
+        path = pending
+    }
+
+    if path != "" {
+        if audio.play(path) != 0 {
+            msg = "Cannot open this file"
+            last_click = time.ms() + 2500
+        }
+    }
+
+    let running = 1
+    while running {
+        draw()
+
+        let ev = event.poll()
+        if ev != nil {
+            let kind = ev.at(0)
+            if kind == 3 {
+                click(ev.at(1), ev.at(2))
+            } else if kind == 1 {
+                key(ev.at(1))
+            } else if kind == 5 {
+                audio.stop()
+                running = 0
+            }
+        }
+
+        if audio.state() == 0 && audio.position() >= audio.duration() && audio.duration() > 0 {
+            msg = "Playback finished"
+            last_click = time.ms() + 2500
+        }
+    }
+}

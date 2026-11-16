@@ -73,12 +73,25 @@ void vbe_draw_string(const char *s, uint16_t cx, uint16_t cy, uint32_t fg, uint3
 /* 像素坐标文本（GUI 用）：每个字形 16×32 像素，不返回边界外 */
 void vbe_draw_text_px(uint16_t x, uint16_t y, const char *s, uint32_t fg, uint32_t bg);
 
+/* ---- UTF-8 / 中文 ----
+ * ASCII 占 16×32，汉字占 32×32（一个字占两个字符格）。
+ * 未收录的字画 1px 空心方框，明确表示缺字。 */
+int  font_cjk_index(uint16_t cp);   /* 字库下标，未收录返回 -1 */
+uint16_t vbe_utf8_width_px(const char *s);
+void vbe_draw_utf8_px(uint16_t x, uint16_t y, const char *s, uint32_t fg, uint32_t bg);
+uint16_t vbe_draw_utf8_max_px(uint16_t x, uint16_t y, const char *s,
+                              uint16_t max_px, uint32_t fg, uint32_t bg);
+void vbe_draw_cjk_px(uint16_t x, uint16_t y, uint16_t cp, uint32_t fg, uint32_t bg);
+void vbe_draw_cjk_transparent(uint16_t x, uint16_t y, uint16_t cp, uint32_t fg);
+void vbe_draw_utf8_transparent(uint16_t x, uint16_t y, const char *s, uint32_t fg);
+
 /* ---- 文本终端专用：直写帧缓冲（单缓冲，不经过 backbuffer） ----
  * 终端字符量大、颜色固定，双缓冲会让每个字符多一次 2KB 的 LFB 复制；
  * 直接写 LFB 可以省掉这一半的显存流量。GUI 仍使用 backbuffer + swap。 */
 void vbe_fb_clear(uint32_t color);
 void vbe_fb_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint32_t color);
 void vbe_fb_draw_char(uint16_t cx, uint16_t cy, char c, uint32_t fg, uint32_t bg);
+void vbe_fb_draw_cjk(uint16_t cx, uint16_t cy, uint16_t cp, uint32_t fg, uint32_t bg);
 void vbe_fb_scroll_up(uint16_t pixel_rows, uint32_t fill_color);
 
 /* 状态 */

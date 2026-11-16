@@ -13,6 +13,7 @@
 #include <stdint.h>
 
 #include "vbe.h"
+#include "unicode.h"
 #include "ui.h"
 #include "keyboard.h"
 #include "mouse.h"
@@ -254,9 +255,7 @@ void ui_line(int x0, int y0, int x1, int y1, uint32_t color)
 
 int ui_text_width(const char *s)
 {
-    int n = 0;
-    while (s[n]) n++;
-    return n * 16;
+    return (int)vbe_utf8_width_px(s);
 }
 
 void ui_text(int x, int y, const char *s, uint32_t fg, uint32_t bg)
@@ -265,31 +264,54 @@ void ui_text(int x, int y, const char *s, uint32_t fg, uint32_t bg)
 }
 
 /* 绘制前 n 个字符（不越过字符串结尾）。
- * 按"连续像素段"合并填充，避免逐像素调用把文本渲染拖慢。 */
+ * 按"连续像素段"合并填充，避免逐像素调用把文本渲染拖慢。
+ * 支持 UTF-8：ASCII 走 16x32 字模，汉字走 32x32 中文字库。
+ * 这一层做解码是刻意的——界面里几百个调用点都传字面量，
+ * 只有在这里统一处理，中文才不会变成空白或被逐字节拆开。 */
 static void ui_text_px_n(int x, int y, const char *s, int n, uint32_t fg)
 {
     extern const uint8_t font16x32[256][32][2];
     int px = x;
+    int i = 0;
+    int count = 0;
 
-    for (int k = 0; k < n && s[k]; k++) {
-        const uint8_t (*glyph)[2] = font16x32[(uint8_t)s[k]];
+    while (s[i] && count < n) {
+        uint32_t cp = 0;
+        int used = utf8_decode((const uint8_t *)s + i, 4, &cp);
+        if (used <= 0) { i++; continue; }
+
+        int w = utf32_width(cp);
+        if (w == 0) { i += used; continue; }
+
+        if (w == 2) {
+            vbe_draw_cjk_transparent((uint16_t)px, (uint16_t)y,
+                                     (uint16_t)cp, fg);
+            px += 32;
+            i += used;
+            count++;
+            continue;
+        }
+
+        const uint8_t (*glyph)[2] = font16x32[(uint8_t)cp];
         for (int row = 0; row < 32; row++) {
             uint16_t bits = (uint16_t)(((uint16_t)glyph[row][0] << 8) | glyph[row][1]);
-            int i = 0;
-            while (i < 16) {
-                if ((bits & (uint16_t)(0x8000u >> i)) == 0) {
-                    i++;
+            int k = 0;
+            while (k < 16) {
+                if ((bits & (uint16_t)(0x8000u >> k)) == 0) {
+                    k++;
                     continue;
                 }
-                int start = i;
-                while (i < 16 && (bits & (uint16_t)(0x8000u >> i)) != 0) {
-                    i++;
+                int start = k;
+                while (k < 16 && (bits & (uint16_t)(0x8000u >> k)) != 0) {
+                    k++;
                 }
                 vbe_fill_rect((uint16_t)(px + start), (uint16_t)(y + row),
-                              (uint16_t)(i - start), 1, fg);
+                              (uint16_t)(k - start), 1, fg);
             }
         }
         px += 16;
+        i += used;
+        count++;
     }
 }
 

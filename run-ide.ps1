@@ -98,6 +98,18 @@ $qargs = @(
     '-serial',"file:$($serialLog -replace '\\','/')"
 )
 
+# AC'97 声卡：
+#   交互模式用 SDL 的 winmm 后端（Windows waveOut，兼容性比
+#   DirectSound 更好）；自动化模式用 SDL dummy，保证 DMA 按真实
+#   时间推进但不占用宿主音频设备。
+if ($Headless) {
+    $env:SDL_AUDIODRIVER = 'dummy'
+} else {
+    $env:SDL_AUDIODRIVER = 'winmm'
+}
+$qargs += @('-audiodev','sdl,id=snd0')
+$qargs += @('-device','AC97,audiodev=snd0')
+
 if ($Headless) {
     $qargs += @('-display','none','-monitor','tcp:127.0.0.1:4470,server,nowait')
 } else {

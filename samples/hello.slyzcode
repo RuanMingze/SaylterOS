@@ -1,0 +1,53 @@
+// ============================================================
+// hello.slyzcode - SLYZ v2 语言自检示例
+// ------------------------------------------------------------
+// 覆盖：变量、字符串、数组、方法调用、函数、递归、
+//       for 范围循环、短路逻辑、字符串拼接与类型转换。
+//
+// 编译：slyzc compile samples/hello.slyzcode -o samples/hello.slyz
+// 运行：slyzc run samples/hello.slyz
+// ============================================================
+
+let greeting = "Hello, SLYZ v2!"
+
+fn shout(text) {
+    return upper(text) + "!"
+}
+
+fn fib(n) {
+    if n < 2 {
+        return n
+    }
+    return fib(n - 1) + fib(n - 2)
+}
+
+fn main() {
+    println(greeting)
+    println(shout(greeting))
+
+    let nums = [3, 1, 2]
+    nums.push(4)
+
+    let total = 0
+    for i in 0..nums.length {
+        total += nums.at(i)
+    }
+    println("sum = " + str(total))
+    println("items = " + str(nums))
+
+    let line = ""
+    for i in 0..10 {
+        line += str(fib(i)) + " "
+    }
+    println("fib: " + trim(line))
+
+    if total > 5 && nums.length == 4 {
+        println("logic ok")
+    } else {
+        println("logic broken")
+    }
+
+    let found = index_of(greeting, "SLYZ")
+    println("index_of SLYZ = " + str(found))
+    println("date = " + time.date() + " " + time.text())
+}

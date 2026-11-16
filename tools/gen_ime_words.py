@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+# ============================================================
+# gen_ime_words.py - 生成 SaylterOS 拼音输入法的双字词表
+# ------------------------------------------------------------
+# 数据来源：Rime pinyin_simp 词典
+#   https://github.com/rime/rime-pinyin-simp
+#   词条格式 "词<TAB>拼音<TAB>权重"，权重来自 Android PinyinIME 语料，
+#   是真实词频（"的" 482 万、"中国" 10.6 万），不是字频拼凑。
+#   许可：Apache License 2.0（派生自 Android 开源输入法项目）
+#
+# 输出 src/kernel/ime_words.c / ime_words.h：
+#   typedef struct { uint16_t s1, s2, c1, c2, score; } ime_word_t;
+#   s1/s2 是 ime_syllables 下标，c1/c2 是 Unicode 码位，
+#   score 是词频排名（1 最常用），跨音节组排序时用它。
+#
+# 用法：
+#   python tools/gen_ime_words.py [--rime PATH] [--max-words N]
+# ============================================================
+
+import argparse
+import io
+import os
+import re
+import sys
+import urllib.request
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+KERNEL = os.path.join(ROOT, 'src', 'kernel')
+
+RIME_URL = ('https://raw.githubusercontent.com/rime/rime-pinyin-simp/'
+            'master/pinyin_simp.dict.yaml')
+
+
+def load_syllables():
+    path = os.path.join(KERNEL, 'ime_pinyin.c')
+    text = io.open(path, encoding='utf-8').read()
+    order = {}
+    for i, m in enumerate(re.finditer(r'\{ "([a-z]+)", \d+, \d+ \}', text)):
+        order[m.group(1)] = i
+    return order
+
+
+def load_glyphs():
+    path = os.path.join(KERNEL, 'font_cjk.c')
+    text = io.open(path, encoding='utf-8').read()
+    block = re.search(r'const uint16_t font_cjk_codes\[[^\]]+\] = \{(.*?)\};',
+                      text, re.S)
+    if not block:
+        raise SystemExit('font_cjk_codes not found')
+    return {int(v, 16) for v in re.findall(r'0x([0-9A-Fa-f]{4})', block.group(1))}
+
+
+def ensure_rime(path):
+    if os.path.exists(path):
+        return
+    print('Rime dictionary missing, downloading...')
+    raw = urllib.request.urlopen(RIME_URL, timeout=180).read()
+    with io.open(path, 'w', encoding='utf-8', newline='\n') as fp:
+        fp.write(raw.decode('utf-8'))
+
+
+def load_rime(path):
+    """返回 (词, [音节...], 权重)；跳过 YAML 头部。"""
+    entries = []
+    started = False
+    for line in io.open(path, encoding='utf-8'):
+        line = line.rstrip('\n')
+        if line.startswith('...'):
+            started = True
+            continue
+        if not started or not line or line[0] == '#':
+            continue
+        parts = line.split('\t')
+        if len(parts) < 3:
+            continue
+        word, py, weight = parts[0], parts[1], parts[2]
+        try:
+            w = int(weight)
+        except ValueError:
+            continue
+        pieces = py.split()
+        entries.append((word, pieces, w))
+    return entries
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--rime', default=os.path.join(
+        os.environ.get('TEMP', '.'), 'rime_simp.txt'))
+    ap.add_argument('--out', default=os.path.join(KERNEL, 'ime_words.c'))
+    ap.add_argument('--header', default=os.path.join(KERNEL, 'ime_words.h'))
+    ap.add_argument('--max-words', type=int, default=12000)
+    ap.add_argument('--per-key', type=int, default=3)
+    args = ap.parse_args()
+
+    syllables = load_syllables()
+    glyphs = load_glyphs()
+    ensure_rime(args.rime)
+
+    raw = load_rime(args.rime)
+    print(f'rimes entries={len(raw)} syllables={len(syllables)} '
+          f'glyphs={len(glyphs)}')
+
+    # 同一 (读音, 词) 只保留权重最大的一条；多音字在不同读音下各留一份
+    best = {}
+    for word, pieces, weight in raw:
+        if len(word) != 2 or len(pieces) != 2:
+            continue
+        c1, c2 = ord(word[0]), ord(word[1])
+        if not (0x4E00 <= c1 <= 0x9FFF and 0x4E00 <= c2 <= 0x9FFF):
+            continue
+        if c1 not in glyphs or c2 not in glyphs:
+            continue
+        k1, k2 = pieces[0].lower(), pieces[1].lower()
+        if k1 not in syllables or k2 not in syllables:
+            continue
+        key = (k1, k2, c1, c2)
+        if key not in best or best[key] < weight:
+            best[key] = weight
+
+    buckets = {}
+    for (k1, k2, c1, c2), weight in best.items():
+        buckets.setdefault((syllables[k1], syllables[k2]), []).append(
+            (weight, c1, c2))
+
+    total = sum(len(v) for v in buckets.values())
+    print(f'candidates={total} groups={len(buckets)}')
+
+    # 每组按权重降序取前 per-key 个
+    chosen = []
+    for key, items in buckets.items():
+        for weight, c1, c2 in sorted(items, reverse=True)[:args.per_key]:
+            chosen.append((weight, key[0], key[1], c1, c2))
+
+    # 全局按词频截断：这一步现在按真实词频排，"支持""测试"不会再被挤掉
+    chosen.sort(key=lambda x: -x[0])
+    if len(chosen) > args.max_words:
+        chosen = chosen[:args.max_words]
+
+    # score 用词频排名（1..N），uint16 足够，越小越常用
+    ranked = []
+    for i, (weight, s1, s2, c1, c2) in enumerate(chosen):
+        ranked.append((s1, s2, c1, c2, i + 1, weight))
+    ranked.sort(key=lambda x: (x[0], x[1], x[4]))
+
+    print(f'selected words={len(ranked)}  '
+          f'top={chr(ranked[0][2])}{chr(ranked[0][3])}')
+
+    header = [
+        '/* Auto-generated by tools/gen_ime_words.py - do not edit */',
+        '/* Word data derived from Rime pinyin_simp (Apache License 2.0). */',
+        '#ifndef IME_WORDS_H',
+        '#define IME_WORDS_H',
+        '',
+        '#include <stdint.h>',
+        '',
+        f'#define IME_WORD_COUNT {len(ranked)}',
+        '',
+        'typedef struct {',
+        '    uint16_t s1;   /* ime_syllables 下标 */',
+        '    uint16_t s2;',
+        '    uint16_t c1;   /* Unicode 码位 */',
+        '    uint16_t c2;',
+        '    uint16_t score;/* 词频排名，越小越常用 */',
+        '} ime_word_t;',
+        '',
+        'extern const ime_word_t ime_words[IME_WORD_COUNT];',
+        '',
+        '#endif',
+    ]
+    with io.open(args.header, 'w', encoding='utf-8', newline='\n') as fp:
+        fp.write('\n'.join(header) + '\n')
+
+    body = [
+        '/* Auto-generated by tools/gen_ime_words.py - do not edit */',
+        '/* Word data derived from Rime pinyin_simp (Apache License 2.0). */',
+        '',
+        '#include <stdint.h>',
+        '#include "ime_words.h"',
+        '',
+        'const ime_word_t ime_words[IME_WORD_COUNT] = {',
+    ]
+    for s1, s2, c1, c2, score, _weight in ranked:
+        body.append(f'    {{ {s1}, {s2}, 0x{c1:04X}, 0x{c2:04X}, {score} }}, '
+                    f'/* {chr(c1)}{chr(c2)} */')
+    body.append('};')
+    body.append('')
+    with io.open(args.out, 'w', encoding='utf-8', newline='\n') as fp:
+        fp.write('\n'.join(body) + '\n')
+
+    print(f'generated {args.out} ({os.path.getsize(args.out)} bytes)')
+
+    for probe in ('nihao', 'zhongguo', 'ceshi', 'zhichi', 'women', 'keyi'):
+        for cut in range(1, len(probe)):
+            if probe[:cut] in syllables and probe[cut:] in syllables:
+                a, b = syllables[probe[:cut]], syllables[probe[cut:]]
+                hits = [w for w in ranked if w[0] == a and w[1] == b][:4]
+                print(f'  {probe} -> ' +
+                      ' '.join(chr(w[2]) + chr(w[3]) for w in hits))
+                break
+
+
+if __name__ == '__main__':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
+    main()

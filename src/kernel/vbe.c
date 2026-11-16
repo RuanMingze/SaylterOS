@@ -6,6 +6,8 @@
  * ============================================================ */
 
 #include "vbe.h"
+#include "font_cjk.h"
+#include "unicode.h"
 #include <stddef.h>
 
 vbe_info_t vbe_current;
@@ -398,39 +400,169 @@ void vbe_draw_string(const char *s, uint16_t cx, uint16_t cy, uint32_t fg, uint3
     }
 }
 
+/* 像素坐标单字符绘制（backbuffer + 裁剪）。ASCII 与 UTF-8 两条路径共用。 */
+static void draw_ascii_px(uint16_t x, uint16_t y, uint8_t ch,
+                          uint32_t fg, uint32_t bg) {
+    if ((uint32_t)x + FONT16_W > vbe_current.width) return;
+    if ((uint32_t)y + FONT16_H > vbe_current.height) return;
+
+    uint32_t stride = back_pitch_bytes / 4;
+    const uint8_t (*glyph)[2] = font16x32[ch];
+
+    for (int row = 0; row < FONT16_H; row++) {
+        int py = (int)y + row;
+        if (g_clip_active && (py < g_clip_y0 || py >= g_clip_y1)) continue;
+
+        uint32_t *line = back + (uint32_t)py * stride + x;
+        uint8_t left = glyph[row][0];
+        uint8_t right = glyph[row][1];
+        for (int i = 0; i < 16; i++) {
+            int pxx = (int)x + i;
+            if (g_clip_active && (pxx < g_clip_x0 || pxx >= g_clip_x1)) continue;
+            uint8_t bit = (i < 8) ? (uint8_t)((left >> (7 - i)) & 1u)
+                                  : (uint8_t)((right >> (15 - i)) & 1u);
+            line[i] = bit ? fg : bg;
+        }
+    }
+}
+
 /* 像素坐标文本：GUI 组件需要 16px 网格之外的位置。
  * 不走 g_row_lut：GUI 的前景/背景色组合多，缓存会频繁重建；
  * 直接逐位写 dword，文本量小，开销可以接受。 */
 void vbe_draw_text_px(uint16_t x, uint16_t y, const char *s, uint32_t fg, uint32_t bg) {
     if (!vbe_is_enabled()) return;
 
-    uint32_t stride = back_pitch_bytes / 4;
     uint16_t px = x;
-
     while (*s) {
         if ((uint32_t)px + FONT16_W > vbe_current.width) return;
         if ((uint32_t)y + FONT16_H > vbe_current.height) return;
-
-        const uint8_t (*glyph)[2] = font16x32[(uint8_t)(*s)];
-        for (int row = 0; row < FONT16_H; row++) {
-            int py = (int)y + row;
-            if (g_clip_active && (py < g_clip_y0 || py >= g_clip_y1)) continue;
-
-            uint32_t *line = back + (uint32_t)py * stride + px;
-            uint8_t left = glyph[row][0];
-            uint8_t right = glyph[row][1];
-            for (int i = 0; i < 16; i++) {
-                int pxx = (int)px + i;
-                if (g_clip_active && (pxx < g_clip_x0 || pxx >= g_clip_x1)) continue;
-                uint8_t bit = (i < 8) ? (uint8_t)((left >> (7 - i)) & 1u)
-                                      : (uint8_t)((right >> (15 - i)) & 1u);
-                line[i] = bit ? fg : bg;
-            }
-        }
-
+        draw_ascii_px(px, y, (uint8_t)(*s), fg, bg);
         px = (uint16_t)(px + FONT16_W);
         s++;
     }
+}
+
+/* UTF-8 文本宽度（像素）：GUI 布局计算用，不写像素 */
+uint16_t vbe_utf8_width_px(const char *s) {
+    if (!s) return 0;
+    int cols = 0;
+    int i = 0;
+    while (s[i]) {
+        uint32_t cp = 0;
+        int used = utf8_decode((const uint8_t *)s + i, 4, &cp);
+        if (used <= 0) { i++; continue; }
+        cols += utf32_width(cp);
+        i += used;
+    }
+    return (uint16_t)(cols * FONT16_W);
+}
+
+/* UTF-8 文本绘制：ASCII 16px，汉字 32px，遇到非法字节跳过 1 字节 */
+void vbe_draw_utf8_px(uint16_t x, uint16_t y, const char *s, uint32_t fg, uint32_t bg) {
+    if (!vbe_is_enabled() || !s) return;
+
+    uint16_t px = x;
+    int i = 0;
+    while (s[i]) {
+        uint32_t cp = 0;
+        int used = utf8_decode((const uint8_t *)s + i, 4, &cp);
+        if (used <= 0) { i++; continue; }
+
+        int w = utf32_width(cp);
+        if (w == 0) { i += used; continue; }
+
+        if (w == 2) {
+            if ((uint32_t)px + FONT_CJK_W > vbe_current.width) return;
+            vbe_draw_cjk_px(px, y, (uint16_t)cp, fg, bg);
+            px = (uint16_t)(px + FONT_CJK_W);
+        } else {
+            if ((uint32_t)px + FONT16_W > vbe_current.width) return;
+            draw_ascii_px(px, y, (uint8_t)cp, fg, bg);
+            px = (uint16_t)(px + FONT16_W);
+        }
+        i += used;
+    }
+}
+
+/* 透明背景的 ASCII 绘制：只写前景像素 */
+static void draw_ascii_transparent(uint16_t x, uint16_t y, uint8_t ch, uint32_t fg) {
+    if ((uint32_t)x + FONT16_W > vbe_current.width) return;
+    if ((uint32_t)y + FONT16_H > vbe_current.height) return;
+
+    uint32_t stride = back_pitch_bytes / 4;
+    const uint8_t (*glyph)[2] = font16x32[ch];
+
+    for (int row = 0; row < FONT16_H; row++) {
+        int py = (int)y + row;
+        if (g_clip_active && (py < g_clip_y0 || py >= g_clip_y1)) continue;
+
+        uint32_t *line = back + (uint32_t)py * stride + x;
+        uint8_t left = glyph[row][0];
+        uint8_t right = glyph[row][1];
+        for (int i = 0; i < 16; i++) {
+            int pxx = (int)x + i;
+            if (g_clip_active && (pxx < g_clip_x0 || pxx >= g_clip_x1)) continue;
+            uint8_t bit = (i < 8) ? (uint8_t)((left >> (7 - i)) & 1u)
+                                  : (uint8_t)((right >> (15 - i)) & 1u);
+            if (bit) line[i] = fg;
+        }
+    }
+}
+
+void vbe_draw_utf8_transparent(uint16_t x, uint16_t y, const char *s, uint32_t fg) {
+    if (!vbe_is_enabled() || !s) return;
+
+    uint16_t px = x;
+    int i = 0;
+    while (s[i]) {
+        uint32_t cp = 0;
+        int used = utf8_decode((const uint8_t *)s + i, 4, &cp);
+        if (used <= 0) { i++; continue; }
+
+        int w = utf32_width(cp);
+        if (w == 0) { i += used; continue; }
+
+        if (w == 2) {
+            if ((uint32_t)px + FONT_CJK_W > vbe_current.width) return;
+            vbe_draw_cjk_transparent(px, y, (uint16_t)cp, fg);
+            px = (uint16_t)(px + FONT_CJK_W);
+        } else {
+            if ((uint32_t)px + FONT16_W > vbe_current.width) return;
+            draw_ascii_transparent(px, y, (uint8_t)cp, fg);
+            px = (uint16_t)(px + FONT16_W);
+        }
+        i += used;
+    }
+}
+
+/* 带宽度上限的 UTF-8 绘制：超出 max_px 就停下，宁可少画也不越界。
+ * 返回实际绘制的像素宽度，调用方据此决定是否补 "..."。 */
+uint16_t vbe_draw_utf8_max_px(uint16_t x, uint16_t y, const char *s,
+                              uint16_t max_px, uint32_t fg, uint32_t bg) {
+    if (!vbe_is_enabled() || !s) return 0;
+
+    uint16_t px = x;
+    int i = 0;
+    while (s[i]) {
+        uint32_t cp = 0;
+        int used = utf8_decode((const uint8_t *)s + i, 4, &cp);
+        if (used <= 0) { i++; continue; }
+
+        int w = utf32_width(cp);
+        if (w == 0) { i += used; continue; }
+
+        uint16_t need = (uint16_t)(w * FONT16_W);
+        if ((uint32_t)(px - x) + need > max_px) break;
+
+        if (w == 2) {
+            vbe_draw_cjk_px(px, y, (uint16_t)cp, fg, bg);
+        } else {
+            draw_ascii_px(px, y, (uint8_t)cp, fg, bg);
+        }
+        px = (uint16_t)(px + need);
+        i += used;
+    }
+    return (uint16_t)(px - x);
 }
 
 /* ============================================================
@@ -483,6 +615,121 @@ void vbe_fb_draw_char(uint16_t cx, uint16_t cy, char c, uint32_t fg, uint32_t bg
         const uint32_t *right = g_row_lut[glyph[row][1]];
         for (int i = 0; i < 8; i++) line[i] = left[i];
         for (int i = 0; i < 8; i++) line[8 + i] = right[i];
+    }
+}
+
+/* ============================================================
+ * 32x32 中文点阵
+ * ------------------------------------------------------------
+ * 汉字在终端里占两个 16px 单元格（32px 宽）、正好 32px 高。
+ * 字形数据按 Unicode 升序存放，二分查找；未收录的字画一个
+ * 1px 空心方框，明确告诉用户"这里缺字"，而不是留白造成错觉。
+ * ============================================================ */
+
+/* 缺字占位框的第 row 行位图 */
+static inline uint32_t missing_row_bits(int row) {
+    if (row == 0 || row == FONT_CJK_H - 1) return 0xFFFFFFFFu;
+    return 0x80000001u;
+}
+
+int font_cjk_index(uint16_t cp) {
+    int lo = 0;
+    int hi = FONT_CJK_COUNT - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) >> 1;
+        uint16_t v = font_cjk_codes[mid];
+        if (v == cp) return mid;
+        if (v < cp) lo = mid + 1;
+        else hi = mid - 1;
+    }
+    return -1;
+}
+
+void vbe_fb_draw_cjk(uint16_t cx, uint16_t cy, uint16_t cp, uint32_t fg, uint32_t bg) {
+    if (!vbe_is_enabled()) return;
+    uint32_t px = (uint32_t)cx * FONT16_W;
+    uint32_t py = (uint32_t)cy * FONT16_H;
+    if (px + FONT_CJK_W > vbe_current.width) return;
+    if (py + FONT_CJK_H > vbe_current.height) return;
+
+    int idx = font_cjk_index(cp);
+    for (int row = 0; row < FONT_CJK_H; row++) {
+        uint32_t bits = (idx >= 0) ? font_cjk_rows[idx][row]
+                                   : missing_row_bits(row);
+        volatile uint32_t *line = fb_ptr((uint16_t)px, (uint16_t)(py + row));
+        if (bits == 0) {
+            for (int i = 0; i < FONT_CJK_W; i++) line[i] = bg;
+            continue;
+        }
+        if (bits == 0xFFFFFFFFu) {
+            for (int i = 0; i < FONT_CJK_W; i++) line[i] = fg;
+            continue;
+        }
+        for (int i = 0; i < FONT_CJK_W; i++) {
+            line[i] = (bits & (0x80000000u >> i)) ? fg : bg;
+        }
+    }
+}
+
+void vbe_draw_cjk_px(uint16_t x, uint16_t y, uint16_t cp, uint32_t fg, uint32_t bg) {
+    if (!vbe_is_enabled()) return;
+    if ((uint32_t)x + FONT_CJK_W > vbe_current.width) return;
+    if ((uint32_t)y + FONT_CJK_H > vbe_current.height) return;
+
+    int idx = font_cjk_index(cp);
+    uint32_t stride = back_pitch_bytes / 4;
+
+    for (int row = 0; row < FONT_CJK_H; row++) {
+        int py = (int)y + row;
+        if (g_clip_active && (py < g_clip_y0 || py >= g_clip_y1)) continue;
+        uint32_t bits = (idx >= 0) ? font_cjk_rows[idx][row]
+                                   : missing_row_bits(row);
+        uint32_t *line = back + (uint32_t)py * stride + x;
+        for (int i = 0; i < FONT_CJK_W; i++) {
+            int pxx = (int)x + i;
+            if (g_clip_active && (pxx < g_clip_x0 || pxx >= g_clip_x1)) continue;
+            line[i] = (bits & (0x80000000u >> i)) ? fg : bg;
+        }
+    }
+}
+
+/* 透明背景版本：只写前景像素。
+ * GUI 的选区高亮、渐变背景、候选窗底色都需要"字形叠加"，
+ * 用不透明版本会把底下的高亮整块盖掉。 */
+void vbe_draw_cjk_transparent(uint16_t x, uint16_t y, uint16_t cp, uint32_t fg) {
+    if (!vbe_is_enabled()) return;
+    if ((uint32_t)x + FONT_CJK_W > vbe_current.width) return;
+    if ((uint32_t)y + FONT_CJK_H > vbe_current.height) return;
+
+    int idx = font_cjk_index(cp);
+    if (idx < 0) {
+        /* 缺字：只画一个 1px 方框，保留底色 */
+        for (int row = 0; row < FONT_CJK_H; row++) {
+            uint32_t bits = missing_row_bits(row);
+            int py = (int)y + row;
+            if (g_clip_active && (py < g_clip_y0 || py >= g_clip_y1)) continue;
+            uint32_t *line = back + (uint32_t)py * (back_pitch_bytes / 4) + x;
+            for (int i = 0; i < FONT_CJK_W; i++) {
+                int pxx = (int)x + i;
+                if (g_clip_active && (pxx < g_clip_x0 || pxx >= g_clip_x1)) continue;
+                if (bits & (0x80000000u >> i)) line[i] = fg;
+            }
+        }
+        return;
+    }
+
+    uint32_t stride = back_pitch_bytes / 4;
+    for (int row = 0; row < FONT_CJK_H; row++) {
+        uint32_t bits = font_cjk_rows[idx][row];
+        if (!bits) continue;
+        int py = (int)y + row;
+        if (g_clip_active && (py < g_clip_y0 || py >= g_clip_y1)) continue;
+        uint32_t *line = back + (uint32_t)py * stride + x;
+        for (int i = 0; i < FONT_CJK_W; i++) {
+            int pxx = (int)x + i;
+            if (g_clip_active && (pxx < g_clip_x0 || pxx >= g_clip_x1)) continue;
+            if (bits & (0x80000000u >> i)) line[i] = fg;
+        }
     }
 }
 

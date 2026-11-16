@@ -14,7 +14,7 @@
 ;   +5..18 pm.bin
 ;   +19..  内核
 ;
-; 安装完成后还会清零文件系统超级块区域（LBA2048..2063），
+; 安装完成后还会清零文件系统超级块区域（LBA8192..8207），
 ; 让首次启动时 SlyzFS 走"自动格式化并创建 root"的路径。
 ;
 ; 流程：界面 -> 检测硬盘 -> 确认 -> 写入 -> 逐扇区校验 -> 完成
@@ -43,7 +43,7 @@ TRACK_SECTORS   equ 18
 BUF_SEG         equ 0x0500
 VERIFY_SEG      equ 0x0750
 STACK_TOP       equ 0x4C00
-FS_HEAD_LBA     equ 2048
+FS_HEAD_LBA     equ 8192
 FS_HEAD_SECTORS equ 16
 
 ATTR_TITLE      equ 0x1F
@@ -733,47 +733,51 @@ flush_disk:
 ; ============================================================
 ; floppy_read_track: EAX=起始 LBA（18 的倍数）, ES:BX=缓冲；结果写 io_result
 ; 逐扇区读取（AH=02, AL=1）：整磁道 18 扇区的单次 DMA 在部分 BIOS 上
-; 会静默返回 0 数据，逐扇区最可靠。
+; ------------------------------------------------------------
+; floppy_read_track: 读取从 AX 开始的 TRACK_SECTORS 个连续扇区
+; ------------------------------------------------------------
+; 函数名保留（调用点不改），实现已从软盘 CHS 换成 LBA 扩展读：
+; 安装介质现在是 16MB 硬盘镜像，18 扇区/磁道、2 磁头的软盘几何
+; 不再成立，继续按 CHS 换算会读到完全错误的位置。
+; 这里的"磁道"只是"连续 18 个扇区"的批处理单位，不再对应物理磁道。
+; ------------------------------------------------------------
 floppy_read_track:
     push eax
     push ebx
     push cx
     push dx
 
-    movzx eax, ax               ; 只保留 16 位 LBA：高位残留会让 32 位除法溢出
-    xor edx, edx
-    mov ebx, TRACK_SECTORS * 2
-    div ebx
-    mov [cur_cyl], al           ; 柱面（< 80）
-    mov eax, edx
-
-    xor edx, edx
-    mov ebx, TRACK_SECTORS
-    div ebx
-    mov [cur_head], al          ; 磁头
-
-    mov byte [cur_sec], 1
+    movzx eax, ax               ; 只保留 16 位 LBA：高位残留会让寻址错位
+    mov [cur_sector_lba], eax
     mov word [cur_off], 0
     mov word [cur_cnt], TRACK_SECTORS
 
 .sector_loop:
     xor ax, ax
     mov ds, ax                  ; BIOS 可能改写 DS，每轮重置
+
     mov ax, BUF_SEG
-    mov es, ax
-    mov bx, [cur_off]
-    mov ch, [cur_cyl]
-    mov dh, [cur_head]
-    mov cl, [cur_sec]
+    mov [dap_seg], ax
+    mov ax, [cur_off]
+    mov [dap_off], ax
+    mov word [dap_count], 1
+
+    mov eax, [cur_sector_lba]
+    mov dword [dap_lba], eax
+    mov dword [dap_lba + 4], 0
+
+    mov si, dap
     mov dl, [boot_drive]
-    mov ax, 0x0201
+    mov ah, 0x42
     int 0x13
     jc .bad
 
     xor ax, ax
     mov ds, ax
     add word [cur_off], 512
-    inc byte [cur_sec]
+    mov eax, [cur_sector_lba]
+    inc eax
+    mov [cur_sector_lba], eax
     dec word [cur_cnt]
     jnz .sector_loop
 
@@ -1261,6 +1265,16 @@ cur_head:       db 0
 cur_sec:        db 0
 cur_off:        dw 0
 cur_cnt:        dw 0
+cur_sector_lba: dd 0
+
+; Disk Address Packet：LBA 扩展读用，与 CHS 几何无关
+dap:
+                db 0x10, 0
+dap_count:      dw 1
+dap_off:        dw 0
+dap_seg:        dw 0
+dap_lba:        dd 0
+                dd 0
 probe_off:      dw 0
 dec_buf:        times 8 db 0
 bar_buf:        times 24 db 0
@@ -1289,7 +1303,7 @@ msg_probe_bad:  db 'Floppy payload: UNREADABLE'
 msg_probe_bad_end:
 msg_warning:    db 'WARNING: target disk LBA0..payload will be overwritten.'
 msg_warning_end:
-msg_warning2:   db '         filesystem header LBA2048..2063 will be cleared.'
+msg_warning2:   db '         filesystem header LBA8192..8207 will be cleared.'
 msg_warning2_end:
 msg_confirm:    db 'Press Y to install, any other key aborts.'
 msg_confirm_end:

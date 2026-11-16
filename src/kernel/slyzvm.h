@@ -1,41 +1,23 @@
 /* ============================================================
- * slyzvm.h - SLYZ 二进制可执行格式（SLYZBIN v1）
+ * slyzvm.h - SLYZ v2 虚拟机接口
  * ------------------------------------------------------------
- * 设计目标：
- *   1. 与文本 .slyz 彻底区分：文件以 8 字节魔数 "SLYZBIN\0" 开头，
- *      任何文本文件都不会误判。
- *   2. 位置无关：只有绝对偏移，没有重定位表，读进内存即可执行，
- *      因此 Windows 上编译的产物可以直接放进 SlyzFS 交给内核。
- *   3. 结构极简：32 字节头 + 常量池 + 字节码，全部小端。
+ * 同一个解释器同时服务两个宿主：
+ *   - SaylterOS 内核：内存由任务配额提供，输出走屏幕/串口
+ *   - Windows 端 slyzc run：内存由 malloc 提供，输出走 stdout
+ * 差异全部收敛在 SlyzVmOps 回调里，指令语义只有一份实现，
+ * 避免编译器自测通过而内核解释器行为不同。
  *
- * 文件布局：
- *   offset 0   magic[8]        "SLYZBIN\0"
- *   offset 8   u16 version     当前为 1
- *   offset 10  u16 flags       bit0 = 需要交互输入
- *   offset 12  u32 const_size  常量池字节数
- *   offset 16  u32 code_size   字节码字节数
- *   offset 20  u32 entry       入口偏移（通常 0）
- *   offset 24  u32 checksum    FNV-1a(const_pool || code)
- *   offset 28  u32 reserved    必须为 0
- *   offset 32  const_pool      以 '\0' 分隔的字符串常量池
- *   之后       code            字节码
+ * 执行模型：
+ *   slyzvm_create 校验镜像并建立工作区；
+ *   slyzvm_step   最多执行 budget 条指令后返回，返回 1 表示仍在运行；
+ *                  GUI 应用每帧只给有限预算，避免独占 CPU；
+ *   slyzvm_run    内部循环调用 step 直到结束，等价于 budget = 全速。
  *
- * 字节码指令（u16 操作数为小端绝对偏移）：
- *   0x00 END
- *   0x01 ECHO   u16 str
- *   0x02 ASK    u16 str
- *   0x03 JMP    u16 target
- *   0x04 JZ     u16 target      last == 0 时跳转
- *   0x05 JNZ    u16 target      last != 0 时跳转
- *   0x06 RUN    u16 str         交给宿主执行一行命令
- *   0x07 EXIT
- *   0x08 HELP
- *   0x09 CLEAR
- *   0x0A SET    u8 value        写 last
- *   0x0B NOP
- *   0x0C ALLOC  u16 bytes       向宿主申请内存
- *   0x0D FREE                   释放最近一次 ALLOC
- *   0x0E WAIT                   永久让出 CPU，直到任务被 kill
+ * 值所有权：
+ *   值进入值栈、全局槽、数组元素时增加引用计数，离开时减少。
+ *   宿主 sys 回调收到的参数在回调返回后由虚拟机释放；宿主若要把
+ *   参数原样作为返回值，必须通过 slyz_ret_* 重新构造，不能直接
+ *   把传入指针写回 ret。
  * ============================================================ */
 
 #ifndef SLYZVM_H
@@ -43,64 +25,119 @@
 
 #include <stdint.h>
 
-#define SLYZVM_MAGIC0   'S'
-#define SLYZVM_MAGIC1   'L'
-#define SLYZVM_MAGIC2   'Y'
-#define SLYZVM_MAGIC3   'Z'
-#define SLYZVM_MAGIC4   'B'
-#define SLYZVM_MAGIC5   'I'
-#define SLYZVM_MAGIC6   'N'
-#define SLYZVM_MAGIC7   0x00
+#include "slyz.h"
 
-#define SLYZVM_VERSION        1
-#define SLYZVM_HEADER_SIZE    32
+#ifdef SLYZ_HOST
+#define SLYZ_INLINE static inline
+#else
+#define SLYZ_INLINE static inline
+#endif
 
-/* 单文件上限：常量池与字节码各不超过 4KB，合计 8KB */
-#define SLYZVM_MAX_CONST      4096
-#define SLYZVM_MAX_CODE       4096
-#define SLYZVM_MAX_FILE       (SLYZVM_HEADER_SIZE + SLYZVM_MAX_CONST + SLYZVM_MAX_CODE)
+/* ---------- 运行时对象 ----------
+ * kind: SLYZ_T_STR / SLYZ_T_ARR
+ * flags: bit0 = 静态对象（镜像常量池副本），不参与释放
+ * 数据区紧随头部，保证 8 字节对齐，数组元素可直接按 SlyzVal 访问。 */
 
-/* 单次执行的最大指令数，防止损坏文件导致死循环 */
-#define SLYZVM_MAX_STEPS      200000
-
-/* 指令操作码 */
-#define SLOP_END     0x00
-#define SLOP_ECHO    0x01
-#define SLOP_ASK     0x02
-#define SLOP_JMP     0x03
-#define SLOP_JZ      0x04
-#define SLOP_JNZ     0x05
-#define SLOP_RUN     0x06
-#define SLOP_EXIT    0x07
-#define SLOP_HELP    0x08
-#define SLOP_CLEAR   0x09
-#define SLOP_SET     0x0A
-#define SLOP_NOP     0x0B
-#define SLOP_ALLOC   0x0C
-#define SLOP_FREE    0x0D
-#define SLOP_WAIT    0x0E
-
-/* 宿主回调：VM 自身不做任何 I/O，全部由 shell 注入 */
-struct SlyzVmOps {
-    void (*print)(const char *text);
-    int  (*ask)(const char *prompt);       /* 返回 0 或 1 */
-    int  (*run_line)(const char *line);    /* 执行一行 shell 命令，成功返回 1 */
-    void (*clear)(void);
-    void (*help)(void);
-    /* 内存申请：返回 0 表示失败（配额或物理内存不足），VM 会终止脚本 */
-    void *(*alloc)(uint32_t bytes);
-    void  (*free)(void *ptr);
-    /* 每执行一条指令调用一次，用于任务步数统计与协作式调度；可为 0 */
-    void (*tick)(void);
-    /* 主动让出 CPU（WAIT 指令每次调用）；可为 0 */
-    void (*yield)(void);
+struct SlyzObj {
+    uint8_t  kind;
+    uint8_t  flags;
+    uint16_t refs;
+    uint32_t len;        /* 字符串字节数 / 数组元素数 */
+    uint32_t cap;        /* 数组容量 */
+    uint32_t reserved0;
+    void    *data;       /* 字符串：char*；数组：SlyzVal*，可扩容替换 */
 };
 
-/* 只检查 8 字节魔数，用于区分二进制与文本脚本 */
-int slyzvm_is_binary(const uint8_t *data, int size);
+#define SLYZ_OBJ_STATIC 0x01
 
-/* 校验并执行。成功返回 1；格式错误/校验失败/执行出错返回 0。 */
-int slyzvm_run(const uint8_t *data, int size,
-               const struct SlyzVmOps *ops, const char *name);
+struct SlyzVal {
+    int32_t type;
+    int32_t aux;
+    union {
+        int64_t i;
+        struct SlyzObj *obj;
+    } u;
+};
+
+/* ---------- 宿主回调 ---------- */
+
+struct SlyzVm;
+
+typedef struct SlyzVmOps {
+    /* 执行一条系统调用。id 见 slyz.h 的 SLE_SYS_*；
+     * args[0] 是源码里的第一个参数，返回 0 表示成功，非 0 终止程序。 */
+    int  (*sys)(struct SlyzVm *vm, uint16_t id,
+                struct SlyzVal *args, uint16_t argc,
+                struct SlyzVal *ret);
+
+    /* 工作区内存。内核传 task_alloc/task_free，宿主传 malloc/free。
+     * 申请失败必须返回 0，虚拟机据此报告 OOM 而不是崩溃。 */
+    void *(*alloc)(uint32_t bytes);
+    void  (*free)(void *ptr);
+
+    /* 每执行若干条指令调用一次，用于协作式调度与步数统计。可为 0。 */
+    void (*tick)(void);
+
+    /* 格式/运行错误文本。内核写串口，宿主写 stderr。可为 0。 */
+    void (*log)(const char *text);
+} SlyzVmOps;
+
+/* ---------- 生命周期 ---------- */
+
+int  slyzvm_is_binary(const uint8_t *data, int size);
+
+struct SlyzVm *slyzvm_create(const uint8_t *image, int size,
+                             const struct SlyzVmOps *ops, const char *name);
+
+/* 返回 1 仍在运行，0 正常结束，<0 运行错误（SLYZ_ERR_*） */
+int  slyzvm_step(struct SlyzVm *vm, uint32_t budget);
+
+/* 跑到结束，返回 1 成功，0 失败 */
+int  slyzvm_run(const uint8_t *image, int size,
+                const struct SlyzVmOps *ops, const char *name);
+
+void slyzvm_destroy(struct SlyzVm *vm);
+
+int  slyzvm_state(const struct SlyzVm *vm);
+int  slyzvm_exit_code(const struct SlyzVm *vm);
+const char *slyzvm_error(const struct SlyzVm *vm);
+uint32_t slyzvm_steps(const struct SlyzVm *vm);
+int  slyzvm_uses_gui(const struct SlyzVm *vm);
+
+/* 宿主主动结束程序（SLE_SYS_EXIT 使用） */
+void slyzvm_request_exit(struct SlyzVm *vm, int code);
+
+/* 宿主请求在执行完当前指令后让出控制权。
+ * 图形宿主用它实现"绘制一帧就暂停"：gfx.flush 调用后 step 立即返回，
+ * 下一帧从下一条指令继续，事件处理与重绘因此被切成固定节奏。 */
+void slyzvm_request_yield(struct SlyzVm *vm);
+
+/* ---------- 值访问 ---------- */
+
+SLYZ_INLINE int slyz_val_is_nil(const struct SlyzVal *v) {
+    return v->type == SLYZ_T_NIL;
+}
+
+SLYZ_INLINE int64_t slyz_val_int(const struct SlyzVal *v) {
+    if (v->type == SLYZ_T_INT) return v->u.i;
+    return 0;
+}
+
+/* 字符串内容；非字符串返回 0。*len 可为 0。 */
+const char *slyz_val_str(const struct SlyzVal *v, int *len);
+
+int  slyz_val_arr_len(const struct SlyzVal *v);
+struct SlyzVal *slyz_val_arr_at(struct SlyzVal *v, int index);
+
+/* ---------- 返回值构造 ---------- */
+
+void slyz_ret_nil(struct SlyzVal *ret);
+void slyz_ret_int(struct SlyzVal *ret, int64_t x);
+int  slyz_ret_str(struct SlyzVm *vm, struct SlyzVal *ret, const char *s, int len);
+int  slyz_ret_arr(struct SlyzVm *vm, struct SlyzVal *ret, int count);
+int  slyz_arr_set(struct SlyzVm *vm, struct SlyzVal *arr, int index, struct SlyzVal value);
+
+/* 把任意值渲染成可打印文本，返回写入长度（不含结尾 0） */
+int  slyz_val_to_text(struct SlyzVm *vm, const struct SlyzVal *v, char *buf, int cap);
 
 #endif /* SLYZVM_H */

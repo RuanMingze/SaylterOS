@@ -1,0 +1,47 @@
+// ============================================================
+// gui-window.slyzcode - 窗口与绘图的完整骨架
+// ------------------------------------------------------------
+// 这段程序在 SaylterOS 图形会话里创建自己的窗口，绘制标题框、
+// 计数文本与关闭按钮，并在窗口被关闭时退出。
+//
+// 在 Windows 命令行宿主里运行会收到 -1 句柄并打印提示，
+// 这是刻意设计：命令行没有窗口系统，程序必须能自行降级。
+// ============================================================
+
+fn main() {
+    let hwnd = win.open("SLYZ Window", 640, 420)
+    if hwnd < 0 {
+        println("graphics host is not available; run this inside SaylterOS")
+        return
+    }
+
+    let ticks = 0
+    let running = 1
+
+    while running {
+        gfx.clear(0x0B1017)
+        gfx.rect(0, 0, 640, 56, 0x141C27)
+        gfx.text(20, 16, "SLYZ Window", 0xE9EFF7)
+        gfx.text(20, 92, "ticks = " + str(ticks), 0x8EA0B4)
+        gfx.text(20, 132, "width = " + str(win.width(hwnd)), 0x8EA0B4)
+        gfx.text(20, 172, "height = " + str(win.height(hwnd)), 0x8EA0B4)
+        gfx.frame(16, 76, 608, 328, 0x2B3949, 1)
+        gfx.flush()
+
+        ticks += 1
+
+        let ev = event.wait(16)
+        if ev != nil {
+            let kind = ev.at(0)
+            if kind == 5 {
+                running = 0
+            }
+            if kind == 1 && ev.at(1) == 27 {
+                running = 0
+            }
+        }
+    }
+
+    win.close(hwnd)
+    println("window closed after " + str(ticks) + " ticks")
+}

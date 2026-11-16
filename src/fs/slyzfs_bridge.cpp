@@ -210,7 +210,7 @@ extern "C" int slyzfs_try_mount(void) {
     if (!slyzfs::g_inited) {
         slyzfs_bridge_init();
     }
-    slog("try_mount START, reading SB at LBA 2048...");
+    slog("try_mount START, reading SB at LBA 8192...");
     if (!slyzfs::g_fs->mount()) {
         FS_PRINTK("[SlyzFS] no valid filesystem at LBA %u\n", slyzfs::SLYZ_FS_OFFSET);
         slog("try_mount FAIL: bad magic or version");

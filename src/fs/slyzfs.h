@@ -10,11 +10,16 @@
  *   - FAT-like 链式分配，支持子目录
  *   - 基于现有 ATA PIO 扇区读写（512 字节 LBA）
  *
- * 磁盘布局（默认从 LBA 2048 开始，不影响 MBR/引导）：
- *   Sector 2048        : SuperBlock   —— 格式版本/簇大小/数据区起始
- *   Sector 2049 ~ 3072 : FAT          —— 1024 sectors，16-bit 条目，共 524,288 簇
- *   Sector 3073 ~ 3328 : Root Dir     —— 256 sectors，每条目 64B，共 2048 条目
- *   Sector 3329+       : Data Area    —— 簇 2 起，每簇 4 sectors (2048B)
+ * 磁盘布局（默认从 LBA 8192 开始，不影响引导与内核载荷）：
+ *   Sector 8192        : SuperBlock   —— 格式版本/簇大小/数据区起始
+ *   Sector 8193 ~ 8256 : FAT          —— 64 sectors，16-bit 条目
+ *   Sector 8257 ~ 8512 : Root Dir     —— 256 sectors，每条目 71B
+ *   Sector 8513+       : Data Area    —— 簇 2 起，每簇 4 sectors (2048B)
+ *
+ * 起始 LBA 必须大于内核镜像的加载上界（linker.ld 与 build.ps1 把
+ * 内核限制在 0x3F0000 以下）。历史上文件系统从 LBA 2048（1MB）
+ * 开始，内核体积增长到 1MB 以上后，mkfs 写超级块会覆盖内核尾部
+ * 的 .rodata/.data，启动时表现为 #GP。8192（4MB）留出足够余量。
  */
 
 #include <stdint.h>
@@ -67,7 +72,7 @@ static inline int slyz_strcmp(const char* a, const char* b) {
 
 /* ======================= 常量 ======================= */
 
-static constexpr uint32_t SLYZ_FS_OFFSET       = 2048;   /* 文件系统起始 LBA */
+static constexpr uint32_t SLYZ_FS_OFFSET       = 8192;   /* 文件系统起始 LBA（必须在内核加载上界之后） */
 static constexpr uint16_t SLYZ_MAGIC           = 0x534C; /* "SL" 魔数 */
 static constexpr uint16_t SLYZ_VERSION         = 0x0002; /* v0.2：目录条目改回真实尺寸 71B */
 static constexpr uint16_t SLYZ_CLUSTER_SIZE    = 4;      /* 每簇 4 sectors = 2048B */

@@ -61,7 +61,7 @@ powershell -NoProfile -File build.ps1
 |---|---|
 | `build/saylter.img` | VBE 版软盘镜像 |
 | `build/saylter-tty.img` | TTY 版软盘镜像 |
-| `build/saylter-ide.img` | 32 MB IDE 硬盘镜像，SlyzFS 位于 LBA 2048 |
+| `build/saylter-ide.img` | 32 MB IDE 硬盘镜像，SlyzFS 位于 LBA 8192 |
 
 每次构建都会**重新创建** `saylter-ide.img`，其中已写入的用户、文件会丢失。
 
@@ -221,8 +221,8 @@ SaylterOS/
 | 0 | `boot.bin`（MBR） | `0x7C00` |
 | 1–4 | `stage2.bin` | `0x7E00` |
 | 5–18 | `pm.bin` | `0x8600` |
-| 19+ | `kernel.bin` | `0xA200` |
-| 2048+ | SlyzFS 超级块 | — |
+| 19+ | `kernel.bin` | `0x100000` |
+| 8192+ | SlyzFS 超级块 | — |
 
 `boot.asm` 使用 `int 13h AH=42h`（DAP/LBA）分四段加载，每段都不跨越 64 KB 段边界：
 
@@ -244,20 +244,24 @@ LBA 130..193→ 0x18000
 | 编译必须带 `-mno-sse -mno-sse2 -mno-mmx -mno-3dnow` | 裸内核未置位 `CR4.OSFXSR`，SSE 指令会触发 `#UD` 并卡死 |
 | 编译默认 `-O0`，绘制热路径 `-O2` | 高优化级别会插入 SSE 指令与栈探针，热路径显式关闭循环改写 |
 
-当前实测：内核镜像约 592 KB，装载结束于 `0x194200`；`.bss` 结束于 `0x1350700`（距 20 MB 上界约 700 KB）。新增模块后 `build.ps1` 会自动重新核算并拒绝越界构建。
+当前实测：内核镜像约 1.29 MB，装载结束于 `0x249200`；`.bss` 结束于 `0x1358E80`（距 20 MB 上界约 690 KB）。新增模块后 `build.ps1` 会自动重新核算并拒绝越界构建。
+
+> SlyzFS 起始 LBA 必须大于内核装载上界。文件系统曾从 LBA 2048（1 MB）
+> 开始，内核超过 1 MB 后 `mkfs` 的超级块写入会覆盖内核尾部
+> `.rodata/.data`，表现为启动时 #GP；现已移动到 LBA 8192（4 MB）。
 
 ### SlyzFS
 
 | 项 | 值 |
 |---|---|
-| 起始 LBA | 2048 |
+| 起始 LBA | 8192 |
 | 超级块 | 1 扇区（结构 506 字节，读写用 512 字节缓冲中转） |
 | FAT | 64 扇区，16384 个 16 位条目，链式分配 |
 | 根目录 | 256 扇区，每扇区 8 个条目 |
 | 簇大小 | 4 扇区 = 2048 字节 |
 | 目录条目 | 71 字节（pack(1)） |
-| 数据区起始 | LBA 2369 |
-| 32 MB 盘容量 | 15791 个簇 |
+| 数据区起始 | LBA 8513 |
+| 32 MB 盘容量 | 14255 个簇 |
 
 目录条目布局：
 

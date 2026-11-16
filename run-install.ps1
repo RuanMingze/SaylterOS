@@ -61,7 +61,7 @@ if (-not (Test-Path $Target)) {
         Write-Host ("Target disk too small: {0} ({1} bytes, need >= {2})." -f $Target, $len, $minBytes) -ForegroundColor Red
         exit 1
     }
-    Write-Host ("Target disk exists: {0} ({1} bytes). The installer will overwrite LBA0..payload and clear LBA2048..2063." -f $Target, $len)
+    Write-Host ("Target disk exists: {0} ({1} bytes). The installer will overwrite LBA0..payload and clear LBA8192..8207." -f $Target, $len)
 }
 
 Write-Host ("Installer : {0}" -f $installer)

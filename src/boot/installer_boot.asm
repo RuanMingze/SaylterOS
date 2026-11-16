@@ -1,13 +1,13 @@
 ; ============================================================
-; SaylterOS Installer - 引导扇区（软盘 MBR）
+; SaylterOS Installer - 引导扇区（安装介质 MBR）
 ; ------------------------------------------------------------
 ; 由 BIOS 加载到 0x7C00。职责只有一件事：
-;   从软盘 LBA1 起把安装器主体读进 0x7E00，然后跳过去。
+;   从介质 LBA1 起把安装器主体读进 0x7E00，然后跳过去。
 ;
-; 为什么限制在一段连续读取：
-;   软盘 int 13h 的 CHS 读取不能跨磁道（每磁道 18 扇区），
-;   LBA1..17 落在同一个磁道（C0/H0/S2..S18），可以一次读完。
-;   安装器主体必须不超过 17 扇区（8704 字节），build.ps1 会自检。
+; 介质已经从 1.44MB 软盘换成 16MB 硬盘镜像：软盘的 CHS 几何
+; 假设（18 扇区/磁道、2 磁头）在硬盘上不成立，因此这里统一
+; 使用 INT 13h AH=42h 的 LBA 扩展读，不再做任何 CHS 换算。
+; BIOS 传入的 DL 可能是 0x80（硬盘），全程原样保存使用。
 ; ============================================================
 
 ORG 0x7C00
@@ -15,15 +15,9 @@ ORG 0x7C00
 
 MAIN_ADDR       equ 0x7E00
 FIRST_MAIN_LBA  equ 1
-MAX_MAIN_SECTORS equ 17         ; LBA1..17 同磁道
-TRACK_SECTORS   equ 18
 
 %ifndef INSTALLER_MAIN_SECTORS
 %define INSTALLER_MAIN_SECTORS 8
-%endif
-
-%if INSTALLER_MAIN_SECTORS > MAX_MAIN_SECTORS
-%error "installer main exceeds one floppy track (17 sectors)"
 %endif
 
 start:
@@ -45,35 +39,26 @@ start:
     mov si, msg_loading
     call puts
 
-    ; 逐扇区读取安装器主体到 0000:7E00。
-    ; 单次多扇区 DMA 在部分 FDC/BIOS 组合上会静默失败或只搬一部分，
-    ; 逐扇区（AL=1）最稳，LBA1..17 全部落在第 0 磁道，速度也不是问题。
-    ; ES 必须为 0：把 0x7E00 装进 ES 会变成物理地址 0x7E000，
-    ; 与远跳目标 0x0000:7E00 相差 0x76000，主体根本不会执行。
     mov word [cur_lba], FIRST_MAIN_LBA
     mov byte [cur_cnt], INSTALLER_MAIN_SECTORS
     mov word [cur_off], MAIN_ADDR
 
 .sector_loop:
-    mov ax, [cur_lba]
-    xor dx, dx
-    mov bx, TRACK_SECTORS * 2
-    div bx                      ; AX = 柱面，DX = 磁道内偏移
-    mov ch, al
-    mov ax, dx
-    xor dx, dx
-    mov bl, TRACK_SECTORS
-    div bl                      ; AL = 磁头，AH = 扇区序号（0 基）
-    mov dh, al
-    mov cl, ah
-    inc cl
-    mov dl, [boot_drive]
+    ; 逐扇区读：DAP 只描述一个扇区，避免部分 BIOS 对跨段多扇区
+    ; DMA 的处理差异。数量很少，性能无所谓。
+    mov word [dap_count], 1
+    mov ax, [cur_off]
+    mov [dap_off], ax
+    mov word [dap_seg], 0
 
-    xor ax, ax
-    mov es, ax
-    mov bx, [cur_off]
-    mov ah, 0x02
-    mov al, 1
+    mov ax, [cur_lba]
+    movzx eax, ax
+    mov [dap_lba], eax
+    mov dword [dap_lba + 4], 0
+
+    mov si, dap
+    mov dl, [boot_drive]
+    mov ah, 0x42
     int 0x13
     jc .fail
 
@@ -85,8 +70,6 @@ start:
     jnz .sector_loop
 
     ; 跳主体（远跳保证 CS:IP 正确）
-    ; x86 远跳的编码顺序是 EA offset16 segment16，写反会跳到
-    ; 7E00:0000（物理 0x7E000），而主体实际加载在 0000:7E00。
     xor ax, ax
     mov ds, ax
     mov dl, [boot_drive]
@@ -125,10 +108,19 @@ puts:
     pop ax
     ret
 
-boot_drive:     db 0
-cur_lba:        dw 0
-cur_cnt:        db 0
-cur_off:        dw 0
+; Disk Address Packet（16 字节）
+dap:
+    db 0x10, 0
+dap_count:  dw 1
+dap_off:    dw 0
+dap_seg:    dw 0
+dap_lba:    dd 0
+            dd 0
+
+boot_drive: db 0
+cur_lba:    dw 0
+cur_cnt:    db 0
+cur_off:    dw 0
 msg_loading:    db 'SaylterOS Installer: loading', 13, 10, 0
 msg_read_fail:  db 'Installer load failed', 13, 10, 0
 

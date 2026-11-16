@@ -47,6 +47,11 @@ void tty_clear_row(uint16_t row, uint8_t attr);
 void tty_clear_from(uint16_t x, uint16_t y);
 /* 在指定位置写一个带属性的字符（不移动光标） */
 void tty_put_at(uint16_t x, uint16_t y, char c, uint8_t attr);
+/* 写一个 Unicode 码位；双宽字符会占用 x 与 x+1 两格。
+ * 返回占用的列数（0/1/2），越界返回 0。 */
+int  tty_put_at_cp(uint16_t x, uint16_t y, uint16_t cp, uint8_t attr);
+/* 写 UTF-8 字符串，返回占用的列数 */
+int  tty_put_text_at(uint16_t x, uint16_t y, const char *utf8, uint8_t attr);
 /* 批量绘制：成批写单元格时只做一次帧缓冲回写，降低全屏重绘开销 */
 void tty_begin_batch(void);
 void tty_end_batch(void);

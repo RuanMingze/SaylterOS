@@ -1,0 +1,180 @@
+// ============================================================
+// taskmgr.slyzcode - 任务管理器（SLYZ 独立应用）
+// ------------------------------------------------------------
+// 数据全部来自 os.info / os.proc / os.proc_name 三个系统调用：
+//   os.info(key)          内存、任务数、磁盘写入、开机时间、CPU
+//   os.proc(i, field)     单个任务的 pid/状态/步数/配额/占用
+//   os.proc_name(i)       任务名
+//
+// 与内置任务管理器相比，这一版不再链接内核内部结构体；
+// 数据接口变化只需要改内核宿主，界面逻辑仍在本文件。
+// ============================================================
+
+let cpu = 0
+let mem_total = 0
+let mem_used = 0
+let mem_peak = 0
+let tasks = 0
+let task_mem = 0
+let disk = 0
+let uptime = 0
+let slots = 4
+
+fn refresh() {
+    cpu = os.info(9)
+    mem_total = os.info(1)
+    mem_used = os.info(2)
+    mem_peak = os.info(3)
+    tasks = os.info(5)
+    task_mem = os.info(6)
+    disk = os.info(7)
+    uptime = os.info(8)
+    slots = os.info(10)
+}
+
+fn fmt_kb(v) {
+    if v >= 1024 {
+        return str(v / 1024) + " MB"
+    }
+    return str(v) + " KB"
+}
+
+fn fmt_bytes(v) {
+    if v >= 1048576 {
+        return str(v / 1048576) + " MB"
+    }
+    if v >= 1024 {
+        return str(v / 1024) + " KB"
+    }
+    return str(v) + " B"
+}
+
+fn fmt_uptime(ms) {
+    let s = ms / 1000
+    let m = s / 60
+    let h = m / 60
+    return str(h) + "h " + str(m % 60) + "m " + str(s % 60) + "s"
+}
+
+fn state_name(v) {
+    if v == 0 {
+        return "free"
+    }
+    if v == 1 {
+        return "ready"
+    }
+    if v == 2 {
+        return "running"
+    }
+    if v == 3 {
+        return "dead"
+    }
+    return "?"
+}
+
+fn bar(x, y, w, h, permille, color) {
+    gfx.rect(x, y, w, h, 0x1B2532)
+    let filled = w * permille / 1000
+    if filled > 0 {
+        gfx.rect(x, y, filled, h, color)
+    }
+    gfx.frame(x, y, w, h, 0x2B3949, 1)
+}
+
+fn bar_color(permille) {
+    if permille > 800 {
+        return 0xF87171
+    }
+    if permille > 500 {
+        return 0xFBBF24
+    }
+    return 0x34D399
+}
+
+fn draw_overview() {
+    // CPU
+    gfx.rect(24, 96, 460, 150, 0x141C27)
+    gfx.text(40, 108, "CPU", 0x8EA0B4)
+    gfx.text(40, 140, str(cpu / 10) + "%", 0xE9EFF7)
+    bar(40, 190, 428, 18, cpu, bar_color(cpu))
+    gfx.text(40, 218, "per-core average, 0..1000 permille", 0x5A6B7E)
+
+    // 内存
+    gfx.rect(500, 96, 496, 150, 0x141C27)
+    gfx.text(516, 108, "Memory", 0x8EA0B4)
+
+    let mem_pm = 0
+    if mem_total > 0 {
+        mem_pm = mem_used * 1000 / mem_total
+    }
+    gfx.text(516, 140, fmt_kb(mem_used) + " / " + fmt_kb(mem_total), 0xE9EFF7)
+    bar(516, 190, 464, 18, mem_pm, bar_color(mem_pm))
+    gfx.text(516, 218, "peak " + fmt_kb(mem_peak), 0x5A6B7E)
+
+    // 统计
+    gfx.rect(24, 262, 972, 48, 0x141C27)
+    gfx.text(40, 272, "Tasks " + str(tasks) + "/" + str(slots), 0x8EA0B4)
+    gfx.text(250, 272, "Task memory " + fmt_bytes(task_mem), 0x8EA0B4)
+    gfx.text(520, 272, "Disk " + fmt_bytes(disk), 0x8EA0B4)
+    gfx.text(760, 272, "Uptime " + fmt_uptime(uptime), 0x8EA0B4)
+}
+
+fn draw_processes() {
+    gfx.text(24, 328, "Processes", 0xE9EFF7)
+
+    gfx.rect(24, 364, 972, 36, 0x1B2532)
+    gfx.text(40, 370, "PID", 0x8EA0B4)
+    gfx.text(120, 370, "NAME", 0x8EA0B4)
+    gfx.text(480, 370, "STATE", 0x8EA0B4)
+    gfx.text(640, 370, "STEPS", 0x8EA0B4)
+    gfx.text(800, 370, "MEMORY", 0x8EA0B4)
+
+    let y = 404
+    for i in 0..slots {
+        let st = os.proc(i, 2)
+        if st > 0 {
+            let pid = os.proc(i, 1)
+            let name = os.proc_name(i)
+            let steps = os.proc(i, 3)
+            let used = os.proc(i, 5)
+
+            gfx.rect(24, y - 4, 972, 38, 0x101722)
+            gfx.text(40, y, str(pid), 0xE9EFF7)
+            gfx.text(120, y, name, 0xE9EFF7)
+            gfx.text(480, y, state_name(st), 0x34D399)
+            gfx.text(640, y, str(steps), 0x8EA0B4)
+            gfx.text(800, y, fmt_bytes(used), 0x8EA0B4)
+
+            y += 44
+        }
+    }
+}
+
+fn draw() {
+    gfx.clear(0x0B1017)
+
+    gfx.text(24, 16, "Task Manager", 0xE9EFF7)
+    gfx.text(24, 52, "Live counters refreshed every frame from the kernel.", 0x8EA0B4)
+
+    draw_overview()
+    draw_processes()
+
+    gfx.flush()
+}
+
+fn main() {
+    let handle = win.open("Task Manager", 1040, 700)
+    if handle < 0 {
+        return
+    }
+
+    while true {
+        refresh()
+        draw()
+
+        let ev = event.poll()
+        if ev != nil && ev.at(0) == 5 {
+            return
+        }
+    }
+}

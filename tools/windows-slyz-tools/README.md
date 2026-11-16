@@ -1,4 +1,8 @@
-# SLYZ Tools for Windows
+# SLYZ Tools for Windows（已废弃）
+
+> 这里的 `slyz_tool.c` 生成 **SLYZBIN v1**，内核 v2 虚拟机不再接受。
+> 现行工具链在 `tools/slyzc/`，语言参考见 `docs/slyz-reference.md`。
+> 保留本目录仅用于查看历史格式，不要再用它产出系统可执行文件。
 
 把 `.slyz` 源文件编译成 SaylterOS 内核可直接执行的 **SLYZBIN v1** 字节码镜像。
 
