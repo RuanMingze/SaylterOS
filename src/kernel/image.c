@@ -32,9 +32,11 @@
 #pragma pack(push, 1)
 struct ImageDirEntry {
     uint8_t  type;
-    uint8_t  name[52];
-    uint16_t start_cluster;
+    uint8_t  flags;
+    uint16_t name_len;
+    char     name[256];
     uint32_t size;
+    uint32_t start_lba;
     uint32_t created_ts;
     uint32_t modified_ts;
     uint16_t mode;

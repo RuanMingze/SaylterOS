@@ -42,6 +42,11 @@ static void host_tick(void) {
 
 static int g_logged_once[16];
 
+/* 命令行宿主上的 SylFault 配置影子：不写文件，但读写语义与内核一致，
+ * 让同一份 .slyzcode 在两个宿主上都能完整跑完界面流程。 */
+static int g_host_dump = 0;
+static int g_host_serial = 0;
+
 static void host_note_once(int slot, const char *text) {
     if (slot < 0 || slot >= 16) return;
     if (g_logged_once[slot]) return;
@@ -418,6 +423,78 @@ static int host_sys(struct SlyzVm *vm, uint16_t id,
             int64_t code = arg_int(args, argc, 0);
             slyzvm_request_exit(vm, (int)code);
             slyz_ret_nil(ret);
+            return 0;
+        }
+
+        /* 故障注入在命令行宿主上不执行：开发机不能被测试程序打崩。
+         * 配置读写仍然生效，这样 SylFault 的界面流程可以完整走通。 */
+        case SLE_SYS_FAULT_TRIGGER:
+            host_note_once(3, "fault.trigger is only available inside SaylterOS");
+            slyz_ret_int(ret, -1);
+            return 0;
+
+        case SLE_SYS_FAULT_DUMP:
+            host_note_once(4, "fault.dump needs the SaylterOS kernel heap and SlyzFS");
+            slyz_ret_int(ret, -1);
+            return 0;
+
+        case SLE_SYS_FAULT_LEAK:
+            host_note_once(5, "fault.leak only leaks inside the SaylterOS kernel");
+            slyz_ret_int(ret, 0);
+            return 0;
+
+        case SLE_SYS_FAULT_LEAK_FREE:
+            slyz_ret_int(ret, 0);
+            return 0;
+
+        case SLE_SYS_FAULT_SET: {
+            const char *key = arg_text(args, argc, 0, 0);
+            const char *value = arg_text(args, argc, 1, 0);
+            int flag = (value && (value[0] == '1' || value[0] == 'o' ||
+                                  value[0] == 't' || value[0] == 'y')) ? 1 : 0;
+            if (strcmp(key, "dump") == 0) {
+                g_host_dump = flag;
+                slyz_ret_int(ret, 0);
+                return 0;
+            }
+            if (strcmp(key, "serial_to_disk") == 0) {
+                g_host_serial = flag;
+                slyz_ret_int(ret, 0);
+                return 0;
+            }
+            slyz_ret_int(ret, -1);
+            return 0;
+        }
+
+        case SLE_SYS_FAULT_GET: {
+            const char *key = arg_text(args, argc, 0, 0);
+            const char *value = 0;
+            if (strcmp(key, "dump") == 0) value = g_host_dump ? "1" : "0";
+            else if (strcmp(key, "serial_to_disk") == 0) value = g_host_serial ? "1" : "0";
+            else if (strcmp(key, "leak_kb") == 0) value = "0";
+            if (!value) {
+                slyz_ret_int(ret, -1);
+                return 0;
+            }
+            if (!slyz_ret_str(vm, ret, value, (int)strlen(value))) return -1;
+            return 0;
+        }
+
+        case SLE_SYS_INPUT: {
+            const char *prompt = arg_text(args, argc, 0, 0);
+            char line[256];
+            if (prompt && *prompt) {
+                fputs(prompt, stdout);
+                fflush(stdout);
+            }
+            if (!fgets(line, (int)sizeof(line), stdin)) {
+                line[0] = '\0';
+            }
+            size_t len = strlen(line);
+            while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+                line[--len] = '\0';
+            }
+            if (!slyz_ret_str(vm, ret, line, (int)len)) return -1;
             return 0;
         }
 

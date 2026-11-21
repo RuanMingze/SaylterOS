@@ -64,6 +64,8 @@ PF_LAST_CR2     equ 0x7DD0
 PF_LAST_ERROR   equ 0x7DD8
 PF_LAST_RIP     equ 0x7DC8
 
+
+
 ; ============================================================
 ; 实模式入口
 ; ============================================================
@@ -117,6 +119,23 @@ pm_start:
     mov si, msg_vbe_fail
     call serial_puts16
 .vbe_done:
+
+    ; --- 用 BIOS INT 13h 把内核从 LBA19 搬到 0x100000 ---
+    ; 这样 U 盘 / SATA / NVMe（只要 BIOS/CSM 把它暴露成 INT 13h 盘）
+    ; 都能启动；不再依赖 0x1F0 的 ATA PIO。
+    call load_kernel_bios
+    jc .kernel_fail
+    mov si, msg_kernel_ok
+    call serial_puts16
+    jmp .kernel_done
+.kernel_fail:
+    mov si, msg_kernel_fail
+    call serial_puts16
+.halt_kernel:
+    cli
+    hlt
+    jmp .halt_kernel
+.kernel_done:
 
     ; --- 进入 32 位保护模式 ---
     lgdt [gdt_descriptor]
@@ -211,6 +230,154 @@ serial_puts16:
     ret
 
 ; ============================================================
+; BIOS INT 13h 把内核从 LBA19 搬到 0x100000
+; ------------------------------------------------------------
+; 每次读 64 扇区（32KB）到 0x1000:0000，然后进入 unreal mode
+; （设 PE -> 装载 4GB 平坦数据段 -> 清 PE，保留段描述符缓存），
+; 用 32 位 rep movsd 搬到目标物理地址。
+; 盘号取自 stage2 在 0x7DB0 保存的 BIOS 启动盘号，因此 U 盘、
+; SATA、以及与 CSM 映射为 INT 13h 盘的介质都能启动。
+; 出参：CF=0 成功 / CF=1 读盘失败
+; ============================================================
+load_kernel_bios:
+    ; VBE 调用可能留下非零 ES/DS，先强制归零
+    xor ax, ax
+    mov ds, ax
+    mov es, ax
+
+    pusha
+
+    mov si, msg_drv
+    call serial_puts16
+    mov al, [0x0500]
+    call serial_hex8_16
+    mov si, msg_crlf
+    call serial_puts16
+
+    mov eax, KERNEL_LBA
+    mov [bios_lba], eax
+    mov dword [bios_dst], KERNEL_ENTRY
+    mov word [bios_left], KERNEL_SECTORS
+
+    mov si, msg_load
+    call serial_puts16
+
+.next_chunk:
+    mov ax, [bios_left]
+    test ax, ax
+    jz .done
+
+    cmp ax, 64
+    jbe .count_ready
+    mov ax, 64
+.count_ready:
+    mov [bios_secs], ax
+    sub word [bios_left], ax
+
+    mov word [bios_dap + 2], ax
+    mov word [bios_dap + 4], 0
+    mov word [bios_dap + 6], 0x1000
+    mov eax, [bios_lba]
+    mov dword [bios_dap + 8], eax
+    mov dword [bios_dap + 12], 0
+
+    mov bp, 5
+.retry:
+    mov ah, 0x42
+    mov dl, [0x0500]
+    mov si, bios_dap
+    int 0x13
+    jnc .read_ok
+
+    mov [bios_err], ah
+    xor ah, ah
+    mov dl, [0x0500]
+    int 0x13
+    dec bp
+    jnz .retry
+    jmp .fail
+
+.read_ok:
+    call unreal_copy_high
+
+    movzx eax, word [bios_secs]
+    add dword [bios_lba], eax
+
+    movzx eax, word [bios_secs]
+    shl eax, 9
+    add dword [bios_dst], eax
+
+    jmp .next_chunk
+
+.done:
+    popa
+    clc
+    ret
+.fail:
+    mov si, msg_bios_err
+    call serial_puts16
+    mov al, [bios_err]
+    call serial_hex8_16
+    mov si, msg_crlf
+    call serial_puts16
+    popa
+    stc
+    ret
+
+; 16 位十六进制输出（AL）
+serial_hex8_16:
+    push ax
+    push bx
+    mov bl, al
+    shr al, 4
+    call .nibble
+    mov al, bl
+    and al, 0x0F
+    call .nibble
+    pop bx
+    pop ax
+    ret
+.nibble:
+    cmp al, 10
+    jb .digit
+    add al, 'A' - 10
+    jmp .out
+.digit:
+    add al, '0'
+.out:
+    call serial_putc16
+    ret
+
+; 建立 unreal mode，从 0x10000 拷贝 [bios_secs]*512 字节到 [bios_dst]
+unreal_copy_high:
+    movzx ecx, word [bios_secs]
+    shl ecx, 9
+    shr ecx, 2
+
+    lgdt [gdt_descriptor]
+    mov eax, cr0
+    or eax, 1
+    mov cr0, eax
+    jmp short $+2
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+
+    mov eax, cr0
+    and eax, 0xFFFFFFFE
+    mov cr0, eax
+    jmp 0:unreal_here
+unreal_here:
+    mov esi, 0x10000
+    mov edi, [bios_dst]
+    a32 rep movsd
+
+    xor ax, ax
+    mov ds, ax
+    mov es, ax
+    ret
+
+; ============================================================
 ; 32 位保护模式入口
 ; ============================================================
 [BITS 32]
@@ -226,29 +393,10 @@ pm_entry:
     mov esi, msg_pm32
     call serial_puts32
 
-    ; ---------- ATA PIO：把内核从 LBA19 搬到 0x100000 ----------
-    mov esi, msg_load
-    call serial_puts32
-
-    mov eax, KERNEL_LBA
-    mov ebp, KERNEL_SECTORS
-    mov edi, KERNEL_ENTRY
-    call ata_load_kernel32
-    jc .load_failed
-
+    ; 内核已在 16 位阶段由 BIOS INT 13h 加载到 0x100000
     mov esi, msg_loaded
     call serial_puts32
-    jmp .load_done
 
-.load_failed:
-    mov esi, msg_load_fail
-    call serial_puts32
-.halt_load:
-    cli
-    hlt
-    jmp .halt_load
-
-.load_done:
     call build_page_tables
 
     mov esi, msg_paging
@@ -278,130 +426,8 @@ pm_entry:
     dd long_mode_entry
     dw 0x0018
 
-; ============================================================
-; ATA PIO 读取内核镜像到指定物理地址
-; 入参：EAX = 起始 LBA，EBP = 扇区数，EDI = 目标物理地址
-; 出参：CF = 0 成功 / CF = 1 失败
-; 说明：只用主通道（0x1F0），28 位 LBA，PIO 单扇区读，
-;       与 SlyzFS 的磁盘访问方式一致（同一块 IDE 盘）。
-; 破坏：eax/ebx/ecx/edx/esi/edi/ebp
-; ============================================================
-ata_load_kernel32:
-    push eax
-    push ebx
-    push ecx
-    push edx
-    push esi
-    push edi
-
-    mov esi, eax                 ; ESI = 当前 LBA
-
-    ; 探测：主通道状态寄存器全 1 表示总线无设备
-    mov dx, 0x1F7
-    in al, dx
-    cmp al, 0xFF
-    je .fail
-
-.next_sector:
-    test ebp, ebp
-    jz .ok
-
-    ; 等 BSY 清除（轮询上限约 2M 次）
-    mov ecx, 0x200000
-.wait_bsy:
-    mov dx, 0x1F7
-    in al, dx
-    test al, 0x80
-    jz .bsy_clear
-    dec ecx
-    jnz .wait_bsy
-    jmp .fail
-.bsy_clear:
-
-    ; 驱动器/磁头：主盘 + LBA 高 4 位（0xE0 = LBA 模式）
-    mov ebx, esi
-    shr ebx, 24
-    and ebx, 0x0F
-    or ebx, 0xE0
-    mov dx, 0x1F6
-    mov al, bl
-    out dx, al
-
-    ; 扇区计数 = 1
-    mov dx, 0x1F2
-    mov al, 1
-    out dx, al
-
-    ; LBA[7:0]
-    mov ebx, esi
-    mov dx, 0x1F3
-    mov al, bl
-    out dx, al
-
-    ; LBA[15:8]
-    mov ebx, esi
-    shr ebx, 8
-    mov dx, 0x1F4
-    mov al, bl
-    out dx, al
-
-    ; LBA[23:16]
-    mov ebx, esi
-    shr ebx, 16
-    mov dx, 0x1F5
-    mov al, bl
-    out dx, al
-
-    ; READ SECTORS = 0x20
-    mov dx, 0x1F7
-    mov al, 0x20
-    out dx, al
-
-    ; 等 DRQ 置位
-    mov ecx, 0x200000
-.wait_drq:
-    mov dx, 0x1F7
-    in al, dx
-    test al, 0x80
-    jnz .drq_retry
-    test al, 0x08
-    jnz .drq_ready
-    test al, 0x01
-    jnz .fail
-.drq_retry:
-    dec ecx
-    jnz .wait_drq
-    jmp .fail
-
-.drq_ready:
-    ; rep insw 会自动推进 EDI（256 个 word = 512 字节）
-    mov ecx, 256
-    mov dx, 0x1F0
-    rep insw
-
-    inc esi
-    dec ebp
-    jmp .next_sector
-
-.ok:
-    pop edi
-    pop esi
-    pop edx
-    pop ecx
-    pop ebx
-    pop eax
-    clc
-    ret
-
-.fail:
-    pop edi
-    pop esi
-    pop edx
-    pop ecx
-    pop ebx
-    pop eax
-    stc
-    ret
+; 内核加载已移到 16 位阶段的 load_kernel_bios（BIOS INT 13h），
+; 不再使用 0x1F0 的 ATA PIO，因此 U 盘也能启动。
 
 ; ============================================================
 ; 建 4GB 恒等映射页表，2MB 大页
@@ -1022,25 +1048,45 @@ isr_sci:
 [BITS 16]
 
 vbe_init:
+    ; VBE 2.0+：控制块前 4 字节必须写 "VBE2"，否则部分 BIOS
+    ; （VMware / Phoenix）只返回 VBE 1.x 模式列表，看不到 LFB 模式。
+    mov dword [VBE_CTL_BUF], 0x32454256
+
+    xor ax, ax
+    mov es, ax
+
     mov ax, 0x4F00
     mov di, VBE_CTL_BUF
     int 0x10
     cmp ax, 0x004F
-    jne .vbe_fail
+    je .vbe_4f_ok
+    push ax
+    mov si, msg_vbe_4f_fail
+    call serial_puts16
+    pop ax
+    call serial_hex_ax16
+    mov si, msg_crlf
+    call serial_puts16
+    jmp .vbe_fail
+.vbe_4f_ok:
+    mov si, msg_vbe_4f_ok
+    call serial_puts16
 
     mov si, vbe_prefer
 .prefer_loop:
     mov ax, [si]                  ; 期望宽度（0 = 优先级表结束）
     test ax, ax
-    jz .vbe_fail
+    jz .fallback_start
     mov [vbe_want_w], ax
     mov ax, [si + 2]              ; 期望高度
     mov [vbe_want_h], ax
 
     xor bx, bx                    ; 模式列表字节偏移
 .mode_loop:
+    push es
     les di, [VBE_CTL_BUF + 0x0E]  ; VideoModePtr 在 0x0E
     mov dx, [es:di + bx]
+    pop es
     cmp dx, 0xFFFF
     je .next_pref
 
@@ -1107,6 +1153,90 @@ vbe_init:
     add si, 4
     jmp .prefer_loop
 
+; ---------- 兜底：优先表没有匹配时，选面积最大的 32bpp LFB 模式 ----------
+.fallback_start:
+    xor bx, bx
+    mov word [vbe_best_mode], 0xFFFF
+    mov dword [vbe_best_bytes], 0
+
+.fb_mode_loop:
+    push es
+    les di, [VBE_CTL_BUF + 0x0E]
+    mov dx, [es:di + bx]
+    pop es
+    cmp dx, 0xFFFF
+    je .fb_done
+
+    mov ax, 0x4F01
+    mov cx, dx
+    mov di, VBE_MODE_BUF
+    push bx
+    int 0x10
+    pop bx
+    cmp ax, 0x004F
+    jne .fb_next
+
+    test byte [VBE_MODE_BUF + 0x00], 0x80
+    jz .fb_next
+    cmp byte [VBE_MODE_BUF + 0x1B], 6
+    jne .fb_next
+    cmp byte [VBE_MODE_BUF + 0x19], 32
+    jne .fb_next
+
+    ; bytes = pitch * height，必须 <= 8MB（backbuffer 上限）
+    movzx eax, word [VBE_MODE_BUF + 0x10]
+    movzx ecx, word [VBE_MODE_BUF + 0x14]
+    imul eax, ecx
+    cmp eax, 8*1024*1024
+    ja .fb_next
+
+    cmp eax, [vbe_best_bytes]
+    jbe .fb_next
+    mov [vbe_best_bytes], eax
+    mov [vbe_best_mode], dx
+
+.fb_next:
+    add bx, 2
+    jmp .fb_mode_loop
+
+.fb_done:
+    mov dx, [vbe_best_mode]
+    cmp dx, 0xFFFF
+    jne .fb_set
+    mov si, msg_vbe_nomode
+    call serial_puts16
+    jmp .vbe_fail
+.fb_set:
+
+    push dx
+    mov bx, dx
+    or bx, 0x4000
+    mov ax, 0x4F02
+    int 0x10
+    pop dx
+    cmp ax, 0x004F
+    jne .vbe_fail
+
+    mov ax, 0x4F01
+    mov cx, dx
+    mov di, VBE_MODE_BUF
+    int 0x10
+    cmp ax, 0x004F
+    jne .vbe_fail
+
+    mov word [VBE_RESULT], 0xA1B2
+    mov eax, [VBE_MODE_BUF + 0x28]
+    mov [VBE_RESULT + 2], eax
+    mov ax, [VBE_MODE_BUF + 0x12]
+    mov [VBE_RESULT + 6], ax
+    mov ax, [VBE_MODE_BUF + 0x14]
+    mov [VBE_RESULT + 8], ax
+    mov al, [VBE_MODE_BUF + 0x19]
+    mov [VBE_RESULT + 10], al
+    mov ax, [VBE_MODE_BUF + 0x10]
+    mov [VBE_RESULT + 11], ax
+    ret
+
 .vbe_fail:
     mov word [VBE_RESULT], 0x0000          ; magic = fail
     ret
@@ -1122,6 +1252,37 @@ vbe_prefer:
     dw 0, 0
 vbe_want_w: dw 0
 vbe_want_h: dw 0
+vbe_best_mode:  dw 0xFFFF
+vbe_best_bytes: dd 0
+
+msg_vbe_4f_ok:   db '[PM] VBE 4F00 ok', 13, 10, 0
+msg_vbe_4f_fail: db '[PM] VBE 4F00 ax=', 0
+msg_vbe_nomode:  db '[PM] VBE no 32bpp LFB mode', 13, 10, 0
+
+; AX 的 4 位十六进制输出（16 位实模式串口）
+serial_hex_ax16:
+    push ax
+    push bx
+    push cx
+    mov bx, ax
+    mov cx, 4
+.hx_loop:
+    rol bx, 4
+    mov al, bl
+    and al, 0x0F
+    cmp al, 10
+    jb .hx_digit
+    add al, 'A' - 10
+    jmp .hx_out
+.hx_digit:
+    add al, '0'
+.hx_out:
+    call serial_putc16
+    loop .hx_loop
+    pop cx
+    pop bx
+    pop ax
+    ret
 
 ; ============================================================
 ; GDT
@@ -1220,15 +1381,37 @@ exc_table:
 msg_vbe_ok:   db '[PM] VBE mode set', 13, 10, 0
 msg_vbe_fail: db '[PM] VBE unavailable, text fallback', 13, 10, 0
 msg_pm32:     db '[PM] 32-bit protected mode', 13, 10, 0
-msg_load:     db '[PM] loading kernel via ATA PIO', 13, 10, 0
-msg_loaded:   db '[PM] kernel loaded at 0x100000', 13, 10, 0
-msg_load_fail: db '[PM] KERNEL LOAD FAILED (ATA PIO)', 13, 10, 0
+msg_load:       db '[PM] loading kernel via BIOS INT 13h', 13, 10, 0
+msg_loaded:     db '[PM] kernel loaded at 0x100000', 13, 10, 0
+msg_kernel_ok:  db '[PM] kernel transfer complete', 13, 10, 0
+msg_kernel_fail: db '[PM] KERNEL LOAD FAILED (INT 13h)', 13, 10, 0
+msg_drv:        db '[PM] boot drive=0x', 0
+msg_bios_err:   db '[PM] int13h AH=', 0
+msg_crlf:       db 13, 10, 0
 msg_paging:   db '[PM] page tables ready', 13, 10, 0
 msg_long:     db '[PM] 64-bit long mode', 13, 10, 0
 msg_idt:      db '[PM] 64-bit IDT loaded', 13, 10, 0
 msg_irq:      db '[PM] IRQ0/IRQ1/IRQ9 enabled', 13, 10, 0
 msg_exc:      db '[PM] EXCEPTION vector=0x', 0
 msg_pf:       db '[PM] PAGE FAULT cr2=', 0
+
+; ============================================================
+; BIOS 内核加载状态
+; ============================================================
+ALIGN 4
+bios_dap:
+    db 0x10
+    db 0x00
+    dw 0            ; 扇区数
+    dw 0            ; 目标偏移
+    dw 0x1000       ; 目标段
+    dq 0            ; LBA
+
+bios_lba:   dd 0
+bios_dst:   dd 0
+bios_left:  dw 0
+bios_secs:  dw 0
+bios_err:   db 0
 msg_pf_cr2:   db '0x', 0
 msg_pf_err:   db ' error=', 0
 msg_pf_rip:   db ' rip=', 0

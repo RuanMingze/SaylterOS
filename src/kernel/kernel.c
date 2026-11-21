@@ -10,7 +10,10 @@
 #include "acpi.h"
 #include "acpica_glue.h"
 #include "vbe.h"
+#include "gpu.h"
+#include "blk.h"
 #include "smp.h"
+#include "debug.h"
 
 /* linker.ld 定义的 BSS 边界 */
 extern char _bss_start[];
@@ -147,7 +150,14 @@ void kernel_main(void) {
      * 0x7DF0。tty_init 依据 framebuffer 尺寸与 16x32 字体算出字符行列。
      * VBE 不可用时 tty_init 自动回退到 80x25 文本模式。 */
     vbe_init();
+    /* GPU 探测必须在 tty 之前：LFB 要先标成写合并，否则后面
+     * 每一次上屏都是逐行 uncached 写。失败不影响启动。 */
+    gpu_init();
     tty_init();
+
+    /* 调试模式：在正常内核启动之前运行早期控制台。
+     * 此时 SlyzFS 尚未挂载；用户输入 next 后才继续下面的启动流程。 */
+    debug_early_console();
 
     /* --- 启动动画：C 内核加载中 --- */
     kernel_draw_logo();
@@ -185,6 +195,19 @@ void kernel_main(void) {
     }
 
     /* --- ACPI 与 AML 解释器已在启动画面播放期间初始化完成 --- */
+
+    /* --- GPU 2D 后端：GGTT / ring / 自测 ---
+     * 放在这里是因为它要用 kmalloc（堆已在 ACPI 初始化时建立）和
+     * printk（tty 已就绪）。硬件不存在或自测失败时 gpu_start 直接
+     * 返回 0，图形栈继续走原来的 CPU 路径。 */
+    gpu_start();
+
+    /* --- 块设备后端：USB xHCI MSC 优先，失败回退 ATA PIO ---
+     * 必须在 shell_main 之前完成：SlyzFS、auth、swap 都会在 shell
+     * 初始化阶段访问磁盘。 */
+    blk_init();
+    debug_storage_ready();
+    printk("[KERNEL] block device: %s\n", blk_backend());
 
     shell_main();
 

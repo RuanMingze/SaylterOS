@@ -1,0 +1,1757 @@
+# ============================================================
+# slyzfs2.slyz3 - SlyzFS v2（NTFS 风格、带日志的 64 位文件系统）
+# ------------------------------------------------------------
+# 由 slyz3c --baremetal 编译成 .slys，内核通过 slysfs.h 的 ABI
+# 调用。整个文件系统逻辑都在这里，没有任何 C/C++ 实现。
+#
+# 磁盘格式（卷内，簇号 64 位，簇大小 4096）：
+#   簇0        卷头 "SLYZVOL2"
+#   簇1..      簇位图（每 bit 一个簇）
+#   之后       环形日志（4MB 或按卷容量收缩）
+#   之后       MFT（4KB 记录，"FILE" + USA 防撕裂写）
+#   之后       数据区
+#
+# 属性：
+#   0x10 STD_INFO      常驻，时间 / 权限 / 所有者
+#   0x30 FILE_NAME     常驻，父目录 / 名字（<=255 字节 UTF-8）
+#   0x80 DATA          非常驻，区段表（最多 8 段）
+#   0x90 INDEX_ROOT    常驻，目录首索引块 LBA + 块数
+#
+# 日志：
+#   头扇区 "SLOG"，之后每条记录 9 个扇区（头 + 4KB 数据）。
+#   事务先写 PAGE 记录，再写 COMMIT 并 flush，之后才把页面
+#   落到最终位置；挂载时只重放带 COMMIT 的事务。
+# ============================================================
+
+# 卷上下文表：3 个卷 × 96 字节
+# +0 base(8) +8 cluster_sectors(4) +12 total_clusters(8) +20 mft_lba(8)
+# +28 mft_records(4) +32 mft_next(4) +36 bitmap_lba(8) +44 bitmap_sectors(4)
+# +48 log_lba(8) +56 log_sectors(4) +60 root_record(8) +68 mounted(4)
+# +72 log_records(4) +76 used(4) +80 hint(4) +84 bitmap_ptr(8)
+state V = 0
+state cur = 0
+state hdr = 0
+state bmp = 0
+state recbuf = 0
+state idxbuf = 0
+state auxbuf = 0
+state databuf = 0
+state secbuf = 0
+state jbuf = 0
+state jcount = 0
+state log_head = 0
+state log_seq = 1
+state scratch = 0
+state used_clusters = 0
+state alloc_hint = 0
+state htab = 0
+state g_ref = 0
+state g_lba = 0
+state g_count = 0
+
+# 上下文偏移
+# +0 base_lba(8) +8 cluster_sectors(4) +12 total_clusters(8) +20 mft_lba(8)
+# +28 mft_records(4) +32 mft_next(4) +36 bitmap_lba(8) +44 bitmap_sectors(4)
+# +48 log_lba(8) +56 log_sectors(4) +60 root_record(8) +68 mounted(4)
+# +72 log_records(4) +76 used(4) +80 hint(4) +84 bitmap_ptr(8)
+
+# ------------------------------------------------------------
+# 基础读写
+# ------------------------------------------------------------
+
+fn rd32(p, o) { return load32(p, o) }
+fn rd64(p, o) { return load64(p, o) }
+fn wr32(p, o, v) { store32(p, o, v) return 0 }
+fn wr64(p, o, v) { store64(p, o, v) return 0 }
+
+fn rd_sectors(lba, p, bytes) {
+    let s = 0
+    while s * 512 < bytes {
+        if disk.read(lba + s, p + s * 512) == 0 { return 0 }
+        s = s + 1
+    }
+    return 1
+}
+
+fn wr_sectors(lba, p, bytes) {
+    let s = 0
+    while s * 512 < bytes {
+        if disk.write(lba + s, p + s * 512) == 0 { return 0 }
+        s = s + 1
+    }
+    return 1
+}
+
+fn crc32(p, n) {
+    let c = 0xFFFFFFFF
+    let i = 0
+    while i < n {
+        c = (c ^ load8(p, i)) & 0xFFFFFFFF
+        let k = 0
+        while k < 8 {
+            if (c & 1) != 0 {
+                c = ((c >> 1) ^ 0xEDB88320) & 0xFFFFFFFF
+            } else {
+                c = (c >> 1) & 0x7FFFFFFF
+            }
+            k = k + 1
+        }
+        i = i + 1
+    }
+    return (c ^ 0xFFFFFFFF) & 0xFFFFFFFF
+}
+
+# USA：每个扇区末尾两字节替换成 USN，真实值存在记录头部的数组里。
+fn usa_apply(p) {
+    let off = load16(p, 4)
+    let cnt = load16(p, 6)
+    let usn = load16(p, off)
+    let i = 1
+    while i < cnt {
+        let pos = i * 512 - 2
+        store16(p, off + i * 2, load16(p, pos))
+        store16(p, pos, usn)
+        i = i + 1
+    }
+    return 1
+}
+
+fn usa_restore(p) {
+    let off = load16(p, 4)
+    let cnt = load16(p, 6)
+    let i = 1
+    while i < cnt {
+        let pos = i * 512 - 2
+        store16(p, pos, load16(p, off + i * 2))
+        i = i + 1
+    }
+    return 1
+}
+
+fn usa_valid(p) {
+    let off = load16(p, 4)
+    let cnt = load16(p, 6)
+    let usn = load16(p, off)
+    let i = 1
+    while i < cnt {
+        if load16(p, i * 512 - 2) != usn { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+# ------------------------------------------------------------
+# 卷上下文
+# ------------------------------------------------------------
+
+fn vp(v, off) { return load64(V, v * 96 + off) }
+fn vw(v, off) { return load32(V, v * 96 + off) }
+fn vsetp(v, off, val) { store64(V, v * 96 + off, val) return 0 }
+fn vsetw(v, off, val) { store32(V, v * 96 + off, val) return 0 }
+
+fn vbase(v) { return vp(v, 0) }
+fn vcsec(v) { return vw(v, 8) }
+fn vclusters(v) { return vp(v, 12) }
+fn vmft(v) { return vp(v, 20) }
+fn vmftrecs(v) { return vw(v, 28) }
+fn vmftnext(v) { return vw(v, 32) }
+fn vbitmap(v) { return vp(v, 36) }
+fn vbmps(v) { return vw(v, 44) }
+fn vlog(v) { return vp(v, 48) }
+fn vlogs(v) { return vw(v, 56) }
+fn vroot(v) { return vp(v, 60) }
+fn vmounted(v) { return vw(v, 68) }
+fn vlogrecs(v) { return vw(v, 72) }
+fn vused(v) { return vw(v, 76) }
+fn vhint(v) { return vw(v, 80) }
+fn vbmp(v) { return vp(v, 84) }
+fn vsetbmp(v, p) { store64(V, v * 96 + 84, p) return 0 }
+
+fn use_vol(v) {
+    if v > 2 { return 0 }
+    if vmounted(v) == 0 { return 0 }
+    cur = v
+    bmp = vbmp(v)
+    used_clusters = vused(v)
+    alloc_hint = vhint(v)
+    /* hdr 是全局缓冲区：切换卷时必须重新读卷头，否则 rec_alloc 之类
+     * 的元数据更新会把上一个卷的超级块写进当前卷。 */
+    if rd_sectors(vbase(v), hdr, 512) == 0 { return 0 }
+    return 1
+}
+
+fn sync_vol() {
+    vsetw(cur, 76, used_clusters)
+    vsetw(cur, 80, alloc_hint)
+    return 1
+}
+
+fn clba(v, c) { return vbase(v) + c * vcsec(v) }
+
+# ------------------------------------------------------------
+# 日志（redo + commit + checkpoint）
+# ------------------------------------------------------------
+
+# 把一次事务里的页面暂存起来。每页固定 4KB，最多 32 页。
+fn jstage(lba, p, bytes) {
+    if jcount >= 32 { return 0 }
+    let e = jbuf + jcount * 4112
+    store64(e, 0, lba)
+    store32(e, 8, bytes)
+    mem.copy(e + 16, p, bytes)
+    jcount = jcount + 1
+    return 1
+}
+
+fn jwrite_page(lba, p, bytes) {
+    let recs = vlogrecs(cur)
+    if recs == 0 { return 0 }
+    if log_head >= recs { log_head = 0 }
+    let base = vlog(cur) + 1 + log_head * 9
+
+    mem.zero(secbuf, 512)
+    store32(secbuf, 0, 0x4345524C)      # "SLREC"
+    store32(secbuf, 4, 1)               # PAGE
+    store64(secbuf, 8, lba)
+    store32(secbuf, 16, bytes)
+    store32(secbuf, 20, crc32(p, bytes))
+    store64(secbuf, 24, log_seq)
+    if disk.write(base, secbuf) == 0 { return 0 }
+
+    let s = 0
+    while s * 512 < bytes {
+        mem.zero(secbuf, 512)
+        let left = bytes - s * 512
+        let n = 512
+        if left < 512 { n = left }
+        mem.copy(secbuf, p + s * 512, n)
+        if disk.write(base + 1 + s, secbuf) == 0 { return 0 }
+        s = s + 1
+    }
+    log_head = log_head + 1
+    log_seq = log_seq + 1
+    return 1
+}
+
+fn jwrite_commit() {
+    let recs = vlogrecs(cur)
+    if recs == 0 { return 0 }
+    if log_head >= recs { log_head = 0 }
+    let base = vlog(cur) + 1 + log_head * 9
+    mem.zero(secbuf, 512)
+    store32(secbuf, 0, 0x4345524C)
+    store32(secbuf, 4, 2)               # COMMIT
+    store32(secbuf, 16, 0)
+    store64(secbuf, 24, log_seq)
+    if disk.write(base, secbuf) == 0 { return 0 }
+    log_head = log_head + 1
+    log_seq = log_seq + 1
+    return 1
+}
+
+fn log_write_header(checkpoint) {
+    mem.zero(secbuf, 512)
+    store32(secbuf, 0, 0x474F4C53)      # "SLOG"
+    store32(secbuf, 4, 2)
+    store32(secbuf, 8, log_head)
+    store32(secbuf, 12, checkpoint)
+    store64(secbuf, 16, log_seq)
+    store32(secbuf, 28, crc32(secbuf, 28))
+    disk.write(vlog(cur), secbuf)
+    return 1
+}
+
+# 提交：日志 PAGE -> COMMIT -> flush -> 落到最终位置 -> flush -> checkpoint
+fn jcommit() {
+    if jcount == 0 { return 1 }
+    let i = 0
+    while i < jcount {
+        let e = jbuf + i * 4112
+        if jwrite_page(load64(e, 0), e + 16, load32(e, 8)) == 0 { return 0 }
+        i = i + 1
+    }
+    if jwrite_commit() == 0 { return 0 }
+    if disk.flush() == 0 { return 0 }
+
+    i = 0
+    while i < jcount {
+        let e = jbuf + i * 4112
+        if wr_sectors(load64(e, 0), e + 16, load32(e, 8)) == 0 { return 0 }
+        i = i + 1
+    }
+    if disk.flush() == 0 { return 0 }
+
+    log_write_header(log_head)
+    disk.flush()
+    jcount = 0
+    return 1
+}
+
+# 挂载时重放：只有看到 COMMIT 的事务才应用。
+fn jreplay(v) {
+    if vlogs(v) == 0 { return 1 }
+    if rd_sectors(vlog(v), secbuf, 512) == 0 { return 1 }
+    if load32(secbuf, 0) != 0x474F4C53 { return 1 }
+    let head = load32(secbuf, 8)
+    let ckpt = load32(secbuf, 12)
+    let recs = vlogrecs(v)
+    if recs == 0 { return 1 }
+    if head > recs { head = recs }
+    if ckpt > head { ckpt = head }
+
+    jcount = 0
+    let idx = ckpt
+    while idx < head {
+        let base = vlog(v) + 1 + idx * 9
+        if rd_sectors(base, secbuf, 512) == 0 { break }
+        if load32(secbuf, 0) != 0x4345524C { break }
+        let typ = load32(secbuf, 4)
+        if typ == 1 {
+            let lba = load64(secbuf, 8)
+            let bytes = load32(secbuf, 16)
+            let p = jbuf + jcount * 4112
+            if jcount < 32 {
+                store64(p, 0, lba)
+                store32(p, 8, bytes)
+                rd_sectors(base + 1, p + 16, bytes)
+                jcount = jcount + 1
+            }
+        } else if typ == 2 {
+            let i = 0
+            while i < jcount {
+                let e = jbuf + i * 4112
+                wr_sectors(load64(e, 0), e + 16, load32(e, 8))
+                i = i + 1
+            }
+            disk.flush()
+            jcount = 0
+        }
+        idx = idx + 1
+    }
+    log_head = head
+    log_seq = load64(secbuf, 16)
+    if log_seq == 0 { log_seq = 1 }
+    jcount = 0
+    return 1
+}
+
+# ------------------------------------------------------------
+# 位图
+# ------------------------------------------------------------
+
+fn bit_get(c) {
+    let byte = load8(bmp, c >> 3)
+    return (byte >> (c & 7)) & 1
+}
+
+fn bit_set(c, val) {
+    let bo = c >> 3
+    let byte = load8(bmp, bo)
+    let m = 1 << (c & 7)
+    if val != 0 { byte = byte | m } else { byte = byte & (255 - m) }
+    store8(bmp, bo, byte)
+    return 1
+}
+
+/* 把一段簇的位图扇区提交到日志。按位逐次 jstage 会让一次大分配
+ * 产生成千上万个暂存页，撑爆事务缓冲；这里按扇区去重。 */
+fn bit_stage_range(first, n) {
+    if n <= 0 { return 1 }
+    let s0 = (first >> 3) >> 9
+    let s1 = ((first + n - 1) >> 3) >> 9
+    let s = s0
+    while s <= s1 {
+        jstage(vbitmap(cur) + s, bmp + s * 512, 512)
+        s = s + 1
+    }
+    return 1
+}
+
+# 分配连续 n 个簇。返回起始簇号；失败返回 0 - 1。
+fn alloc_run(n) {
+    let total = vclusters(cur)
+    let first = alloc_hint
+    if first < 8 { first = 8 }
+    let c = first
+    let scanned = 0
+    while scanned < total {
+        if c >= total { c = 8 }
+        if bit_get(c) == 0 {
+            let ok = 1
+            let i = 0
+            while i < n {
+                if c + i >= total { ok = 0 break }
+                if bit_get(c + i) != 0 { ok = 0 break }
+                i = i + 1
+            }
+            if ok != 0 {
+                i = 0
+                while i < n {
+                    bit_set(c + i, 1)
+                    i = i + 1
+                }
+                used_clusters = used_clusters + n
+                alloc_hint = c + n
+                bit_stage_range(c, n)
+                return c
+            }
+        }
+        c = c + 1
+        scanned = scanned + 1
+    }
+    return 0 - 1
+}
+
+fn free_run(first, n) {
+    let i = 0
+    while i < n {
+        bit_set(first + i, 0)
+        i = i + 1
+    }
+    if used_clusters >= n { used_clusters = used_clusters - n }
+    if first < alloc_hint { alloc_hint = first }
+    bit_stage_range(first, n)
+    return 1
+}
+
+# ------------------------------------------------------------
+# MFT 记录
+# ------------------------------------------------------------
+
+fn rec_lba(idx) { return vmft(cur) + idx * 8 }
+
+fn rec_read(idx) {
+    if idx >= vmftrecs(cur) { return 0 }
+    if rd_sectors(rec_lba(idx), recbuf, 4096) == 0 { return 0 }
+    if load32(recbuf, 0) != 0x454C4946 { return 0 }
+    if usa_valid(recbuf) == 0 { return 0 }
+    return 1
+}
+
+fn rec_store(idx) {
+    usa_apply(recbuf)
+    let ok = jstage(rec_lba(idx), recbuf, 4096)
+    usa_restore(recbuf)
+    return ok
+}
+
+fn rec_inuse(idx) {
+    if rec_read(idx) == 0 { return 0 }
+    return (load16(recbuf, 22) & 1)
+}
+
+fn rec_alloc() {
+    let total = vmftrecs(cur)
+    let first = vmftnext(cur)
+    if first < 16 { first = 16 }
+    let i = first
+    let scanned = 0
+    while scanned < total {
+        if i >= total { i = 16 }
+        if rec_inuse(i) == 0 {
+            vsetw(cur, 32, i + 1)
+            store32(hdr, 36, i + 1)
+            /* 卷头被修改，必须重算 CRC，否则下次挂载会判定卷损坏。 */
+            store32(hdr, 152, crc32(hdr, 152))
+            jstage(vbase(cur), hdr, 512)
+            return i
+        }
+        i = i + 1
+        scanned = scanned + 1
+    }
+    return 0 - 1
+}
+
+fn rec_init(idx, flags, parent) {
+    mem.zero(recbuf, 4096)
+    store32(recbuf, 0, 0x454C4946)      # "FILE"
+    store16(recbuf, 4, 48)              # usa offset
+    store16(recbuf, 6, 9)               # 8 个扇区 + USN
+    store16(recbuf, 16, 1)              # sequence = 1
+    store16(recbuf, 18, 1)              # link count
+    store16(recbuf, 20, 72)             # attrs offset
+    store16(recbuf, 22, flags)
+    store32(recbuf, 24, 72)             # used
+    store32(recbuf, 28, 4096)           # alloc
+    store64(recbuf, 32, parent)
+    store16(recbuf, 40, 1)
+    store32(recbuf, 44, idx)
+    store16(recbuf, 48, 0x4D55)         # USN
+    return 1
+}
+
+# 在记录里追加一个常驻属性，返回属性偏移。
+fn attr_add_resident(type, value_len, value_off) {
+    let used = load32(recbuf, 24)
+    if used + value_off + value_len > 4096 { return 0 }
+    let off = used
+    store32(recbuf, off, type)
+    store32(recbuf, off + 4, value_off + value_len)
+    store8(recbuf, off + 8, 0)
+    store8(recbuf, off + 9, 0)
+    store16(recbuf, off + 10, 0)
+    store16(recbuf, off + 12, 0)
+    store16(recbuf, off + 14, load16(recbuf, 40))
+    store16(recbuf, 40, load16(recbuf, 40) + 1)
+    if value_off >= 24 {
+        store32(recbuf, off + 16, value_len)
+        store16(recbuf, off + 20, value_off)
+    }
+    store32(recbuf, 24, off + value_off + value_len)
+    return off
+}
+
+fn attr_add_data() {
+    let used = load32(recbuf, 24)
+    if used + 64 > 4096 { return 0 }
+    let off = used
+    store32(recbuf, off, 0x80)
+    store32(recbuf, off + 4, 64)
+    store8(recbuf, off + 8, 1)
+    store8(recbuf, off + 9, 0)
+    store16(recbuf, off + 10, 0)
+    store16(recbuf, off + 12, 0)
+    store16(recbuf, off + 14, 2)
+    store64(recbuf, off + 16, 0)
+    store64(recbuf, off + 24, 0)
+    store32(recbuf, off + 32, 0)
+    store32(recbuf, off + 36, 0)
+    store64(recbuf, off + 40, 0)
+    store64(recbuf, off + 48, 0)
+    store64(recbuf, off + 56, 0)
+    store32(recbuf, 24, off + 64)
+    return off
+}
+
+fn attr_find(type) {
+    let off = load16(recbuf, 20)
+    let guard = 0
+    while guard < 64 {
+        let t = load32(recbuf, off)
+        if t == 0xFFFFFFFF { return 0 }
+        if t == type { return off }
+        let len = load32(recbuf, off + 4)
+        if len < 16 { return 0 }
+        off = off + len
+        guard = guard + 1
+    }
+    return 0
+}
+
+fn data_attr() { return attr_find(0x80) }
+fn index_root_attr() { return attr_find(0x90) }
+
+fn ext_count(off) { return load32(recbuf, off + 32) }
+fn ext_lba(off, i) { return load64(recbuf, off + 64 + i * 16) }
+fn ext_clusters(off, i) { return load32(recbuf, off + 72 + i * 16) }
+
+fn data_size(off) { return load64(recbuf, off + 48) }
+fn data_set_size(off, v) { store64(recbuf, off + 48, v) }
+
+fn data_map(off, pos) {
+    let e = 0
+    let base = 0
+    let cnt = ext_count(off)
+    while e < cnt {
+        let bytes = ext_clusters(off, e) * 4096
+        if pos >= base && pos < base + bytes {
+            return ext_lba(off, e) * 512 + (pos - base)
+        }
+        base = base + bytes
+        e = e + 1
+    }
+    return 0 - 1
+}
+
+fn data_append(off, clusters) {
+    let cnt = ext_count(off)
+    if cnt >= 8 { return 0 }
+    let c = alloc_run(clusters)
+    if c < 0 { return 0 }
+    let lba = clba(cur, c)
+    if cnt > 0 {
+        let last = cnt - 1
+        let lend = ext_lba(off, last) + ext_clusters(off, last) * vcsec(cur)
+        if lend == lba {
+            store32(recbuf, off + 72 + last * 16, ext_clusters(off, last) + clusters)
+            store64(recbuf, off + 40, load64(recbuf, off + 40) + clusters * 4096)
+            return 1
+        }
+    }
+    store64(recbuf, off + 64 + cnt * 16, lba)
+    store32(recbuf, off + 72 + cnt * 16, clusters)
+    store32(recbuf, off + 32, cnt + 1)
+    store32(recbuf, off + 4, 64 + (cnt + 1) * 16)
+    store32(recbuf, 24, load32(recbuf, 24) + 16)
+    store64(recbuf, off + 40, load64(recbuf, off + 40) + clusters * 4096)
+    return 1
+}
+
+# ------------------------------------------------------------
+# 目录索引块
+# ------------------------------------------------------------
+
+fn name_eq(p, poff, np, nlen) {
+    /* 名字长度由索引条目的 nlen 字段精确给出，调用方也已校验长度相等。
+     * 这里只比较 nlen 个字节（大小写不敏感）。
+     *
+     * 不能额外要求 poff+nlen 处为 0：条目按 8 字节对齐紧排，当名字长度
+     * 恰好让 (16+nlen) 对齐到 8 时（例如 8 字节目录名），名字后面紧跟
+     * 下一个条目的记录号低字节，该字节通常非 0，会把合法条目判成不存在。
+     * 这正是 C:\Programs 在根目录已有 system 时 stat/open 失败的原因。 */
+    let i = 0
+    while i < nlen {
+        let a = load8(p, poff + i)
+        let b = load8(np, i)
+        if a >= 65 && a <= 90 { a = a + 32 }
+        if b >= 65 && b <= 90 { b = b + 32 }
+        if a != b { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+fn idx_init(lba) {
+    mem.zero(idxbuf, 4096)
+    store32(idxbuf, 0, 0x58444E49)      # "INDX"
+    store16(idxbuf, 4, 40)
+    store16(idxbuf, 6, 9)
+    store64(idxbuf, 16, 0)
+    store32(idxbuf, 24, 0)
+    store32(idxbuf, 28, 64)
+    store16(idxbuf, 40, 0x4D55)
+    return wr_sectors(lba, idxbuf, 4096)
+}
+
+fn entry_len(nlen) { return (16 + nlen + 7) & (0 - 8) }
+
+fn dir_lookup(dir, np, nlen) {
+    if rec_read(dir) == 0 { return 0 }
+    let root = index_root_attr()
+    if root == 0 { return 0 }
+    let blk = load64(recbuf, root + 24)
+    while blk != 0 {
+        if rd_sectors(blk, idxbuf, 4096) == 0 { return 0 }
+        if load32(idxbuf, 0) != 0x58444E49 { return 0 }
+        let cnt = load32(idxbuf, 24)
+        let eoff = 64
+        let i = 0
+        while i < cnt {
+            let nl = load16(idxbuf, eoff + 6)
+            if nl == nlen {
+                if name_eq(idxbuf, eoff + 16, np, nlen) != 0 {
+                    return load32(idxbuf, eoff)
+                }
+            }
+            eoff = eoff + load16(idxbuf, eoff + 8)
+            i = i + 1
+        }
+        blk = load64(idxbuf, 16)
+    }
+    return 0
+}
+
+fn idx_has_room(lba, need) {
+    if rd_sectors(lba, idxbuf, 4096) == 0 { return 0 }
+    return load32(idxbuf, 28) + need <= 4096
+}
+
+fn idx_insert_into(dir, lba, np, nlen, ref, flags) {
+    if rd_sectors(lba, idxbuf, 4096) == 0 { return 0 }
+    let cnt = load32(idxbuf, 24)
+    let need = entry_len(nlen)
+    if load32(idxbuf, 28) + need > 4096 { return 0 }
+
+    mem.zero(auxbuf, 4096)
+    mem.copy(auxbuf, idxbuf, 64)
+    let src = 64
+    let dst = 64
+    let placed = 0
+    let i = 0
+    while i < cnt {
+        let el = load16(idxbuf, src + 8)
+        if placed == 0 {
+            let cmp = 0
+            let a = load16(idxbuf, src + 6)
+            let k = 0
+            while k < a && k < nlen {
+                let ca = load8(idxbuf, src + 16 + k)
+                let cb = load8(np, k)
+                if ca >= 65 && ca <= 90 { ca = ca + 32 }
+                if cb >= 65 && cb <= 90 { cb = cb + 32 }
+                if ca != cb { cmp = 1 if ca < cb { cmp = 0 - 1 } break }
+                k = k + 1
+            }
+            if cmp == 0 {
+                if a < nlen { cmp = 0 - 1 }
+                if a > nlen { cmp = 1 }
+            }
+            if cmp > 0 {
+                store32(auxbuf, dst, ref)
+                store16(auxbuf, dst + 4, flags)
+                store16(auxbuf, dst + 6, nlen)
+                store16(auxbuf, dst + 8, need)
+                mem.copy(auxbuf + dst + 16, np, nlen)
+                dst = dst + need
+                placed = 1
+            }
+        }
+        mem.copy(auxbuf + dst, idxbuf + src, el)
+        dst = dst + el
+        src = src + el
+        i = i + 1
+    }
+    if placed == 0 {
+        store32(auxbuf, dst, ref)
+        store16(auxbuf, dst + 4, flags)
+        store16(auxbuf, dst + 6, nlen)
+        store16(auxbuf, dst + 8, need)
+        mem.copy(auxbuf + dst + 16, np, nlen)
+        dst = dst + need
+    }
+    store32(auxbuf, 24, cnt + 1)
+    store32(auxbuf, 28, dst)
+    mem.copy(idxbuf, auxbuf, 4096)
+    return jstage(lba, idxbuf, 4096)
+}
+
+fn dir_insert(dir, np, nlen, ref, flags) {
+    if rec_read(dir) == 0 { return 0 }
+    let root = index_root_attr()
+    if root == 0 { return 0 }
+    let blk = load64(recbuf, root + 24)
+    let blocks = load32(recbuf, root + 32)
+    if blk == 0 {
+        let c = alloc_run(1)
+        if c < 0 { return 0 }
+        blk = clba(cur, c)
+        idx_init(blk)
+        store64(recbuf, root + 24, blk)
+        store32(recbuf, root + 32, 1)
+        rec_store(dir)
+    }
+    let need = entry_len(nlen)
+    let probe = blk
+    let last = blk
+    while probe != 0 {
+        if idx_has_room(probe, need) != 0 {
+            return idx_insert_into(dir, probe, np, nlen, ref, flags)
+        }
+        last = probe
+        if rd_sectors(probe, idxbuf, 4096) == 0 { return 0 }
+        probe = load64(idxbuf, 16)
+    }
+
+    let c = alloc_run(1)
+    if c < 0 { return 0 }
+    let nb = clba(cur, c)
+    if idx_init(nb) == 0 { return 0 }
+    if rd_sectors(last, idxbuf, 4096) == 0 { return 0 }
+    store64(idxbuf, 16, nb)
+    jstage(last, idxbuf, 4096)
+
+    rec_read(dir)
+    root = index_root_attr()
+    store32(recbuf, root + 32, blocks + 1)
+    rec_store(dir)
+    return idx_insert_into(dir, nb, np, nlen, ref, flags)
+}
+
+fn idx_remove_from(dir, lba, np, nlen) {
+    if rd_sectors(lba, idxbuf, 4096) == 0 { return 0 }
+    let cnt = load32(idxbuf, 24)
+    mem.zero(auxbuf, 4096)
+    mem.copy(auxbuf, idxbuf, 64)
+    let src = 64
+    let dst = 64
+    let removed = 0
+    let i = 0
+    while i < cnt {
+        let el = load16(idxbuf, src + 8)
+        let nl = load16(idxbuf, src + 6)
+        let hit = 0
+        if nl == nlen && name_eq(idxbuf, src + 16, np, nlen) != 0 { hit = 1 }
+        if hit == 0 {
+            mem.copy(auxbuf + dst, idxbuf + src, el)
+            dst = dst + el
+        } else {
+            removed = 1
+        }
+        src = src + el
+        i = i + 1
+    }
+    if removed == 0 { return 0 }
+    store32(auxbuf, 24, cnt - 1)
+    store32(auxbuf, 28, dst)
+    mem.copy(idxbuf, auxbuf, 4096)
+    return jstage(lba, idxbuf, 4096)
+}
+
+fn dir_remove(dir, np, nlen) {
+    if rec_read(dir) == 0 { return 0 }
+    let root = index_root_attr()
+    if root == 0 { return 0 }
+    let blk = load64(recbuf, root + 24)
+    while blk != 0 {
+        let r = idx_remove_from(dir, blk, np, nlen)
+        if r != 0 { return 1 }
+        if rd_sectors(blk, idxbuf, 4096) == 0 { return 0 }
+        blk = load64(idxbuf, 16)
+    }
+    return 0
+}
+
+# ------------------------------------------------------------
+# 路径
+# ------------------------------------------------------------
+
+state seg_start = 0
+state seg_len = 0
+
+fn path_seg(path, pos) {
+    let p = pos
+    while load8(path, p) == 92 || load8(path, p) == 47 { p = p + 1 }
+    seg_start = p
+    while load8(path, p) != 0 {
+        let c = load8(path, p)
+        if c == 92 || c == 47 { break }
+        p = p + 1
+    }
+    seg_len = p - seg_start
+    if load8(path, p) != 0 { p = p + 1 }
+    return p
+}
+
+fn has_more(path, pos) {
+    let p = pos
+    while load8(path, p) == 92 || load8(path, p) == 47 { p = p + 1 }
+    return load8(path, p) != 0
+}
+
+fn resolve(path) {
+    let rec = vroot(cur)
+    let pos = 0
+    while 1 {
+        let next = path_seg(path, pos)
+        if seg_len == 0 { return rec }
+        let ref = dir_lookup(rec, path + seg_start, seg_len)
+        if ref == 0 { return 0 - 1 }
+        if has_more(path, next) == 0 { return ref }
+        rec = ref
+        pos = next
+    }
+    return 0 - 1
+}
+
+# 返回父目录记录；最后一个路径组件留在 seg_start/seg_len。
+fn resolve_parent(path) {
+    let rec = vroot(cur)
+    let pos = 0
+    while 1 {
+        let next = path_seg(path, pos)
+        if seg_len == 0 { return rec }
+        if has_more(path, next) == 0 { return rec }
+        let ref = dir_lookup(rec, path + seg_start, seg_len)
+        if ref == 0 { return 0 - 1 }
+        rec = ref
+        pos = next
+    }
+    return 0 - 1
+}
+
+# ------------------------------------------------------------
+# 记录创建
+# ------------------------------------------------------------
+
+fn rec_build(idx, flags, parent, np, nlen, is_dir) {
+    rec_init(idx, flags, parent)
+
+    let a = attr_add_resident(0x10, 48, 24)
+    if a == 0 { return 0 }
+    store64(recbuf, a + 24, 0)
+    store64(recbuf, a + 32, 0)
+    store64(recbuf, a + 40, 0)
+    store32(recbuf, a + 48, 420)
+    store32(recbuf, a + 52, 0)
+    store32(recbuf, a + 56, 0)
+    store32(recbuf, a + 60, 0)
+
+    let f = attr_add_resident(0x30, 24 + nlen, 24)
+    if f == 0 { return 0 }
+    store64(recbuf, f + 24, parent)
+    store16(recbuf, f + 32, nlen)
+    store16(recbuf, f + 34, 0)
+    store32(recbuf, f + 36, 0)
+    store32(recbuf, f + 40, 0)
+    store16(recbuf, f + 44, 420)
+    store8(recbuf, f + 46, 0)
+    store8(recbuf, f + 47, 0)
+    mem.copy(recbuf + f + 48, np, nlen)
+
+    if is_dir != 0 {
+        let c = alloc_run(1)
+        if c < 0 { return 0 }
+        let lba = clba(cur, c)
+        if idx_init(lba) == 0 { return 0 }
+        let r = attr_add_resident(0x90, 16, 24)
+        if r == 0 { return 0 }
+        store64(recbuf, r + 24, lba)
+        store32(recbuf, r + 32, 1)
+        store32(recbuf, r + 36, 0)
+    } else {
+        if attr_add_data() == 0 { return 0 }
+    }
+    return 1
+}
+
+fn rec_create(parent, np, nlen, is_dir) {
+    let idx = rec_alloc()
+    if idx < 0 { return 0 - 1 }
+    let flags = 1
+    if is_dir != 0 { flags = 3 }
+    if rec_build(idx, flags, parent, np, nlen, is_dir) == 0 { return 0 - 1 }
+    if rec_store(idx) == 0 { return 0 - 1 }
+    if dir_insert(parent, np, nlen, idx, is_dir) == 0 { return 0 - 1 }
+    return idx
+}
+
+fn rec_destroy(idx) {
+    if rec_read(idx) == 0 { return 0 }
+    let d = data_attr()
+    if d != 0 {
+        let cnt = ext_count(d)
+        let i = 0
+        while i < cnt {
+            free_run((ext_lba(d, i) - vbase(cur)) / vcsec(cur), ext_clusters(d, i))
+            i = i + 1
+        }
+    }
+    store16(recbuf, 22, 0)
+    store32(recbuf, 24, 72)
+    return rec_store(idx)
+}
+
+# ------------------------------------------------------------
+# 文件数据读写
+# ------------------------------------------------------------
+
+fn wr_bytes(lba, off, p, n) {
+    while n > 0 {
+        let sec = off >> 9
+        let so = off & 511
+        if so == 0 && n >= 512 {
+            if disk.write(lba + sec, p) == 0 { return 0 }
+            p = p + 512
+            off = off + 512
+            n = n - 512
+        } else {
+            if disk.read(lba + sec, secbuf) == 0 { return 0 }
+            let take = 512 - so
+            if take > n { take = n }
+            mem.copy(secbuf + so, p, take)
+            if disk.write(lba + sec, secbuf) == 0 { return 0 }
+            p = p + take
+            off = off + take
+            n = n - take
+        }
+    }
+    return 1
+}
+
+fn rd_bytes(lba, off, p, n) {
+    while n > 0 {
+        let sec = off >> 9
+        let so = off & 511
+        if so == 0 && n >= 512 {
+            if disk.read(lba + sec, p) == 0 { return 0 }
+            p = p + 512
+            off = off + 512
+            n = n - 512
+        } else {
+            if disk.read(lba + sec, secbuf) == 0 { return 0 }
+            let take = 512 - so
+            if take > n { take = n }
+            mem.copy(p, secbuf + so, take)
+            p = p + take
+            off = off + take
+            n = n - take
+        }
+    }
+    return 1
+}
+
+fn file_write(idx, pos, p, n) {
+    if rec_read(idx) == 0 { return 0 }
+    let d = data_attr()
+    if d == 0 {
+        d = attr_add_data()
+        if d == 0 { return 0 }
+    }
+    let size = data_size(d)
+    let need = pos + n
+    let allocated = load64(recbuf, d + 40)
+    if need > allocated {
+        let more = need - allocated
+        let cl = (more + 4095) / 4096
+        if data_append(d, cl) == 0 { return 0 }
+        d = data_attr()
+    }
+
+    let left = n
+    let curpos = pos
+    while left > 0 {
+        let base = 0
+        let e = 0
+        let cnt = ext_count(d)
+        let found = 0
+        while e < cnt {
+            let bytes = ext_clusters(d, e) * 4096
+            if curpos >= base && curpos < base + bytes {
+                found = 1
+                let chunk = base + bytes - curpos
+                if chunk > left { chunk = left }
+                let sec = ext_lba(d, e) + (curpos - base) / 512
+                let off = (curpos - base) % 512
+                if wr_bytes(sec, off, p, chunk) == 0 { return 0 }
+                p = p + chunk
+                curpos = curpos + chunk
+                left = left - chunk
+                break
+            }
+            base = base + bytes
+            e = e + 1
+        }
+        if found == 0 { return 0 }
+    }
+
+    if need > size { data_set_size(d, need) }
+    disk.flush()
+    rec_store(idx)
+    jcommit()
+    return n
+}
+
+fn file_read(idx, pos, p, n) {
+    if rec_read(idx) == 0 { return 0 }
+    let d = data_attr()
+    if d == 0 { return 0 }
+    let size = data_size(d)
+    if pos >= size { return 0 }
+    let left = n
+    if pos + left > size { left = size - pos }
+
+    let done = 0
+    let curpos = pos
+    while left > 0 {
+        let base = 0
+        let e = 0
+        let cnt = ext_count(d)
+        let found = 0
+        while e < cnt {
+            let bytes = ext_clusters(d, e) * 4096
+            if curpos >= base && curpos < base + bytes {
+                found = 1
+                let chunk = base + bytes - curpos
+                if chunk > left { chunk = left }
+                let sec = ext_lba(d, e) + (curpos - base) / 512
+                let off = (curpos - base) % 512
+                if rd_bytes(sec, off, p, chunk) == 0 { return done }
+                p = p + chunk
+                curpos = curpos + chunk
+                left = left - chunk
+                done = done + chunk
+                break
+            }
+            base = base + bytes
+            e = e + 1
+        }
+        if found == 0 { break }
+    }
+    return done
+}
+
+# ------------------------------------------------------------
+# 格式化
+# ------------------------------------------------------------
+
+fn put_label(p, s, cap) {
+    let i = 0
+    while i + 1 < cap && load8(s, i) != 0 {
+        store8(p, i, load8(s, i))
+        i = i + 1
+    }
+    store8(p, i, 0)
+    return i
+}
+
+fn vol_format(v, base, sectors, label) {
+    let csec = 8
+    let total = sectors / csec
+    if total < 256 { return 0 }
+
+    let bmps = ((total + 7) / 8 + 511) / 512
+    let logc = total / 16
+    if logc > 1024 { logc = 1024 }
+    if logc < 16 { logc = 16 }
+    let mftrecs = total / 128
+    if mftrecs < 256 { mftrecs = 256 }
+    if mftrecs > 32768 { mftrecs = 32768 }
+    let mftcl = (mftrecs * 8 + csec - 1) / csec
+
+    let bmp_start = 1
+    let log_start = bmp_start + ((bmps * 512 + 4095) / 4096)
+    let mft_start = log_start + logc
+    let meta = mft_start + mftcl
+    if meta + 64 >= total { return 0 }
+
+    mem.zero(hdr, 512)
+    store64(hdr, 0, 0x324C4F565A594C53)
+    store16(hdr, 8, 2)
+    store16(hdr, 10, 512)
+    store32(hdr, 12, 4096)
+    store64(hdr, 16, total)
+    store64(hdr, 24, base + mft_start * csec)
+    store32(hdr, 32, mftrecs)
+    store32(hdr, 36, 16)
+    store64(hdr, 40, base + bmp_start * csec)
+    store32(hdr, 48, bmps)
+    store64(hdr, 52, base + log_start * csec)
+    store32(hdr, 60, logc * csec)
+    store64(hdr, 64, 5)
+    store64(hdr, 72, 0x534C595A01020304)
+    put_label(hdr + 80, label, 64)
+    store32(hdr, 144, 0)
+    store32(hdr, 152, crc32(hdr, 152))
+
+    if wr_sectors(base, hdr, 512) == 0 { return 0 }
+
+    let bp = mem.alloc(bmps * 512)
+    if bp == 0 { return 0 }
+    bmp = bp
+    mem.zero(bmp, bmps * 512)
+
+    let i = 0
+    while i < meta {
+        let bo = i >> 3
+        store8(bmp, bo, load8(bmp, bo) | (1 << (i & 7)))
+        i = i + 1
+    }
+    if wr_sectors(base + bmp_start * csec, bmp, bmps * 512) == 0 { return 0 }
+    used_clusters = meta
+    alloc_hint = meta
+
+    mem.zero(secbuf, 512)
+    store32(secbuf, 0, 0x474F4C53)
+    store32(secbuf, 4, 2)
+    store32(secbuf, 8, 0)
+    store32(secbuf, 12, 0)
+    store64(secbuf, 16, 1)
+    store32(secbuf, 28, crc32(secbuf, 28))
+    if disk.write(base + log_start * csec, secbuf) == 0 { return 0 }
+
+    let z = 0
+    mem.zero(secbuf, 512)
+    while z < mftrecs * 8 && z < 4096 {
+        if disk.write(base + mft_start * csec + z, secbuf) == 0 { return 0 }
+        z = z + 1
+    }
+
+    let saved = cur
+    cur = v
+    vsetp(v, 0, base)
+    vsetw(v, 8, csec)
+    vsetp(v, 12, total)
+    vsetp(v, 20, base + mft_start * csec)
+    vsetw(v, 28, mftrecs)
+    vsetw(v, 32, 16)
+    vsetp(v, 36, base + bmp_start * csec)
+    vsetw(v, 44, bmps)
+    vsetp(v, 48, base + log_start * csec)
+    vsetw(v, 56, logc * csec)
+    vsetp(v, 60, 5)
+    vsetw(v, 68, 1)
+    vsetw(v, 72, (logc * csec - 1) / 9)
+    vsetw(v, 76, meta)
+    vsetw(v, 80, meta)
+    vsetbmp(v, bmp)
+
+    if rec_build(5, 3, 5, "\\", 1, 1) == 0 { cur = saved return 0 }
+    if rec_store(5) == 0 { cur = saved return 0 }
+    if jcommit() == 0 { cur = saved return 0 }
+    cur = saved
+    return 1
+}
+
+fn vol_mount(v, base, sectors) {
+    if rd_sectors(base, hdr, 512) == 0 { return 0 }
+    if load64(hdr, 0) != 0x324C4F565A594C53 { return 0 }
+    if load16(hdr, 8) != 2 { return 0 }
+    if load32(hdr, 152) != crc32(hdr, 152) { return 0 }
+
+    let total = load64(hdr, 16)
+    let bmps = load32(hdr, 48)
+    let bp = mem.alloc(bmps * 512)
+    if bp == 0 { return 0 }
+    bmp = bp
+    if rd_sectors(load64(hdr, 40), bmp, bmps * 512) == 0 { return 0 }
+
+    vsetp(v, 0, base)
+    vsetw(v, 8, 4096 / 512)
+    vsetp(v, 12, total)
+    vsetp(v, 20, load64(hdr, 24))
+    vsetw(v, 28, load32(hdr, 32))
+    vsetw(v, 32, load32(hdr, 36))
+    vsetp(v, 36, load64(hdr, 40))
+    vsetw(v, 44, bmps)
+    vsetp(v, 48, load64(hdr, 52))
+    vsetw(v, 56, load32(hdr, 60))
+    vsetp(v, 60, load64(hdr, 64))
+    vsetw(v, 68, 1)
+    vsetw(v, 72, (load32(hdr, 60) - 1) / 9)
+    vsetbmp(v, bmp)
+
+    let used = 0
+    let i = 0
+    while i < total {
+        if (load8(bmp, i >> 3) >> (i & 7)) & 1 != 0 { used = used + 1 }
+        i = i + 1
+    }
+    used_clusters = used
+    alloc_hint = 8
+    vsetw(v, 76, used)
+    vsetw(v, 80, 8)
+    jreplay(v)
+    return 1
+}
+
+# ------------------------------------------------------------
+# 目录条目输出与操作
+# ------------------------------------------------------------
+
+fn put_dirent(out, idx) {
+    if rec_read(idx) == 0 { return 0 }
+    let flags = load16(recbuf, 22)
+    if (flags & 1) == 0 { return 0 }
+    let f = attr_find(0x30)
+    if f == 0 { return 0 }
+    let nl = load16(recbuf, f + 32)
+    if nl > 255 { nl = 255 }
+
+    store8(out, 0, 1)
+    if (flags & 2) != 0 { store8(out, 0, 2) }
+    store8(out, 1, 0)
+    store16(out, 2, nl)
+    mem.zero(out + 4, 256)
+    mem.copy(out + 4, recbuf + f + 48, nl)
+
+    let d = data_attr()
+    let sz = 0
+    let first = 0
+    if d != 0 {
+        sz = data_size(d)
+        if ext_count(d) > 0 { first = ext_lba(d, 0) }
+    }
+    store32(out, 260, sz)
+    store32(out, 264, first)
+
+    let a = attr_find(0x10)
+    let cr = 0
+    let mo = 0
+    let md = 0
+    let uid = 0
+    let gid = 0
+    if a != 0 {
+        cr = load32(recbuf, a + 24)
+        mo = load32(recbuf, a + 32)
+        md = load32(recbuf, a + 48)
+        uid = load32(recbuf, a + 52)
+        gid = load32(recbuf, a + 56)
+    }
+    store32(out, 268, cr)
+    store32(out, 272, mo)
+    store16(out, 276, md)
+    store8(out, 278, uid)
+    store8(out, 279, gid)
+    if (load16(recbuf, f + 34) & 1) != 0 { store8(out, 1, 1) }
+    return 1
+}
+
+fn op_list(drive, path, out, max) {
+    if use_vol(drive) == 0 { return 0 - 1 }
+    let dir = resolve(path)
+    if dir < 0 { return 0 - 1 }
+    if rec_read(dir) == 0 { return 0 - 1 }
+    if (load16(recbuf, 22) & 2) == 0 { return 0 - 1 }
+    let root = index_root_attr()
+    if root == 0 { return 0 }
+    let blk = load64(recbuf, root + 24)
+    let n = 0
+    while blk != 0 && n < max {
+        if rd_sectors(blk, idxbuf, 4096) == 0 { break }
+        if load32(idxbuf, 0) != 0x58444E49 { break }
+        let cnt = load32(idxbuf, 24)
+        let eoff = 64
+        let i = 0
+        while i < cnt && n < max {
+            let ref = load32(idxbuf, eoff)
+            if put_dirent(out + n * 280, ref) != 0 { n = n + 1 }
+            eoff = eoff + load16(idxbuf, eoff + 8)
+            i = i + 1
+        }
+        blk = load64(idxbuf, 16)
+    }
+    return n
+}
+
+fn op_stat(drive, path, out) {
+    if use_vol(drive) == 0 { return 0 }
+    let idx = resolve(path)
+    if idx < 0 { return 0 }
+    if put_dirent(out, idx) == 0 { return 0 }
+    return 1
+}
+
+fn check_name(nlen) {
+    if nlen == 0 { return 0 }
+    if nlen > 255 { return 0 }
+    return 1
+}
+
+fn op_mkdir(drive, path) {
+    if use_vol(drive) == 0 { return 0 }
+    if resolve(path) >= 0 { return 0 }
+    let parent = resolve_parent(path)
+    if parent < 0 { return 0 }
+    if check_name(seg_len) == 0 { return 0 }
+    let idx = rec_create(parent, path + seg_start, seg_len, 1)
+    if idx < 0 { return 0 }
+    sync_vol()
+    if jcommit() == 0 { return 0 }
+    return 1
+}
+
+fn op_create(drive, path) {
+    if use_vol(drive) == 0 { return 0 }
+    let idx = resolve(path)
+    if idx >= 0 {
+        if rec_read(idx) == 0 { return 0 }
+        if (load16(recbuf, 22) & 2) != 0 { return 0 }
+        let d = data_attr()
+        if d != 0 {
+            let cnt = ext_count(d)
+            let i = 0
+            while i < cnt {
+                free_run((ext_lba(d, i) - vbase(cur)) / vcsec(cur), ext_clusters(d, i))
+                i = i + 1
+            }
+            store32(recbuf, d + 32, 0)
+            store32(recbuf, d + 4, 64)
+            store64(recbuf, d + 40, 0)
+            store64(recbuf, d + 48, 0)
+            store64(recbuf, d + 56, 0)
+            store32(recbuf, 24, d + 64)
+        }
+        rec_store(idx)
+        sync_vol()
+        jcommit()
+        return 1
+    }
+    let parent = resolve_parent(path)
+    if parent < 0 { return 0 }
+    if check_name(seg_len) == 0 { return 0 }
+    idx = rec_create(parent, path + seg_start, seg_len, 0)
+    if idx < 0 { return 0 }
+    sync_vol()
+    if jcommit() == 0 { return 0 }
+    return 1
+}
+
+fn op_remove(drive, path, want_dir) {
+    if use_vol(drive) == 0 { return 0 }
+    if resolve(path) < 0 { return 0 }
+    let parent = resolve_parent(path)
+    if parent < 0 { return 0 }
+    if check_name(seg_len) == 0 { return 0 }
+    let ref = dir_lookup(parent, path + seg_start, seg_len)
+    if ref == 0 { return 0 }
+    if rec_read(ref) == 0 { return 0 }
+    let isdir = (load16(recbuf, 22) & 2)
+    if want_dir != 0 && isdir == 0 { return 0 }
+    if want_dir == 0 && isdir != 0 { return 0 }
+    if want_dir != 0 {
+        let root = index_root_attr()
+        if root != 0 {
+            let blk = load64(recbuf, root + 24)
+            while blk != 0 {
+                if rd_sectors(blk, idxbuf, 4096) == 0 { return 0 }
+                if load32(idxbuf, 24) != 0 { return 0 }
+                blk = load64(idxbuf, 16)
+            }
+        }
+    }
+    if dir_remove(parent, path + seg_start, seg_len) == 0 { return 0 }
+    rec_destroy(ref)
+    sync_vol()
+    jcommit()
+    return 1
+}
+
+fn op_usage(drive, out) {
+    if use_vol(drive) == 0 { return 0 }
+    store32(out, 0, vclusters(drive) & 0xFFFFFFFF)
+    store32(out, 4, vused(drive))
+    store32(out, 8, 4096)
+    return 1
+}
+
+fn op_volume_info(drive, out) {
+    if drive > 2 { return 0 }
+    if vmounted(drive) == 0 { return 0 }
+    store32(out, 0, vbase(drive))
+    store32(out, 4, vclusters(drive) * vcsec(drive))
+    store32(out, 8, vclusters(drive))
+    store32(out, 12, vcsec(drive))
+    return 1
+}
+
+# ------------------------------------------------------------
+# 句柄
+# ------------------------------------------------------------
+
+fn handle_slot() {
+    let i = 0
+    while i < 32 {
+        if load32(htab, i * 64) == 0 { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn op_open(drive, path, mode) {
+    if use_vol(drive) == 0 { return 0 }
+    let idx = resolve(path)
+    if mode == 0 {
+        if idx < 0 { return 0 }
+    } else {
+        if idx < 0 {
+            let parent = resolve_parent(path)
+            if parent < 0 { return 0 }
+            if check_name(seg_len) == 0 { return 0 }
+            idx = rec_create(parent, path + seg_start, seg_len, 0)
+            if idx < 0 { return 0 }
+            /* 记录此刻还在日志暂存区；先提交，后续 rec_read 才能读到。 */
+            if jcommit() == 0 { return 0 }
+        } else {
+            if rec_read(idx) == 0 { return 0 }
+            if (load16(recbuf, 22) & 2) != 0 { return 0 }
+        }
+    }
+    if rec_read(idx) == 0 { return 0 }
+    if (load16(recbuf, 22) & 2) != 0 { return 0 }
+
+    let d = data_attr()
+    let pos = 0
+    if mode == 2 && d != 0 { pos = data_size(d) }
+    if mode == 1 {
+        if d != 0 {
+            let cnt = ext_count(d)
+            let i = 0
+            while i < cnt {
+                free_run((ext_lba(d, i) - vbase(cur)) / vcsec(cur), ext_clusters(d, i))
+                i = i + 1
+            }
+            store32(recbuf, d + 32, 0)
+            store32(recbuf, d + 4, 64)
+            store64(recbuf, d + 40, 0)
+            store64(recbuf, d + 48, 0)
+            store64(recbuf, d + 56, 0)
+            store32(recbuf, 24, d + 64)
+            rec_store(idx)
+        }
+    }
+
+    let h = handle_slot()
+    if h < 0 { return 0 }
+    let base = htab + h * 64
+    store32(base, 0, 1)
+    store32(base, 4, drive)
+    store32(base, 8, idx)
+    store32(base, 12, mode)
+    store64(base, 16, pos)
+    let sz = 0
+    if d != 0 { sz = data_size(d) }
+    store64(base, 24, sz)
+    used_clusters = used_clusters
+    sync_vol()
+    jcommit()
+    return h + 1
+}
+
+fn op_read(h, p, n) {
+    if h < 1 || h > 32 { return 0 }
+    let base = htab + (h - 1) * 64
+    if load32(base, 0) == 0 { return 0 }
+    if use_vol(load32(base, 4)) == 0 { return 0 }
+    let pos = load64(base, 16)
+    let got = file_read(load32(base, 8), pos, p, n)
+    store64(base, 16, pos + got)
+    return got
+}
+
+fn op_write(h, p, n) {
+    if h < 1 || h > 32 { return 0 }
+    let base = htab + (h - 1) * 64
+    if load32(base, 0) == 0 { return 0 }
+    if use_vol(load32(base, 4)) == 0 { return 0 }
+    let pos = load64(base, 16)
+    let got = file_write(load32(base, 8), pos, p, n)
+    if got > 0 {
+        store64(base, 16, pos + got)
+        if pos + got > load64(base, 24) { store64(base, 24, pos + got) }
+        sync_vol()
+    }
+    return got
+}
+
+fn op_seek(h, off) {
+    if h < 1 || h > 32 { return 0 }
+    let base = htab + (h - 1) * 64
+    if load32(base, 0) == 0 { return 0 }
+    if off < 0 { return 0 }
+    store64(base, 16, off)
+    return 1
+}
+
+fn op_close(h) {
+    if h < 1 || h > 32 { return 0 }
+    let base = htab + (h - 1) * 64
+    if load32(base, 0) == 0 { return 0 }
+    sync_vol()
+    jcommit()
+    disk.flush()
+    mem.zero(base, 64)
+    return 1
+}
+
+# ------------------------------------------------------------
+# 分区表 / 故障记录
+# ------------------------------------------------------------
+
+fn format_disk() {
+    let total = disk.sectors()
+    if total < 65536 { return 0 }
+    let usable = total - 8196
+    let sys = (usable * 40 / 100) / 8 * 8
+    let rec = (usable * 12 / 100) / 8 * 8
+    if rec < 2048 { rec = 2048 }
+    let dat = usable - sys - rec
+    if dat < 4096 { return 0 }
+
+    mem.zero(scratch, 512)
+    store64(scratch, 0, 0x0032545053594C53)
+    store16(scratch, 8, 1)
+    store8(scratch, 10, 3)
+    store32(scratch, 12, 0x534C595A)
+
+    store8(scratch, 16, 1)
+    store8(scratch, 17, 1)
+    store32(scratch, 20, 8196)
+    store32(scratch, 24, sys)
+    put_label(scratch + 28, "SYSTEM", 24)
+
+    store8(scratch, 80, 2)
+    store8(scratch, 81, 2)
+    store32(scratch, 84, 8196 + sys)
+    store32(scratch, 88, rec)
+    put_label(scratch + 92, "RECOVERY", 24)
+
+    store8(scratch, 144, 3)
+    store8(scratch, 145, 0)
+    store32(scratch, 148, 8196 + sys + rec)
+    store32(scratch, 152, dat)
+    put_label(scratch + 156, "DATA", 24)
+
+    store32(scratch, 508, crc32(scratch, 508))
+    if disk.write(8192, scratch) == 0 { return 0 }
+    if disk.write(8193, scratch) == 0 { return 0 }
+
+    mem.zero(scratch, 512)
+    store64(scratch, 0, 0x3245525A594C53)
+    store16(scratch, 8, 0)
+    store16(scratch, 10, 0)
+    store32(scratch, 12, 0)
+    store32(scratch, 60, crc32(scratch, 60))
+    if disk.write(8194, scratch) == 0 { return 0 }
+
+    if vol_format(0, 8196, sys, "SYSTEM") == 0 { return 0 }
+    if vol_format(1, 8196 + sys, rec, "RECOVERY") == 0 { return 0 }
+    if vol_format(2, 8196 + sys + rec, dat, "DATA") == 0 { return 0 }
+    if disk.flush() == 0 { return 0 }
+    return 1
+}
+
+fn mount_all() {
+    if rd_sectors(8192, scratch, 512) == 0 { return 0 }
+    if load64(scratch, 0) != 0x0032545053594C53 { return 0 }
+    if load32(scratch, 508) != crc32(scratch, 508) { return 0 }
+    let n = load8(scratch, 10)
+    let seen = 0
+    let i = 0
+    while i < n {
+        let off = 16 + i * 64
+        let t = load8(scratch, off)
+        if t >= 1 && t <= 3 {
+            let first = load32(scratch, off + 4)
+            let count = load32(scratch, off + 8)
+            if vol_mount(t - 1, first, count) != 0 {
+                seen = seen | (1 << (t - 1))
+            }
+        }
+        i = i + 1
+    }
+    if seen != 0 {
+        let first = 0
+        if (seen & 1) != 0 { first = 0 }
+        else if (seen & 2) != 0 { first = 1 }
+        else { first = 2 }
+        use_vol(first)
+    }
+    return seen
+}
+
+fn fault_read(out) {
+    if rd_sectors(8194, out, 64) == 0 { return 0 }
+    if load64(out, 0) != 0x3245525A594C53 { return 0 }
+    if load32(out, 60) != crc32(out, 60) { return 0 }
+    return 1
+}
+
+fn fault_write(inp) {
+    mem.zero(scratch, 64)
+    mem.copy(scratch, inp, 60)
+    store32(scratch, 60, crc32(scratch, 60))
+    if disk.write(8194, scratch) == 0 { return 0 }
+    disk.flush()
+    return 1
+}
+
+fn op_chmod(drive, path, mode) {
+    if use_vol(drive) == 0 { return 0 }
+    let idx = resolve(path)
+    if idx < 0 { return 0 }
+    if rec_read(idx) == 0 { return 0 }
+    let a = attr_find(0x10)
+    if a == 0 { return 0 }
+    store32(recbuf, a + 48, mode)
+    rec_store(idx)
+    jcommit()
+    return 1
+}
+
+fn op_chown(drive, path, uid) {
+    if use_vol(drive) == 0 { return 0 }
+    let idx = resolve(path)
+    if idx < 0 { return 0 }
+    if rec_read(idx) == 0 { return 0 }
+    let a = attr_find(0x10)
+    if a == 0 { return 0 }
+    store32(recbuf, a + 52, uid)
+    rec_store(idx)
+    jcommit()
+    return 1
+}
+
+fn op_protect(drive, path, enable) {
+    if use_vol(drive) == 0 { return 0 }
+    let idx = resolve(path)
+    if idx < 0 { return 0 }
+    if rec_read(idx) == 0 { return 0 }
+    let f = attr_find(0x30)
+    if f == 0 { return 0 }
+    let v = 0
+    if enable != 0 { v = 1 }
+    store16(recbuf, f + 34, v)
+    rec_store(idx)
+    jcommit()
+    return 1
+}
+
+fn op_is_protected(drive, path) {
+    if use_vol(drive) == 0 { return 0 }
+    let idx = resolve(path)
+    if idx < 0 { return 0 }
+    if rec_read(idx) == 0 { return 0 }
+    let f = attr_find(0x30)
+    if f == 0 { return 0 }
+    return load16(recbuf, f + 34) & 1
+}
+
+fn count_volumes() {
+    let n = 0
+    let i = 0
+    while i < 3 {
+        if vmounted(i) != 0 { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+# ------------------------------------------------------------
+# 入口
+# ------------------------------------------------------------
+
+fn init_all() {
+    V = mem.alloc(3 * 96)
+    hdr = mem.alloc(512)
+    recbuf = mem.alloc(4096)
+    idxbuf = mem.alloc(4096)
+    auxbuf = mem.alloc(4096)
+    databuf = mem.alloc(4096)
+    secbuf = mem.alloc(512)
+    scratch = mem.alloc(512)
+    jbuf = mem.alloc(32 * 4112)
+    htab = mem.alloc(32 * 64)
+    if V == 0 { return 0 }
+    mem.zero(V, 3 * 96)
+    mem.zero(htab, 32 * 64)
+    return 1
+}
+
+on start {
+    init_all()
+}
+
+fn slyzfs_call(op, a, b, c, d) {
+    if op == 1 { return format_disk() }
+    if op == 2 { return mount_all() }
+    if op == 3 { return vol_format(a, b, c, d) }
+    if op == 4 { return vol_mount(a, b, c) }
+    if op == 5 { return 1 }
+    if op == 6 { sync_vol() return jcommit() }
+
+    if op == 7 { return op_list(a, b, c, d) }
+    if op == 8 { return op_stat(a, b, c) }
+    if op == 9 { return op_mkdir(a, b) }
+    if op == 10 { return op_remove(a, b, 1) }
+    if op == 11 { return op_remove(a, b, 0) }
+    if op == 12 { return op_create(a, b) }
+    if op == 13 { return op_usage(a, b) }
+
+    if op == 14 { return op_open(a, b, c) }
+    if op == 15 { return op_read(a, b, c) }
+    if op == 16 { return op_write(a, b, c) }
+    if op == 17 { return op_seek(a, b) }
+    if op == 18 { return op_close(a) }
+
+    if op == 19 { return op_chmod(a, b, c) }
+    if op == 20 { return op_chown(a, b, c) }
+    if op == 21 { return op_protect(a, b, c) }
+    if op == 22 { return op_is_protected(a, b) }
+    if op == 23 { return count_volumes() }
+    if op == 24 { return op_volume_info(a, b) }
+    if op == 25 { return fault_read(b) }
+    if op == 26 { return fault_write(b) }
+    return 0
+}
+
+

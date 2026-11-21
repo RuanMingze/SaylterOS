@@ -1,0 +1,5 @@
+# libmath.slyzd 清单
+name libmath
+org 0x06000000
+entry 0
+export slyz_add 0 0 1

@@ -53,6 +53,16 @@ uint32_t vbe_get_pixel(uint16_t x, uint16_t y);
 void vbe_blend_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
                     uint32_t color, uint8_t alpha);
 
+/* 用 8 位覆盖率掩码绘制字形。
+ * mask 每字节是一个像素的覆盖率（0..255），stride 是掩码行字节数；
+ * buf 版本写 backbuffer 并遵守全局裁剪，fb 版本直接写 LFB 且以 bg
+ * 作为混合背景（终端已知底色，不需要回读显存）。 */
+void vbe_draw_mask_buf(int x, int y, int w, int h,
+                       const uint8_t *mask, int stride, uint32_t fg);
+void vbe_draw_mask_fb(int x, int y, int w, int h,
+                      const uint8_t *mask, int stride,
+                      uint32_t fg, uint32_t bg);
+
 /* 实心矩形 */
 void vbe_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint32_t color);
 
@@ -81,8 +91,8 @@ uint16_t vbe_utf8_width_px(const char *s);
 void vbe_draw_utf8_px(uint16_t x, uint16_t y, const char *s, uint32_t fg, uint32_t bg);
 uint16_t vbe_draw_utf8_max_px(uint16_t x, uint16_t y, const char *s,
                               uint16_t max_px, uint32_t fg, uint32_t bg);
-void vbe_draw_cjk_px(uint16_t x, uint16_t y, uint16_t cp, uint32_t fg, uint32_t bg);
-void vbe_draw_cjk_transparent(uint16_t x, uint16_t y, uint16_t cp, uint32_t fg);
+void vbe_draw_cjk_px(uint16_t x, uint16_t y, uint32_t cp, uint32_t fg, uint32_t bg);
+void vbe_draw_cjk_transparent(uint16_t x, uint16_t y, uint32_t cp, uint32_t fg);
 void vbe_draw_utf8_transparent(uint16_t x, uint16_t y, const char *s, uint32_t fg);
 
 /* ---- 文本终端专用：直写帧缓冲（单缓冲，不经过 backbuffer） ----
@@ -91,11 +101,17 @@ void vbe_draw_utf8_transparent(uint16_t x, uint16_t y, const char *s, uint32_t f
 void vbe_fb_clear(uint32_t color);
 void vbe_fb_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint32_t color);
 void vbe_fb_draw_char(uint16_t cx, uint16_t cy, char c, uint32_t fg, uint32_t bg);
-void vbe_fb_draw_cjk(uint16_t cx, uint16_t cy, uint16_t cp, uint32_t fg, uint32_t bg);
+void vbe_fb_draw_cjk(uint16_t cx, uint16_t cy, uint32_t cp, uint32_t fg, uint32_t bg);
 void vbe_fb_scroll_up(uint16_t pixel_rows, uint32_t fill_color);
 
 /* 状态 */
 uint8_t vbe_is_enabled(void);
+
+/* backbuffer 物理信息：GPU 后端需要把这块内存映射进 GGTT 才能搬运。
+ * 未启用时全部返回 0。 */
+uint32_t vbe_backbuffer_phys(void);
+uint32_t vbe_backbuffer_stride(void);
+uint32_t vbe_backbuffer_bytes(void);
 
 /* 辅助：命中检测 */
 static inline uint8_t point_in_rect(int16_t px, int16_t py,

@@ -1,0 +1,374 @@
+// ============================================================
+// sylfault.slyzcode - SylFault 图形版
+// ------------------------------------------------------------
+// 一个受控的蓝屏 / 内存泄漏实验室：
+//   - 11 种 STOP 码，触发前有本程序自己的确认面板
+//   - 可随时写崩溃转储到 system\crash\dump-<uptime>.txt
+//   - 可开关 "崩溃时自动转储" 与 "串口输出落盘"
+//   - 可反复泄漏 / 释放 64KB 内存块，观察任务管理器
+//
+// 程序不在任务栏出现，只能通过桌面搜索面板启动；窗口标题由
+// win.title() 设置，桌面从 gui_app_title() 读取。
+// ============================================================
+
+let W = 640
+let H = 554
+
+let BG = 0x0B1017
+let PANEL = 0x141C27
+let PANEL2 = 0x1B2532
+let BORDER = 0x2B3949
+let TEXT = 0xE9EFF7
+let DIM = 0x8EA0B4
+let ACCENT = 0x4F8EF7
+let ACCENT2 = 0x2F6FE0
+let DANGER = 0xF87171
+let WARN = 0xFBBF24
+let OK = 0x34D399
+
+let crash_names = [
+    "Manual crash",
+    "Divide by zero",
+    "Null pointer",
+    "Illegal instruction",
+    "Double free",
+    "Stack overflow",
+    "Memory exhaustion",
+    "IRQL violation",
+    "Security check failure",
+    "Critical structure corruption",
+    "Driver IRQL violation"
+]
+
+let crash_codes = [
+    "0xE2",
+    "0x1E",
+    "0x50",
+    "0x7F",
+    "0xC2",
+    "0xF7",
+    "0xE4",
+    "0x0A",
+    "0x139",
+    "0x109",
+    "0xD1"
+]
+
+let mx = 0
+let my = 0
+let pending = -1
+let message = "Pick a fault. Nothing happens until you confirm."
+
+fn inside(x, y, w, h, px, py) {
+    if px < x {
+        return 0
+    }
+    if py < y {
+        return 0
+    }
+    if px >= x + w {
+        return 0
+    }
+    if py >= y + h {
+        return 0
+    }
+    return 1
+}
+
+fn kb_text(v) {
+    return str(v / 1024) + " KB"
+}
+
+fn button(x, y, w, h, label, fill, fg) {
+    let hover = inside(x, y, w, h, mx, my)
+    let bg = fill
+    if hover {
+        bg = fill + 0x101418
+    }
+    gfx.rect(x, y, w, h, bg)
+    let border = BORDER
+    if hover {
+        border = ACCENT
+    }
+    gfx.frame(x, y, w, h, border, 1)
+
+    let tw = gfx.text_width(label)
+    let tx = x + (w - tw) / 2
+    let ty = y + (h - 32) / 2
+    gfx.text(tx, ty, label, fg)
+}
+
+fn crash_x(i) {
+    return 16 + (i % 2) * 308
+}
+
+fn crash_y(i) {
+    return 128 + (i / 2) * 48
+}
+
+fn leak_total() {
+    return int(fault.get("leak_kb"))
+}
+
+fn dump_on() {
+    return fault.get("dump") == "1"
+}
+
+fn serial_on() {
+    return fault.get("serial_to_disk") == "1"
+}
+
+fn show_status() {
+    let total = os.info(1)
+    let used = os.info(2)
+
+    gfx.rect(16, 52, 608, 64, PANEL)
+    gfx.frame(16, 52, 608, 64, BORDER, 1)
+
+    gfx.text(28, 58, "Heap " + kb_text(used) + " / " + kb_text(total) +
+                     "     Leaked " + str(leak_total()) + " KB", TEXT)
+
+    let dump = "OFF"
+    if dump_on() {
+        dump = "ON"
+    }
+    let serial = "OFF"
+    if serial_on() {
+        serial = "ON"
+    }
+    gfx.text(28, 84, "Dump on crash: " + dump + "     Serial log: " + serial, DIM)
+}
+
+fn show_grid() {
+    let i = 0
+    while i < 11 {
+        button(crash_x(i), crash_y(i), 300, 40,
+               str(i + 1) + ". " + crash_names.at(i) + "  " + crash_codes.at(i),
+               PANEL2, TEXT)
+        i = i + 1
+    }
+}
+
+fn show_controls() {
+    button(16, 428, 194, 34, "Leak +1 MB", PANEL2, WARN)
+    button(218, 428, 194, 34, "Free leaked", PANEL2, OK)
+    button(420, 428, 204, 34, "Write dump now", ACCENT2, TEXT)
+
+    let d_label = "Dump on crash: OFF"
+    if dump_on() {
+        d_label = "Dump on crash: ON"
+    }
+    button(16, 470, 300, 34, d_label, PANEL2, TEXT)
+
+    let s_label = "Serial log: OFF"
+    if serial_on() {
+        s_label = "Serial log: ON"
+    }
+    button(324, 470, 300, 34, s_label, PANEL2, TEXT)
+}
+
+fn show_confirm() {
+    gfx.rect(0, 0, W, H, 0x080C12)
+    gfx.rect(120, 180, 400, 200, PANEL)
+    gfx.frame(120, 180, 400, 200, DANGER, 2)
+
+    gfx.text(144, 200, "Confirm fault injection", TEXT)
+    gfx.text(144, 240, crash_names.at(pending), WARN)
+    gfx.text(144, 272, "STOP " + crash_codes.at(pending), DIM)
+    gfx.text(144, 300, "The system will halt immediately.", DIM)
+
+    button(144, 332, 160, 36, "Inject", 0x7F1D1D, 0xFFFFFF)
+    button(336, 332, 160, 36, "Cancel", PANEL2, TEXT)
+}
+
+fn draw() {
+    gfx.clear(BG)
+
+    gfx.text(16, 12, "SylFault", TEXT)
+    gfx.text(16, 40, "Controlled crash, dump and leak laboratory", DIM)
+
+    show_status()
+    show_grid()
+    show_controls()
+
+    gfx.text(16, 514, message, DIM)
+    gfx.text(440, 514, "Esc closes", 0x5A6B7E)
+
+    if pending >= 0 {
+        show_confirm()
+    }
+
+    gfx.flush()
+}
+
+fn do_dump() {
+    let rc = fault.dump()
+    if rc == 0 {
+        message = "Dump written to system\\crash."
+    } else {
+        message = "Dump failed: SlyzFS is not writable."
+    }
+}
+
+fn toggle(key, label) {
+    let target = "1"
+    if fault.get(key) == "1" {
+        target = "0"
+    }
+    let rc = fault.set(key, target)
+    if rc != 0 {
+        message = "Failed to save " + label + "."
+        return
+    }
+    if target == "1" {
+        message = label + " is now ON."
+    } else {
+        message = label + " is now OFF."
+    }
+}
+
+fn click_confirm(px, py) {
+    if inside(144, 332, 160, 36, px, py) {
+        let kind = pending
+        pending = -1
+        message = "Injecting " + crash_names.at(kind) + "..."
+        draw()
+        fault.trigger(kind)
+        return
+    }
+    if inside(336, 332, 160, 36, px, py) {
+        pending = -1
+        message = "Fault injection cancelled."
+    }
+}
+
+fn click(px, py) {
+    if pending >= 0 {
+        click_confirm(px, py)
+        return
+    }
+
+    let i = 0
+    while i < 11 {
+        if inside(crash_x(i), crash_y(i), 300, 40, px, py) {
+            pending = i
+            message = "Confirm " + crash_names.at(i) + "."
+            return
+        }
+        i = i + 1
+    }
+
+    if inside(16, 428, 194, 34, px, py) {
+        let total = fault.leak(1024)
+        message = "Leaked memory is now " + str(total) + " KB."
+        return
+    }
+    if inside(218, 428, 194, 34, px, py) {
+        let freed = fault.leak_free()
+        message = "Released " + str(freed) + " KB."
+        return
+    }
+    if inside(420, 428, 204, 34, px, py) {
+        do_dump()
+        return
+    }
+    if inside(16, 470, 300, 34, px, py) {
+        toggle("dump", "Dump on crash")
+        return
+    }
+    if inside(324, 470, 300, 34, px, py) {
+        toggle("serial_to_disk", "Serial log")
+        return
+    }
+}
+
+fn key(ch) {
+    if pending >= 0 {
+        if ch == 13 {
+            let kind = pending
+            pending = -1
+            message = "Injecting " + crash_names.at(kind) + "..."
+            draw()
+            fault.trigger(kind)
+            return
+        }
+        if ch == 27 {
+            pending = -1
+            message = "Fault injection cancelled."
+        }
+        return
+    }
+
+    if ch == 27 || ch == 113 || ch == 81 {
+        win.close(0)
+        return
+    }
+    if ch == 108 || ch == 76 {
+        let total = fault.leak(1024)
+        message = "Leaked memory is now " + str(total) + " KB."
+        return
+    }
+    if ch == 102 || ch == 70 {
+        let freed = fault.leak_free()
+        message = "Released " + str(freed) + " KB."
+        return
+    }
+    if ch == 100 || ch == 68 {
+        do_dump()
+        return
+    }
+    if ch == 115 || ch == 83 {
+        toggle("serial_to_disk", "Serial log")
+        return
+    }
+    if ch == 116 || ch == 84 {
+        toggle("dump", "Dump on crash")
+        return
+    }
+
+    if ch >= 49 && ch <= 57 {
+        pending = ch - 49
+        message = "Confirm " + crash_names.at(pending) + "."
+        return
+    }
+    if ch == 48 {
+        pending = 9
+        message = "Confirm " + crash_names.at(9) + "."
+        return
+    }
+    if ch == 45 {
+        pending = 10
+        message = "Confirm " + crash_names.at(10) + "."
+    }
+}
+
+fn main() {
+    let handle = win.open("SylFault", W, H)
+    if handle < 0 {
+        return
+    }
+    win.title(handle, "SylFault")
+
+    let running = 1
+    while running {
+        draw()
+
+        let ev = event.poll()
+        if ev != nil {
+            let kind = ev.at(0)
+            if kind == 2 {
+                mx = ev.at(1)
+                my = ev.at(2)
+            }
+            if kind == 3 {
+                click(ev.at(1), ev.at(2))
+            }
+            if kind == 1 {
+                key(ev.at(1))
+            }
+            if kind == 5 {
+                running = 0
+            }
+        }
+    }
+}

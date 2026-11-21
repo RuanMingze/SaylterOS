@@ -15,6 +15,8 @@ uint16_t tty_get_cols(void);
 uint16_t tty_get_rows(void);
 
 void tty_clear(void);
+/* 按影子字符矩阵整屏重绘（清除 HUD 等外部覆盖内容）。 */
+void tty_repaint(void);
 void tty_putchar(char c);
 void tty_write(const char *s, int len);
 void tty_set_color(uint8_t color);

@@ -22,12 +22,19 @@
 #include "system_cfg.h"
 #include "lang.h"
 #include "audio.h"
+#include "crypto.h"
 #include "net.h"
 #include "smp.h"
 #include "vm.h"
 #include "ime.h"
 #include "ime_pinyin.h"
 #include "unicode.h"
+#include "faultlab.h"
+#include "gpu.h"
+#include "blk.h"
+#include "slyertype.h"
+#include "debug.h"
+#include "slys.h"
 
 /* ---- SlyzFS 目录项镜像结构 ----
  * 必须与 slyzfs.h 的 DirEntry 以及 bridge 层的 SlyzDirEntry 逐字节一致：
@@ -36,9 +43,11 @@
 #pragma pack(push, 1)
 struct SlyzDirEntry {
     uint8_t  type;
-    uint8_t  name[52];
-    uint16_t start_cluster;
+    uint8_t  flags;
+    uint16_t name_len;
+    char     name[256];
     uint32_t size;
+    uint32_t start_lba;
     uint32_t created_ts;
     uint32_t modified_ts;
     uint16_t mode;
@@ -112,7 +121,13 @@ static void serial_print(const char *s) {
     while (*s) serial_putc(*s++);
 }
 
-void kserial_putchar(char c) { serial_putc((unsigned char)c); }
+void kserial_putchar(char c) {
+    /* 故障实验室写 dump / 串口日志落盘期间完全静默：
+     * 连硬件串口都不输出，避免 "写盘 -> 串口 -> 再写盘" 的自激循环。 */
+    if (faultlab_serial_muted()) return;
+    serial_putc((unsigned char)c);
+    faultlab_serial_tap((char)c);
+}
 void kserial_puts(const char *s) { serial_print(s); }
 void kserial_dec32(uint32_t v) {
     char buf[16];
@@ -165,7 +180,7 @@ static int ata_wait_drq(uint32_t timeout) {
     return 0;
 }
 
-static int ata_disk_present(void) {
+int ata_disk_present(void) {
     /* 探测结果缓存：该函数位于每次扇区读写的关键路径上，
      * 若每次都在这里做 1000 次空转的 delay，扫描数万扇区会慢到不可用。
      * 硬盘在位状态在系统生命周期内不会变化，只探测一次即可。 */
@@ -193,17 +208,100 @@ void ata_stats(uint32_t *reads, uint32_t *writes) {
     if (writes) *writes = g_ata_write_sectors;
 }
 
+/* ATA 容量与 LBA48 能力：IDENTIFY DEVICE 只做一次并缓存。
+ * 机械盘与 >128GB 的盘必须走 LBA48（0x24/0x34）：LBA28 只能寻址
+ * 前 128GB，越界写会绕回磁盘头部，可能直接毁掉分区表。 */
+static uint32_t g_ata_total_sectors = 0;
+static int g_ata_lba48 = 0;
+static int g_ata_identified = 0;
+static int g_ata_write_cache = 0;
+
+static void ata_identify_capacity(void) {
+    if (g_ata_identified) return;
+    g_ata_identified = 1;
+    g_ata_total_sectors = 0;
+    g_ata_lba48 = 0;
+    if (!ata_disk_present()) return;
+    if (!ata_wait_busy_clear(20000)) return;
+
+    outb(ATA_DRIVE_PORT, 0xA0);
+    outb(ATA_ERR_PORT, 0x00);
+    outb(ATA_SECCNT_PORT, 0x00);
+    outb(ATA_LBA_LOW_PORT, 0x00);
+    outb(ATA_LBA_MID_PORT, 0x00);
+    outb(ATA_LBA_HIGH_PORT, 0x00);
+    outb(ATA_CMD_PORT, 0xEC);
+
+    uint8_t st = inb(ATA_CMD_PORT);
+    if (st == 0x00 || st == 0xFF) return;
+    if (!ata_wait_drq(20000)) return;
+
+    uint16_t w[256];
+    for (int i = 0; i < 256; i++) w[i] = inw(ATA_DATA_PORT);
+
+    uint32_t cap28 = (uint32_t)w[60] | ((uint32_t)w[61] << 16);
+    int lba48 = (w[83] & (1u << 10)) ? 1 : 0;
+    uint64_t cap48 = (uint64_t)w[100] | ((uint64_t)w[101] << 16) |
+                     ((uint64_t)w[102] << 32) | ((uint64_t)w[103] << 48);
+    uint64_t total = (lba48 && cap48 != 0) ? cap48 : (uint64_t)cap28;
+    if (total == 0) total = 32u * 1024u * 1024u / 512u;
+    if (total > 0xFFFFFFFFull) total = 0xFFFFFFFFull;
+
+    g_ata_total_sectors = (uint32_t)total;
+    g_ata_lba48 = lba48;
+    g_ata_write_cache = (w[85] & (1u << 5)) ? 1 : 0;
+}
+
+/* 打开设备写缓存。配合 blk_flush() 在日志提交点显式落盘：
+ * 既保留机械盘的顺序写性能，又能在掉电前保证已提交事务持久。
+ * ACPI 已完成设备枚举与 D0 上电，这里只做 ATA 层的 SET FEATURES。 */
+void ata_enable_write_cache(void) {
+    ata_identify_capacity();
+    if (!ata_disk_present()) return;
+    if (!g_ata_write_cache) return;
+    if (!ata_wait_busy_clear(20000)) return;
+
+    outb(ATA_DRIVE_PORT, g_ata_lba48 ? 0x40 : 0xA0);
+    outb(ATA_ERR_PORT, 0x02);      /* features: enable write cache */
+    outb(ATA_SECCNT_PORT, 0x00);
+    outb(ATA_LBA_LOW_PORT, 0x00);
+    outb(ATA_LBA_MID_PORT, 0x00);
+    outb(ATA_LBA_HIGH_PORT, 0x00);
+    outb(ATA_CMD_PORT, 0xEF);      /* SET FEATURES */
+    (void)ata_wait_busy_clear(20000);
+}
+
+/* 把 LBA 写进命令寄存器。lba48 时先写高 24 位，再写低 24 位。 */
+static void ata_program_lba(uint32_t lba, int lba48) {
+    if (lba48) {
+        outb(ATA_DRIVE_PORT, 0x40);            /* LBA 模式，不选设备 */
+        outb(ATA_ERR_PORT, 0x00);
+        outb(ATA_SECCNT_PORT, 0x00);
+        outb(ATA_LBA_LOW_PORT, (uint8_t)(lba >> 24));
+        outb(ATA_LBA_MID_PORT, (uint8_t)(lba >> 32));
+        outb(ATA_LBA_HIGH_PORT, (uint8_t)(lba >> 40));
+        outb(ATA_SECCNT_PORT, 0x01);
+        outb(ATA_LBA_LOW_PORT, (uint8_t)lba);
+        outb(ATA_LBA_MID_PORT, (uint8_t)(lba >> 8));
+        outb(ATA_LBA_HIGH_PORT, (uint8_t)(lba >> 16));
+    } else {
+        outb(ATA_DRIVE_PORT, 0xE0 | ((lba >> 24) & 0x0F));
+        outb(ATA_ERR_PORT, 0x00);
+        outb(ATA_SECCNT_PORT, 0x01);
+        outb(ATA_LBA_LOW_PORT, (uint8_t)lba);
+        outb(ATA_LBA_MID_PORT, (uint8_t)(lba >> 8));
+        outb(ATA_LBA_HIGH_PORT, (uint8_t)(lba >> 16));
+    }
+}
+
 int ata_read_sector(uint32_t lba, uint8_t *buf) {
     if (!ata_disk_present()) return 0;
+    ata_identify_capacity();
     if (!ata_wait_busy_clear(20000)) return 0;
 
-    outb(ATA_DRIVE_PORT, 0xE0 | ((lba >> 24) & 0x0F));
-    outb(ATA_ERR_PORT, 0x00);
-    outb(ATA_SECCNT_PORT, 0x01);
-    outb(ATA_LBA_LOW_PORT, (uint8_t)(lba & 0xFF));
-    outb(ATA_LBA_MID_PORT, (uint8_t)((lba >> 8) & 0xFF));
-    outb(ATA_LBA_HIGH_PORT, (uint8_t)((lba >> 16) & 0xFF));
-    outb(ATA_CMD_PORT, 0x20);
+    int use48 = g_ata_lba48 && (lba > 0x0FFFFFFFu);
+    ata_program_lba(lba, use48);
+    outb(ATA_CMD_PORT, use48 ? 0x24 : 0x20);
 
     if (!ata_wait_drq(20000)) {
         serial_print("[ATA] read drq timeout, lba=");
@@ -222,15 +320,12 @@ int ata_read_sector(uint32_t lba, uint8_t *buf) {
 
 int ata_write_sector(uint32_t lba, const uint8_t *buf) {
     if (!ata_disk_present()) return 0;
+    ata_identify_capacity();
     if (!ata_wait_busy_clear(20000)) return 0;
 
-    outb(ATA_DRIVE_PORT, 0xE0 | ((lba >> 24) & 0x0F));
-    outb(ATA_ERR_PORT, 0x00);
-    outb(ATA_SECCNT_PORT, 0x01);
-    outb(ATA_LBA_LOW_PORT, (uint8_t)(lba & 0xFF));
-    outb(ATA_LBA_MID_PORT, (uint8_t)((lba >> 8) & 0xFF));
-    outb(ATA_LBA_HIGH_PORT, (uint8_t)((lba >> 16) & 0xFF));
-    outb(ATA_CMD_PORT, 0x30);
+    int use48 = g_ata_lba48 && (lba > 0x0FFFFFFFu);
+    ata_program_lba(lba, use48);
+    outb(ATA_CMD_PORT, use48 ? 0x34 : 0x30);
 
     if (!ata_wait_drq(20000)) {
         serial_print("[ATA] write drq timeout, lba=");
@@ -242,19 +337,25 @@ int ata_write_sector(uint32_t lba, const uint8_t *buf) {
         uint16_t word = (uint16_t)buf[i * 2] | ((uint16_t)buf[i * 2 + 1] << 8);
         outw(ATA_DATA_PORT, word);
     }
-    outb(ATA_CMD_PORT, 0xE7);
-    if (!ata_wait_busy_clear(20000)) {
-        serial_print("[ATA] write flush timeout, lba=");
-        kserial_hex32(lba);
-        serial_putc('\n');
-        return 0;
-    }
+    /* 不在这里逐扇区 FLUSH：那会把机械盘拖成龟速。
+     * 事务落盘时机由文件系统在日志提交点调用 blk_flush() 决定。 */
     g_ata_write_sectors++;
     return 1;
 }
 
+/* 显式刷盘：FLUSH CACHE。必须在日志提交、目录元数据更新、
+ * 文件 close 与卸载后调用，机械盘掉电时才不会丢已提交事务。 */
+int ata_flush(void) {
+    if (!ata_disk_present()) return 0;
+    if (!ata_wait_busy_clear(20000)) return 0;
+    outb(ATA_DRIVE_PORT, g_ata_lba48 ? 0x40 : 0xA0);
+    outb(ATA_CMD_PORT, 0xE7);
+    return ata_wait_busy_clear(40000);
+}
+
 uint32_t ata_total_sectors(void) {
-    return 32u * 1024u * 1024u / 512u;
+    ata_identify_capacity();
+    return g_ata_total_sectors;
 }
 
 static int disk_write_test_value(uint32_t sector, uint8_t value) {
@@ -262,7 +363,7 @@ static int disk_write_test_value(uint32_t sector, uint8_t value) {
     uint8_t block[512];
     for (int i = 0; i < 512; i++) block[i] = 0;
     block[0] = value;
-    if (!ata_write_sector(sector, block)) return 0;
+    if (!blk_write(sector, block)) return 0;
     disk_test_shadow = value;
     return 1;
 }
@@ -271,7 +372,7 @@ static int disk_read_test_value(uint32_t sector, uint8_t *out_value) {
     if (sector >= DISK_MAX_SECTORS) return 0;
     uint8_t block[512];
     for (int i = 0; i < 512; i++) block[i] = 0;
-    if (!ata_read_sector(sector, block)) return 0;
+    if (!blk_read(sector, block)) return 0;
     *out_value = block[0];
     disk_test_shadow = block[0];
     return 1;
@@ -341,6 +442,7 @@ static const char *help_text[] = {
     "  bg <file>                       Run a SLYZ image as a background task",
     "  kill <pid>                      Terminate a task (pid 0 triggers BSOD)",
     "  nano <file> / edit <file>       Full-screen editor (Ctrl+S save, Ctrl+X exit)",
+    "  vizcormin [file]                VizCormin app module (Ctrl+S save, Ctrl+Q quit)",
     "  cat <file>                      Print file contents",
     "  ask <prompt>                    Prompt for yes/no input",
     "  exit / quit                     Exit the shell",
@@ -353,6 +455,7 @@ static const char *help_text[] = {
     "  whoami                          Show current user",
     "  date                            Show fake system date",
     "  mem                             Show kernel heap statistics",
+    "  gpu                             Show Intel GPU probe, GGTT and blitter status",
     "  ps                              Show tasks, quotas and memory usage",
     "  smp / cpu                       Show CPUs, APIC IDs and Local APIC base",
     "  reboot                          Reset the machine via 8042",
@@ -938,7 +1041,7 @@ static int levenshtein(const char *a, const char *b) {
 
 static const char *builtin_cmds[] = {
     "help","min","clear","cls","echo","dir","ls","pwd","cd","run","ask","dd","remove",
-    "mkdir","rmdir","rm","del","df","nano","edit","cat","run","bg","kill","gui","version","uname","whoami","date","mem",
+    "mkdir","rmdir","rm","del","df","nano","edit","vizcormin","cat","run","bg","kill","gui","version","uname","whoami","date","mem","linktest",
     "reboot","poweroff","shutdown","halt","acpi","powercfg","bootmode","ps","smp","cpu",
     "useradd","passwd","su","logout","chmod","chown",
     "ip","ifconfig","curl","ping","nslookup", 0
@@ -1082,6 +1185,35 @@ static void print_dir_entry(const struct SlyzDirEntry *ent) {
 /* dir / ls —— 列出指定目录（缺省为当前工作目录）。
  * 参数可以是相对路径、绝对路径，也可以指向单个文件：
  * 指向文件时只输出该条目，而不是把它当目录去 list_dir。 */
+
+#define SHELL_MODE_PROTECTED 0x8000u
+#define SLYZ_LOGO_UTF8 "\xF3\xB0\x80\x81"
+
+/* 隐藏细节：点开头与受保护条目不在普通列表中展开，
+ * 但会在计数行留下 SlyzOS 私有字形作为线索。
+ * v2 目录项把保护位放在 flags bit0（不再占用 mode 高位）。 */
+static int dir_entry_hidden(const struct SlyzDirEntry *e) {
+    if (e->name[0] == '.') return 1;
+    if (e->flags & 1u) return 1;
+    return 0;
+}
+
+static void print_dir_footer(int count, int hidden_any) {
+    if (count == 1 && !hidden_any) {
+        printk("1 item\n");
+        return;
+    }
+    if (count == 1) {
+        printk("1 item(s)  " SLYZ_LOGO_UTF8 "\n");
+        return;
+    }
+    if (hidden_any) {
+        printk("%d items  " SLYZ_LOGO_UTF8 "\n", count);
+    } else {
+        printk("%d items\n", count);
+    }
+}
+
 static void cmd_dir(const char *args) {
     static struct SlyzDirEntry entries[128];
     char path[SHELL_PATH_MAX];
@@ -1101,7 +1233,7 @@ static void cmd_dir(const char *args) {
             printk("File: %s\n", shown);
             printk("  MODE        UID  SIZE  NAME\n");
             print_dir_entry(&single);
-            printk("1 item(s)\n");
+            print_dir_footer(1, dir_entry_hidden(&single));
             return;
         }
     }
@@ -1118,10 +1250,21 @@ static void cmd_dir(const char *args) {
     }
     printk("Directory of %s\n", shown);
     printk("  MODE        UID  SIZE  NAME\n");
+    int visible = 0;
+    int hidden_any = 0;
     for (int i = 0; i < n; i++) {
+        if (dir_entry_hidden(&entries[i])) {
+            hidden_any = 1;
+            continue;
+        }
         print_dir_entry(&entries[i]);
+        visible++;
     }
-    printk("%d item(s)\n", n);
+    if (visible == 0 && !hidden_any) {
+        printk("(empty directory)\n");
+        return;
+    }
+    print_dir_footer(visible, hidden_any);
 }
 
 static void cmd_pwd(void) {
@@ -1216,9 +1359,10 @@ static void cmd_df(void) {
     printk("\n  clusters : %u used / %u total (%u bytes each)\n",
            (unsigned int)used_clusters, (unsigned int)total_clusters,
            (unsigned int)cluster_bytes);
-    printk("  raw disk : %u sectors (%u KB) via ATA PIO\n",
-           (unsigned int)ata_total_sectors(),
-           (unsigned int)(ata_total_sectors() / 2u));
+    printk("  raw disk : %u sectors (%u KB) via %s\n",
+           (unsigned int)blk_total_sectors(),
+           (unsigned int)(blk_total_sectors() / 2u),
+           blk_backend());
 }
 
 static void cmd_cd(const char *args) {
@@ -1423,6 +1567,131 @@ static void cmd_edit(const char *args) {
     }
 }
 
+/* ---- VizCormin 窗口宿主桥接 ----
+ * shell 只做三件事：解析路径、加载 .slys 模块、把模块导出的能力表
+ * 接到 GUI 的窗口系统上。编辑器代码完全不在内核镜像里。
+ * 图形会话中命令立即返回，窗口由 GUI 每帧驱动；TTY 会话没有窗口
+ * 系统，shell 自己驱动模块全屏渲染。 */
+static const struct SlysVizCorminHost *g_vc_host = 0;
+
+static void vc_bridge_render(int x, int y, int w, int h) {
+    (void)x;
+    (void)y;
+    (void)w;
+    (void)h;
+    if (g_vc_host && g_vc_host->render) g_vc_host->render();
+}
+
+static void vc_bridge_key(int key) {
+    if (g_vc_host && g_vc_host->key) {
+        g_vc_host->key((uint32_t)(uint8_t)key);
+    }
+}
+
+static void vc_bridge_mouse(int x, int y, int button) {
+    if (g_vc_host && g_vc_host->mouse) g_vc_host->mouse(x, y, button);
+}
+
+static void vc_bridge_close(void) {
+    if (g_vc_host && g_vc_host->shutdown) g_vc_host->shutdown();
+    g_vc_host = 0;
+}
+
+static void vc_bridge_resize(int w, int h) {
+    (void)w;
+    (void)h;
+    if (g_vc_host && g_vc_host->resize) g_vc_host->resize();
+}
+
+static const GuiExternalHost g_vc_bridge = {
+    vc_bridge_render,
+    vc_bridge_key,
+    vc_bridge_mouse,
+    vc_bridge_close,
+    vc_bridge_resize
+};
+
+static void cmd_vizcormin(const char *args) {
+    char path[SHELL_PATH_MAX];
+    path[0] = '\0';
+
+    if (args && *args) {
+        shell_resolve_path(path, shell_cwd, args);
+        if (path[0] == '\0') {
+            printk("vizcormin: invalid file name\n");
+            return;
+        }
+        struct SlyzDirEntry probe;
+        for (uint32_t i = 0; i < sizeof(probe); i++) ((uint8_t *)&probe)[i] = 0;
+        if (!slyzfs_stat(path, &probe)) {
+            printk("vizcormin: %s: no such file\n", path);
+            return;
+        }
+    }
+
+    if (g_vc_host) {
+        printk("vizcormin: already running\n");
+        return;
+    }
+
+    void *entry = 0;
+    char name[24];
+    if (!slys_load("C:\\Programs\\VizCormin\\vizcormin.slys",
+                   &entry, name, (int)sizeof(name))) {
+        printk("vizcormin: cannot load C:\\Programs\\VizCormin\\vizcormin.slys\n");
+        return;
+    }
+
+    SlysVizCorminEntryFn fn = (SlysVizCorminEntryFn)entry;
+    const struct SlysVizCorminHost *host = fn(slys_kernel_api());
+    if (!host || host->version != SLYS_VIZCORMIN_ABI || !host->init) {
+        printk("vizcormin: module ABI mismatch\n");
+        return;
+    }
+    g_vc_host = host;
+
+    if (shell_noninteractive()) {
+        /* GUI：先开窗口，应用再按内容区尺寸初始化。 */
+        if (!gui_external_open("VizCormin", 960, 620, &g_vc_bridge)) {
+            g_vc_host = 0;
+            printk("vizcormin: cannot open window\n");
+            return;
+        }
+        if (host->init(slys_kernel_api(), path) < 0) {
+            gui_external_close();
+            g_vc_host = 0;
+            printk("vizcormin: init failed\n");
+            return;
+        }
+        return;
+    }
+
+    /* TTY：模块全屏绘制，shell 负责交换与读键。 */
+    if (host->init(slys_kernel_api(), path) < 0) {
+        g_vc_host = 0;
+        printk("vizcormin: init failed\n");
+        return;
+    }
+    const struct SlysKernelApi *api = slys_kernel_api();
+    for (;;) {
+        host->render();
+        if (api->fb_swap) api->fb_swap();
+
+        char ch = api->kbd_read ? api->kbd_read() : 0;
+        if (ch == 0) {
+            for (volatile int i = 0; i < 30000; i++) {
+                __asm__ volatile ("nop");
+            }
+            continue;
+        }
+        host->key((uint32_t)(uint8_t)ch);
+        if (host->finished && host->finished()) break;
+    }
+    host->shutdown();
+    g_vc_host = 0;
+    tty_repaint();
+}
+
 /* ---- cat：输出文件内容 ----
  * 通过 SlyzFS 打开并分块读取，正文直接写 VGA 而不经过 tty_putchar：
  * 后者每个字符都要等一次 9600 波特率的串口发送，十几 KB 的文件会把
@@ -1530,8 +1799,7 @@ static void cmd_ask(const char *args) {
  * 每层在执行期间各自持有一份独立副本。 */
 static int slyz_depth = 0;
 
-static int slyz_op_run(const char *line) {
-    static char buffer[256];
+static int slyz_op_run(const char *line) {    static char buffer[256];
     cmd_strncpy(buffer, line, sizeof(buffer));
 
     char *cmd = buffer;
@@ -1551,6 +1819,7 @@ static int slyz_op_run(const char *line) {
     }
     return exec_cmd(cmd, args) != 0;
 }
+
 
 /* 脚本的内存申请走任务配额：超出配额时 OOM 直接杀掉当前脚本任务。
  * 内核任务（id 0）没有配额，失败只返回 0，由 VM 终止脚本。 */
@@ -1833,6 +2102,53 @@ static int slyz_time_text(char *out, int cap, int with_date) {
     return 8;
 }
 
+/* SLE_SYS_INPUT 的终端实现：打印提示词，读一行可编辑文本。
+ * 仅 TTY 会话可用；图形应用走 gui_slyz.c 的空字符串实现。 */
+static int slyz_console_read_line(const char *prompt, char *out, int cap) {
+    int len = 0;
+
+    if (!out || cap <= 0) return 0;
+    if (prompt && *prompt) printk("%s", prompt);
+
+    /* SLYZ 任务第一次被 task_switch 恢复时 IF=0，键盘 IRQ 不会进入。
+     * 这里让出一次：切回本任务后 task_yield 会执行 sti。
+     * 之后必须忙等轮询，不能持续 yield —— shell 的 task_wait 有
+     * 100 万次让出上限，长时间等待会把它提前放回提示符抢键盘。 */
+    task_yield();
+
+    for (;;) {
+        char c = kb_read_char();
+        if (c == 0) {
+            tty_tick();
+            delay(20000);
+            continue;
+        }
+        if (c == '\r' || c == '\n') {
+            printk("\n");
+            break;
+        }
+        if (c == 3) {              /* Ctrl+C：放弃本行输入 */
+            printk("^C\n");
+            len = 0;
+            break;
+        }
+        if (c == '\b' || c == 127) {
+            if (len > 0) {
+                len--;
+                printk("\b \b");
+            }
+            continue;
+        }
+        if ((unsigned char)c >= 32 && (unsigned char)c < 127 && len < cap - 1) {
+            out[len++] = c;
+            printk("%c", c);
+        }
+    }
+
+    out[len] = '\0';
+    return len;
+}
+
 static int slyz_host_sys(struct SlyzVm *vm, uint16_t id,
                          struct SlyzVal *args, uint16_t argc,
                          struct SlyzVal *ret) {
@@ -1940,6 +2256,48 @@ static int slyz_host_sys(struct SlyzVm *vm, uint16_t id,
             char buf[16];
             int n = slyz_time_text(buf, (int)sizeof(buf), 1);
             if (!slyz_ret_str(vm, ret, buf, n)) return -1;
+            return 0;
+        }
+
+        case SLE_SYS_FAULT_TRIGGER:
+            /* 成功注入不会返回；未知类型返回 -1。 */
+            slyz_ret_int(ret, (int64_t)faultlab_trigger((int)slyz_arg_int(args, argc, 0)));
+            return 0;
+
+        case SLE_SYS_FAULT_DUMP:
+            slyz_ret_int(ret, (int64_t)faultlab_dump_now());
+            return 0;
+
+        case SLE_SYS_FAULT_LEAK:
+            slyz_ret_int(ret, (int64_t)faultlab_leak((int)slyz_arg_int(args, argc, 0)));
+            return 0;
+
+        case SLE_SYS_FAULT_LEAK_FREE:
+            slyz_ret_int(ret, (int64_t)faultlab_leak_free());
+            return 0;
+
+        case SLE_SYS_FAULT_SET:
+            slyz_ret_int(ret, (int64_t)faultlab_set(slyz_arg_text(args, argc, 0),
+                                                    slyz_arg_text(args, argc, 1)));
+            return 0;
+
+        case SLE_SYS_FAULT_GET: {
+            char value[32];
+            if (faultlab_get(slyz_arg_text(args, argc, 0), value, (int)sizeof(value)) != 0) {
+                if (!slyz_ret_str(vm, ret, "", 0)) return -1;
+                return 0;
+            }
+            int n = 0;
+            while (value[n]) n++;
+            if (!slyz_ret_str(vm, ret, value, n)) return -1;
+            return 0;
+        }
+
+        case SLE_SYS_INPUT: {
+            char line[256];
+            int n = slyz_console_read_line(slyz_arg_text(args, argc, 0),
+                                           line, (int)sizeof(line));
+            if (!slyz_ret_str(vm, ret, line, n)) return -1;
             return 0;
         }
 
@@ -2248,7 +2606,7 @@ static int try_run_slyz_by_name(const char *name) {
 }
 
 static void cmd_help(void)  { for (int i = 0; help_text[i]; i++) printk("%s\n", help_text[i]); }
-static void cmd_min(void)  { printk("help clear echo dir ls pwd cd dd mkdir rmdir rm del df nano cat run bg kill gui ps smp version uname whoami date mem vm swap pfa protect reboot poweroff acpi powercfg bootmode useradd passwd su logout chmod chown ip curl ping nslookup\n"); }
+static void cmd_min(void)  { printk("help clear echo dir ls pwd cd dd mkdir rmdir rm del df nano vizcormin cat run bg kill gui ps smp version uname whoami date mem gpu vm swap pfa protect reboot poweroff acpi powercfg bootmode useradd passwd su logout chmod chown ip curl ping nslookup\n"); }
 static void cmd_clear(void){ tty_clear(); }
 static void cmd_echo(const char *args)  { printk("%s\n", args); }
 
@@ -2499,7 +2857,7 @@ static void cmd_dd(char *args) {
                         printk("dd: if sector %u out of range\n", (unsigned)lba);
                         return;
                     }
-                    if (!ata_read_sector(lba, buf + b * bs + s * 512u)) {
+                    if (!blk_read(lba, buf + b * bs + s * 512u)) {
                         printk("dd: read failed at sector %u\n", (unsigned)lba);
                         return;
                     }
@@ -2529,7 +2887,7 @@ static void cmd_dd(char *args) {
                         if (dst_fh) slyzfs_close(dst_fh);
                         return;
                     }
-                    if (!ata_write_sector(lba, buf + b * bs + s * 512u)) {
+                    if (!blk_write(lba, buf + b * bs + s * 512u)) {
                         printk("dd: write failed at sector %u\n", (unsigned)lba);
                         if (src_fh) slyzfs_close(src_fh);
                         if (dst_fh) slyzfs_close(dst_fh);
@@ -2577,7 +2935,7 @@ static void cmd_remove(char *args) {
     for (uint32_t i = start; i <= end; i++) {
         uint8_t block[512];
         for (int j = 0; j < 512; j++) block[j] = 0;
-        if (!ata_write_sector(i, block)) {
+        if (!blk_write(i, block)) {
             printk("remove: write failed at sector %u\n", (unsigned int)i);
             return;
         }
@@ -2649,6 +3007,36 @@ static void cmd_mem(void) {
            (unsigned int)allocs, (unsigned int)frees, (unsigned int)failed);
     printk("  tasks  : %u alive, %u bytes accounted\n",
            (unsigned int)task_count_alive(), (unsigned int)task_total_used());
+}
+
+/* ---- GPU 状态 ----
+ * 真机调试用：确认探测到的设备、GGTT 地址、自测结果和累计搬运量。
+ * 状态为 fallback 时全部渲染走 CPU，功能不受影响。 */
+static void cmd_gpu(void) {
+    gpu_info_t gi;
+    gpu_get_info(&gi);
+
+    if (!gi.present) {
+        printk("GPU: no supported Intel display device (CPU rendering)\n");
+        return;
+    }
+
+    printk("GPU: %s  %02x:%02x.%x  %04x:%04x\n",
+           gpu_type_name(), (unsigned int)gi.bus, (unsigned int)gi.slot,
+           (unsigned int)gi.func, (unsigned int)gi.vendor,
+           (unsigned int)gi.device);
+    printk("  state     : %s\n",
+           gi.ready ? "blitter acceleration" : "CPU fallback");
+    printk("  mmio      : 0x%x   lfb: 0x%x (gpu va 0x%x)\n",
+           gi.mmio_phys, gi.lfb_phys, gi.lfb_gpu_va);
+    printk("  backbuffer: %u pages @ gpu va 0x%x\n",
+           gi.bb_pages, gi.bb_gpu_va);
+    printk("  ring      : %u KB @ gpu va 0x%x\n",
+           gi.ring_size / 1024u, gi.ring_gpu_va);
+    printk("  cache     : mtrr=%d pat=%d wc=%d\n",
+           gi.mtrr_type, gi.pat_ok, gi.wc_enabled);
+    printk("  traffic   : %u blits, %u bytes, %u timeouts\n",
+           gi.blits, gi.bytes_copied, gi.timeouts);
 }
 
 /* ---- 虚拟内存 / 分页 / swap ----
@@ -3284,6 +3672,16 @@ static void cmd_audiotest(const char *args) {
     audio_stop();
 }
 
+static void cmd_cryptotest(const char *args) {
+    (void)args;
+    int failed = crypto_selftest();
+    if (failed == 0) {
+        printk("cryptotest: all known-answer vectors passed\n");
+    } else {
+        printk("cryptotest: %d vector(s) FAILED\n", failed);
+    }
+}
+
 static void cmd_bootmode(const char *args) {
     char work[32];
     const char *p = args;
@@ -3356,6 +3754,7 @@ static int exec_cmd(const char *cmd, char *args) {
     else if (cmd_strcmp(cmd, "bg") == 0)    cmd_bg(args);
     else if (cmd_strcmp(cmd, "kill") == 0)  cmd_kill(args);
     else if (cmd_strcmp(cmd, "nano") == 0 || cmd_strcmp(cmd, "edit") == 0) cmd_edit(args);
+    else if (cmd_strcmp(cmd, "vizcormin") == 0) cmd_vizcormin(args);
     else if (cmd_strcmp(cmd, "cat") == 0) cmd_cat(args);
     else if (cmd_strcmp(cmd, "ask") == 0)  cmd_ask(args);
     else if (cmd_strcmp(cmd, "exit") == 0 || cmd_strcmp(cmd, "quit") == 0) {
@@ -3373,6 +3772,16 @@ static int exec_cmd(const char *cmd, char *args) {
     else if (cmd_strcmp(cmd, "whoami") == 0) cmd_whoami();
     else if (cmd_strcmp(cmd, "date") == 0)  cmd_date();
     else if (cmd_strcmp(cmd, "mem") == 0)   cmd_mem();
+    else if (cmd_strcmp(cmd, "gpu") == 0)   cmd_gpu();
+    else if (cmd_strcmp(cmd, "linktest") == 0) {
+        printk("[LINK] dynamic linking self-test\n");
+        if (slys_link_selftest()) {
+            printk("[LINK] OK\n");
+        } else {
+            printk("[LINK] FAILED\n");
+        }
+    }
+
     else if (cmd_strcmp(cmd, "reboot") == 0) cmd_reboot();
     else if (cmd_strcmp(cmd, "poweroff") == 0 || cmd_strcmp(cmd, "shutdown") == 0 ||
              cmd_strcmp(cmd, "halt") == 0) cmd_poweroff(args);
@@ -3380,6 +3789,7 @@ static int exec_cmd(const char *cmd, char *args) {
     else if (cmd_strcmp(cmd, "powercfg") == 0) cmd_powercfg(args);
     else if (cmd_strcmp(cmd, "bootmode") == 0) cmd_bootmode(args);
     else if (cmd_strcmp(cmd, "audiotest") == 0) cmd_audiotest(args);
+    else if (cmd_strcmp(cmd, "cryptotest") == 0) cmd_cryptotest(args);
     else if (cmd_strcmp(cmd, "useradd") == 0 || cmd_strcmp(cmd, "adduser") == 0) cmd_useradd(args);
     else if (cmd_strcmp(cmd, "passwd") == 0) cmd_passwd(args);
     else if (cmd_strcmp(cmd, "su") == 0)     cmd_su(args);
@@ -3477,13 +3887,29 @@ void shell_main(void) {
     int mount_ok = slyzfs_try_mount();
     int fresh_volume = 0;
     if (!mount_ok) {
-        if (slyzfs_format_and_mount()) {
+        if (!debug_auto_format_allowed()) {
+            /* 调试模式的安全闸：挂载失败只报告，不碰磁盘。
+             * 工业 U 盘测试时避免把主硬盘上的旧分区格式化。 */
+            printk("[SlyzFS] mount failed, auto-format disabled (debug safe mode)\n");
+        } else if (slyzfs_format_and_mount()) {
             /* 新格式化的卷建立一套默认目录骨架，避免根目录空空如也 */
             slyzfs_mklazy();
             fresh_volume = 1;
         }
     }
     slyzfs_set_quiet(0);
+
+    /* SlyzFS 就绪：调试串口日志开始写入当前启动盘。 */
+    if (mount_ok || fresh_volume) {
+        debug_serial_fs_ready();
+    }
+
+    /* ---- 平滑字体引擎 ----
+     * 必须在 SlyzFS 挂载之后：字体是系统盘里的普通文件。
+     * 未启用 VBE（80x25 文本模式）时 slyertype_init 直接返回 0，
+     * 不分配内存，终端继续保持点阵与两个 '?' 的回退行为。 */
+    slyertype_init();
+    printk("[SlyerType] %s\n", slyertype_status());
 
     /* ---- 分页 / 虚拟内存 / swap ----
      * 必须在 SlyzFS 挂载之后：pagefile.os 是文件系统里的普通文件。
@@ -3498,6 +3924,9 @@ void shell_main(void) {
     slyzfs_set_quiet(1);
     system_cfg_init();
     lang_init();
+    /* 故障实验室必须在系统盘挂载后初始化：它要读 etc\faultlab.cfg，
+     * 并在串口落盘开启时创建 system\logs\serial.log。 */
+    faultlab_init();
     slyzfs_set_quiet(0);
 
     if (system_cfg_boot_gui() && vbe_is_enabled()) {

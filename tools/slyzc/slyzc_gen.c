@@ -112,6 +112,17 @@ static const BuiltinDef g_builtins[] = {
     { "os.proc",        SLE_SYS_PROC,        2 },
     { "os.proc_name",   SLE_SYS_PROC_NAME,   1 },
 
+    /* 故障注入（SylFault）：仅内核宿主提供，命令行宿主会安全降级 */
+    { "fault.trigger",  SLE_SYS_FAULT_TRIGGER,   1 },
+    { "fault.dump",     SLE_SYS_FAULT_DUMP,      0 },
+    { "fault.leak",     SLE_SYS_FAULT_LEAK,      1 },
+    { "fault.leak_free", SLE_SYS_FAULT_LEAK_FREE, 0 },
+    { "fault.set",      SLE_SYS_FAULT_SET,       2 },
+    { "fault.get",      SLE_SYS_FAULT_GET,       1 },
+
+    /* 终端行输入：TTY 返回用户输入，GUI 返回空字符串 */
+    { "input",          SLE_SYS_INPUT,       1 },
+
     /* 媒体与音频 */
     { "media.request",  SLE_SYS_MEDIA_REQ,   0 },
     { "audio.play",     SLE_SYS_AUDIO_PLAY,  1 },
@@ -186,7 +197,7 @@ static const BuiltinDef g_builtins[] = {
 
 static const char *g_namespaces[] = {
     "fs", "cfg", "time", "os", "win", "gfx", "event", "img",
-    "audio", "media", 0
+    "audio", "media", "fault", 0
 };
 
 static int is_namespace(const char *name) {

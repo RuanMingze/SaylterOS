@@ -1,0 +1,149 @@
+// ============================================================
+// sylfault_tty.slyzcode - SylFault 终端版
+// ------------------------------------------------------------
+// 与图形版共用同一组内核系统调用：
+//   fault.trigger(kind)  触发一次受控蓝屏（不会返回）
+//   fault.dump()         立即写崩溃转储（system\crash\dump-*.txt）
+//   fault.leak(kb)       再泄漏约 kb 千字节
+//   fault.leak_free()    释放全部泄漏块
+//   fault.set/get        读写 etc\faultlab.cfg
+//   input(prompt)        终端行输入（本文件的菜单交互）
+//
+// 该程序只适合 TTY 会话：图形会话没有行输入，input() 会返回空串。
+// ============================================================
+
+let running = 1
+
+fn line() {
+    println("------------------------------------------------------------")
+}
+
+fn status_text(key, label) {
+    let v = fault.get(key)
+    if v == "1" {
+        return label + ": ON"
+    }
+    return label + ": OFF"
+}
+
+fn show_status() {
+    println(status_text("dump", "Dump on crash"))
+    println(status_text("serial_to_disk", "Serial log to disk"))
+    println("Leaked memory: " + fault.get("leak_kb") + " KB")
+}
+
+fn show_menu() {
+    line()
+    println(" SylFault (TTY) - fault injection lab")
+    line()
+    println("  1) Manual crash                   STOP 0x000000E2")
+    println("  2) Divide by zero                 STOP 0x0000001E")
+    println("  3) Null pointer dereference       STOP 0x00000050")
+    println("  4) Illegal instruction            STOP 0x0000007F")
+    println("  5) Double free                    STOP 0x000000C2")
+    println("  6) Kernel stack overflow          STOP 0x000000F7")
+    println("  7) Memory exhaustion              STOP 0x000000E4")
+    println("  8) IRQL not less or equal         STOP 0x0000000A")
+    println("  9) Security check failure         STOP 0x00000139")
+    println(" 10) Critical structure corruption  STOP 0x00000109")
+    println(" 11) Driver IRQL violation          STOP 0x000000D1")
+    println(" 12) Leak another 1 MB")
+    println(" 13) Free leaked memory")
+    println(" 14) Write crash dump now")
+    println(" 15) Toggle dump on crash")
+    println(" 16) Toggle serial log to disk")
+    println("  0) Exit")
+    line()
+    show_status()
+    line()
+}
+
+fn trigger(kind, label, code) {
+    println("")
+    println("[!] " + label)
+    println("[!] This will halt the system with STOP " + code + ".")
+    let answer = input("Type YES to continue: ")
+    if answer != "YES" {
+        println("Cancelled.")
+        return
+    }
+    println("Injecting fault...")
+    fault.trigger(kind)
+    // 正常情况下不会执行到这里；未知类型会返回 -1。
+    println("[x] fault.trigger returned without halting (unknown kind).")
+}
+
+fn toggle(key) {
+    if fault.get(key) == "1" {
+        return fault.set(key, "0")
+    }
+    return fault.set(key, "1")
+}
+
+fn main() {
+    println("")
+    println("SylFault - SaylterOS fault injection laboratory")
+    println("Every crash here is simulated on purpose; the machine will halt.")
+
+    while running {
+        show_menu()
+        let choice = input("select> ")
+
+        if choice == "" || choice == "0" {
+            running = 0
+        } else if choice == "1" {
+            trigger(0, "Manually initiated crash", "0x000000E2")
+        } else if choice == "2" {
+            trigger(1, "Divide by zero", "0x0000001E")
+        } else if choice == "3" {
+            trigger(2, "Null pointer dereference", "0x00000050")
+        } else if choice == "4" {
+            trigger(3, "Illegal instruction", "0x0000007F")
+        } else if choice == "5" {
+            trigger(4, "Double free in nonpaged pool", "0x000000C2")
+        } else if choice == "6" {
+            trigger(5, "Kernel stack overflow", "0x000000F7")
+        } else if choice == "7" {
+            trigger(6, "Memory exhaustion", "0x000000E4")
+        } else if choice == "8" {
+            trigger(7, "IRQL not less or equal", "0x0000000A")
+        } else if choice == "9" {
+            trigger(8, "Kernel security check failure", "0x00000139")
+        } else if choice == "10" {
+            trigger(9, "Critical structure corruption", "0x00000109")
+        } else if choice == "11" {
+            trigger(10, "Driver IRQL violation", "0x000000D1")
+        } else if choice == "12" {
+            let total = fault.leak(1024)
+            println("Leaked memory is now " + str(total) + " KB.")
+        } else if choice == "13" {
+            let freed = fault.leak_free()
+            println("Released " + str(freed) + " KB.")
+        } else if choice == "14" {
+            let rc = fault.dump()
+            if rc == 0 {
+                println("Dump written to system\\crash.")
+            } else {
+                println("Dump failed: SlyzFS is not writable.")
+            }
+        } else if choice == "15" {
+            let rc = toggle("dump")
+            if rc == 0 {
+                println("Dump on crash is now " + fault.get("dump") + ".")
+            } else {
+                println("[x] Cannot update etc\\faultlab.cfg; toggle left unchanged.")
+            }
+        } else if choice == "16" {
+            let rc = toggle("serial_to_disk")
+            if rc == 0 {
+                println("Serial log to disk is now " + fault.get("serial_to_disk") + ".")
+            } else {
+                println("[x] Cannot create the serial log or save the config.")
+            }
+        } else {
+            println("Unknown selection: " + choice)
+        }
+    }
+
+    println("SylFault closed.")
+}

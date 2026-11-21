@@ -29,6 +29,7 @@
 #include "reboot.h"
 #include "net.h"
 #include "gui.h"
+#include "debug.h"
 #include "shell.h"
 #include "html.h"
 #include "mem.h"
@@ -38,17 +39,18 @@
 #include "ata.h"
 #include "ime.h"
 #include "unicode.h"
+#include "slyertype.h"
 #include "lang.h"
 #include "gui_slyz.h"
 #include "image.h"
 #include "audio.h"
+#include "blk.h"
 
 /* 界面文案统一走语言包：LTR("Files") 在当前语言为中文时返回"文件"，
  * 未收录的条目自动回退英文，新增语言不需要改任何调用点。 */
 #define LTR(s) lang_tr(s)
 
-/* ATA 累计扇区计数（shell.c 实现），任务管理器的磁盘页使用 */
-extern void ata_stats(uint32_t *reads, uint32_t *writes);
+/* 磁盘统计由 blk.c 提供（USB 或 ATA） */
 
 /* ============================================================
  * SlyzFS 接口与目录项镜像
@@ -60,9 +62,11 @@ extern void ata_stats(uint32_t *reads, uint32_t *writes);
 #pragma pack(push, 1)
 struct GuiDirEntry {
     uint8_t  type;
-    uint8_t  name[52];
-    uint16_t start_cluster;
+    uint8_t  flags;
+    uint16_t name_len;
+    char     name[256];
     uint32_t size;
+    uint32_t start_lba;
     uint32_t created_ts;
     uint32_t modified_ts;
     uint16_t mode;
@@ -91,8 +95,8 @@ extern void  slyzfs_set_quiet(int quiet);
  * ============================================================ */
 
 #define GUI_TASKBAR_W 88
-#define GUI_WIN_MAX   9
-#define GUI_APP_COUNT 7
+#define GUI_WIN_MAX   10
+#define GUI_APP_COUNT 8
 #define GUI_FM_MAX    128
 #define GUI_ED_MAX    65536
 #define GUI_CURSOR_W  16
@@ -107,7 +111,9 @@ enum {
     WIN_SLYZ = 5,
     WIN_TASKMGR = 6,
     WIN_CALC = 7,
-    WIN_MEDIA = 8
+    WIN_MEDIA = 8,
+    /* 原生预装应用窗口：由 GuiExternalHost 驱动（如 VizCormin）。 */
+    WIN_EXTERNAL = 9
 };
 
 enum {
@@ -373,10 +379,15 @@ static void gui_mouse_update(void) {
  * ============================================================ */
 
 static uint8_t g_kb_saved_imr = 0;
+/* GUI 独占键盘期间 IRQ1 被屏蔽，按键只能由 gui_kb_read 轮询 8042
+ * 取得；预装应用（如 VizCormin）通过 SlysKernelApi 读键盘时必须
+ * 走同一条路径，否则在图形会话里一个键都收不到。 */
+static int g_kb_owned = 0;
 
 static void gui_kb_begin(void) {
     g_kb_saved_imr = inb(0x21);
     outb(0x21, (uint8_t)(g_kb_saved_imr | 0x02));   /* mask IRQ1 */
+    g_kb_owned = 1;
 
     /* 丢掉 8042 输出缓冲里残留的键盘字节 */
     for (int i = 0; i < 64; i++) {
@@ -396,6 +407,7 @@ static void gui_kb_end(void) {
     ps2_mouse_disable();
     kb_flush();
     outb(0x21, g_kb_saved_imr);
+    g_kb_owned = 0;
 }
 
 static char gui_kb_read(void) {
@@ -405,6 +417,46 @@ static char gui_kb_read(void) {
 
         uint8_t sc = inb(0x60);
         char c = scancode_to_char(sc);
+        if (c != 0) return c;
+    }
+    return 0;
+}
+
+int gui_keyboard_owned(void) {
+    return g_kb_owned;
+}
+
+char gui_keyboard_poll(void) {
+    if (!g_kb_owned) return 0;
+    /* 鼠标上报没有中断、完全靠 GUI 主循环轮询。预装应用独占屏幕时
+     * 主循环停摆，鼠标包会持续占满 8042 唯一的数据缓冲。
+     *
+     * 这里不能直接 inb 丢弃 AUX 字节：鼠标驱动用跨调用的相位状态
+     * （g_mouse_phase）组包，绕过它丢字节会让相位永久错位，模块退出
+     * 后 GUI 的鼠标就再也不动。必须交给 ps2_mouse_poll_ex 消费，
+     * 同时把位移累加进桌面光标，保证状态机与坐标都保持连续。 */
+    for (int i = 0; i < 32; i++) {
+        uint8_t status = inb(0x64);
+        if ((status & 0x01) == 0) break;
+
+        if ((status & 0x20) != 0) {
+            int8_t mdx = 0;
+            int8_t mdy = 0;
+            int8_t mw = 0;
+            uint8_t mb = 0;
+            if (ps2_mouse_poll_ex(&mdx, &mdy, &mb, &mw) != 0) {
+                g_mx += mdx;
+                g_my += mdy;
+                if (g_mx < 0) g_mx = 0;
+                if (g_my < 0) g_my = 0;
+                if (g_mx > gW - GUI_CURSOR_W) g_mx = gW - GUI_CURSOR_W;
+                if (g_my > gH - GUI_CURSOR_H) g_my = gH - GUI_CURSOR_H;
+                g_mmoved = 1;
+            }
+            continue;
+        }
+
+        char c = scancode_to_char(inb(0x60));
         if (c != 0) return c;
     }
     return 0;
@@ -438,7 +490,7 @@ static void gui_text_n(int x, int y, const char *s, int max_chars, uint32_t colo
 
         if (w == 2) {
             vbe_draw_cjk_transparent((uint16_t)cx, (uint16_t)y,
-                                     (uint16_t)cp, color);
+                                     cp, color);
         } else {
             char one[2];
             one[0] = (char)cp;
@@ -783,6 +835,23 @@ static void icon_chart(int x, int y, int s, uint32_t color) {
                       (uint16_t)bw, (uint16_t)heights[i], color);
     }
     ui_hline(x + 4, base, s - 8, color);
+}
+
+static void icon_fault(int x, int y, int s, uint32_t color) {
+    /* SylFault：警示三角 + 感叹号，和普通应用的图标明显区分 */
+    int cx = x + s / 2;
+    int top = y + 3;
+    int bot = y + s - 5;
+    int left = x + 3;
+    int right = x + s - 4;
+
+    ui_line(cx, top, left, bot, color);
+    ui_line(cx, top, right, bot, color);
+    ui_line(left, bot, right, bot, color);
+
+    int bar_h = (s * 2) / 5;
+    ui_vline(cx, top + s / 4, bar_h, color);
+    ui_round_fill((ui_rect){ cx - 2, bot - 7, 4, 4 }, 2, color);
 }
 
 static void icon_calc(int x, int y, int s, uint32_t color) {
@@ -1504,6 +1573,17 @@ struct GuiWindow {
 
 static struct GuiWindow g_wins[GUI_WIN_MAX];
 static int g_z_counter = 0;
+
+/* ---- 原生应用窗口状态 ---- */
+static const GuiExternalHost *g_ext_host = 0;
+static int    g_ext_space_w = 960;
+static int    g_ext_space_h = 620;
+static char   g_ext_title[32] = "App";
+static ui_rect g_ext_content;
+static int    g_ext_content_valid = 0;
+
+static void dirty_all(void);
+static void dirty_add(int x, int y, int w, int h);
 static int g_focus = -1;
 static int g_dragging = -1;
 static int g_drag_dx = 0;
@@ -1531,17 +1611,29 @@ struct GuiAppDef {
     const char *name;
     const char *desc;
     int         win;
+    int         hidden;   /* 1 = 不在任务栏显示，只在搜索面板出现 */
 };
 
 static const struct GuiAppDef g_apps[GUI_APP_COUNT] = {
-    { "Files",        "Browse your home directory",      WIN_FILES },
-    { "Text Editor",  "Create and edit text files",       WIN_EDITOR },
-    { "Terminal",     "Run shell commands in a window",   WIN_TERM },
-    { "Browser",      "Browse http pages (HTML + CSS)",   WIN_BROWSER },
-    { "Settings",     "Boot mode, clock and account",     WIN_SETTINGS },
-    { "Task Manager", "CPU, memory, disk and processes",  WIN_TASKMGR },
-    { "Calculator",   "Arithmetic with divide-by-zero guard", WIN_CALC }
+    { "Files",        "Browse your home directory",      WIN_FILES,    0 },
+    { "Text Editor",  "Create and edit text files",       WIN_EDITOR,   0 },
+    { "Terminal",     "Run shell commands in a window",   WIN_TERM,     0 },
+    { "Browser",      "Browse http pages (HTML + CSS)",   WIN_BROWSER,  0 },
+    { "Settings",     "Boot mode, clock and account",     WIN_SETTINGS, 0 },
+    { "Task Manager", "CPU, memory, disk and processes",  WIN_TASKMGR,  0 },
+    { "Calculator",   "Arithmetic with divide-by-zero guard", WIN_CALC, 0 },
+    { "SylFault",     "Crash, dump and memory leak lab",  WIN_SLYZ,     1 }
 };
+
+/* 任务栏与启动器只排列可见应用；隐藏项不占槽位，因此 SylFault
+ * 放在数组末尾不会在任务栏留下空档。 */
+static int gui_visible_app_count(void) {
+    int n = 0;
+    for (int i = 0; i < GUI_APP_COUNT; i++) {
+        if (!g_apps[i].hidden) n++;
+    }
+    return n;
+}
 
 /* 由文件管理器 / 编辑器 / 设置页实现（本文件后半部分） */
 static void gui_files_open(const char *path);
@@ -1640,6 +1732,9 @@ static ui_rect win_default_rect(int id) {
     } else if (id == WIN_MEDIA) {
         r.w = 600;
         r.h = 540;
+    } else if (id == WIN_EXTERNAL) {
+        r.w = g_ext_space_w + 20;
+        r.h = g_ext_space_h + 66;
     } else {
         r.w = 640;
         r.h = 640;
@@ -1676,6 +1771,14 @@ static void win_close(int id) {
     if (gui_app_active(id)) {
         gui_app_stop(id);
     }
+    /* 原生应用窗口：先摘掉宿主再通知，避免 close 回调里再次
+     * 请求关闭造成递归。 */
+    if (id == WIN_EXTERNAL && g_ext_host) {
+        const GuiExternalHost *h = g_ext_host;
+        g_ext_host = 0;
+        g_ext_content_valid = 0;
+        if (h->close) h->close();
+    }
     /* 媒体播放器没有独立进程：窗口关闭就停止音频，避免后台
      * 继续播放却找不到控制入口。 */
     if (id == WIN_MEDIA) {
@@ -1689,6 +1792,111 @@ static void win_close(int id) {
     if (g_dragging == id) g_dragging = -1;
     if (g_resizing == id) g_resizing = -1;
     if (id == WIN_FILES || id == WIN_EDITOR) gui_desk_refresh();
+}
+
+/* ============================================================
+ * 原生应用窗口（GuiExternalHost）
+ * ============================================================ */
+
+int gui_external_open(const char *title, int w, int h,
+                      const GuiExternalHost *host) {
+    if (!host) return 0;
+    g_ext_host = host;
+    g_ext_space_w = w > 240 ? w : 240;
+    g_ext_space_h = h > 160 ? h : 160;
+    int n = 0;
+    if (title) {
+        while (title[n] && n < (int)sizeof(g_ext_title) - 1) {
+            g_ext_title[n] = title[n];
+            n++;
+        }
+    }
+    g_ext_title[n] = '\0';
+    g_ext_content_valid = 0;
+    win_open(WIN_EXTERNAL);
+    dirty_all();
+    return 1;
+}
+
+void gui_external_close(void) {
+    if (g_wins[WIN_EXTERNAL].open) {
+        win_close(WIN_EXTERNAL);
+    } else if (g_ext_host) {
+        const GuiExternalHost *h = g_ext_host;
+        g_ext_host = 0;
+        g_ext_content_valid = 0;
+        if (h->close) h->close();
+    }
+    dirty_all();
+}
+
+int gui_external_is_open(void) {
+    return g_wins[WIN_EXTERNAL].open && g_ext_host != 0;
+}
+
+uint32_t gui_ext_width(void) {
+    /* 窗口没打开时必须返回 0：TTY 会话里应用靠这个判断该走
+     * 全屏 fb_* 后端，而不是画到不存在的窗口内容区。 */
+    if (!g_wins[WIN_EXTERNAL].open) return 0;
+    if (g_ext_content_valid && g_ext_content.w > 0) {
+        return (uint32_t)g_ext_content.w;
+    }
+    return (uint32_t)g_ext_space_w;
+}
+
+uint32_t gui_ext_height(void) {
+    if (!g_wins[WIN_EXTERNAL].open) return 0;
+    if (g_ext_content_valid && g_ext_content.h > 0) {
+        return (uint32_t)g_ext_content.h;
+    }
+    return (uint32_t)g_ext_space_h;
+}
+
+void gui_ext_invalidate(void) {
+    /* 只标脏内容区：打字时不必重绘标题栏与阴影，逐个按键整窗重绘
+     * 在 QEMU 的软件渲染下会明显掉帧。 */
+    if (g_wins[WIN_EXTERNAL].open && g_ext_content_valid) {
+        dirty_add(g_ext_content.x, g_ext_content.y,
+                  g_ext_content.w, g_ext_content.h);
+    }
+}
+
+void gui_ext_request_close(void) {
+    gui_external_close();
+}
+
+void gui_ext_fill_rect(int x, int y, int w, int h, uint32_t color) {
+    if (!g_ext_content_valid || w <= 0 || h <= 0) return;
+    int x0 = g_ext_content.x + x;
+    int y0 = g_ext_content.y + y;
+    int x1 = x0 + w;
+    int y1 = y0 + h;
+    if (x0 < g_ext_content.x) x0 = g_ext_content.x;
+    if (y0 < g_ext_content.y) y0 = g_ext_content.y;
+    if (x1 > g_ext_content.x + g_ext_content.w) {
+        x1 = g_ext_content.x + g_ext_content.w;
+    }
+    if (y1 > g_ext_content.y + g_ext_content.h) {
+        y1 = g_ext_content.y + g_ext_content.h;
+    }
+    if (x1 <= x0 || y1 <= y0) return;
+    vbe_fill_rect((uint16_t)x0, (uint16_t)y0,
+                  (uint16_t)(x1 - x0), (uint16_t)(y1 - y0), color);
+}
+
+int gui_ext_draw_cell(int x, int y, int cw, int ch,
+                      uint32_t cp, uint32_t fg) {
+    if (!g_ext_content_valid) return 0;
+    int x0 = g_ext_content.x + x;
+    int y0 = g_ext_content.y + y;
+    if (x0 + cw <= g_ext_content.x || y0 + ch <= g_ext_content.y) return 0;
+    if (x0 >= g_ext_content.x + g_ext_content.w) return 0;
+    if (y0 >= g_ext_content.y + g_ext_content.h) return 0;
+    vbe_push_clip(g_ext_content.x, g_ext_content.y,
+                  g_ext_content.w, g_ext_content.h);
+    int r = slyertype_draw_cell_buf(x0, y0, cw, ch, cp, fg);
+    vbe_pop_clip();
+    return r;
 }
 
 /* 最小化：保留 open 与内容，只从桌面与命中测试里移除；
@@ -1904,6 +2112,10 @@ static void launch_app(int win) {
         gui_app_start(WIN_SETTINGS, "system\\apps\\settings.slyz");
     } else if (win == WIN_TASKMGR) {
         gui_app_start(WIN_TASKMGR, "system\\apps\\taskmgr.slyz");
+    } else if (win == WIN_SLYZ) {
+        /* SylFault：开发工具，不在任务栏出现，只能从搜索启动。
+         * 镜像缺失时窗口仍会打开并显示通用 Slyz 页，便于诊断系统盘。 */
+        gui_app_start(WIN_SLYZ, "system\\apps\\sylfault.slyz");
     }
     win_open(win);
     g_search_open = 0;
@@ -1936,6 +2148,7 @@ static int gui_hover_id(void) {
         ui_rect sr = tb_search_rect();
         if (g_point_in(&sr, x, y)) return 2;
         for (int i = 0; i < GUI_APP_COUNT; i++) {
+            if (g_apps[i].hidden) continue;
             ui_rect r = tb_app_rect(i);
             if (g_point_in(&r, x, y)) return 10 + i;
         }
@@ -2039,6 +2252,7 @@ static void gui_taskbar_render(void) {
     icon_search(sr.x + 28, sr.y + 26, 12, sr_hover ? C_ACCENT3 : C_DIM);
 
     for (int i = 0; i < GUI_APP_COUNT; i++) {
+        if (g_apps[i].hidden) continue;
         ui_rect r = tb_app_rect(i);
         int hover = g_point_in(&r, g_mx, g_my);
         int open = g_wins[g_apps[i].win].open;
@@ -2077,7 +2291,7 @@ static void gui_taskbar_render(void) {
         if (g_wins[i].open && i != WIN_MEDIA) any_open = 1;
     }
     if (any_open) {
-        ui_hline(16, 156 + GUI_APP_COUNT * 54 + 4, 56, C_BORDER);
+        ui_hline(16, 156 + gui_visible_app_count() * 54 + 4, 56, C_BORDER);
     }
 
     for (int i = 0; i < GUI_WIN_MAX; i++) {
@@ -2107,6 +2321,8 @@ static void gui_taskbar_render(void) {
             icon_chart(ix, iy, 16, ic);
         } else if (i == WIN_CALC) {
             icon_calc(ix, iy, 16, ic);
+        } else if (i == WIN_EXTERNAL) {
+            icon_editor(ix, iy, 16, ic);
         } else {
             icon_settings(ix, iy, 16, ic);
         }
@@ -2177,11 +2393,16 @@ static void gui_window_frame(int id, const ui_theme *t) {
         icon_calc(ix, iy, 24, C_ACCENT3);
     } else if (id == WIN_MEDIA) {
         icon_chart(ix, iy, 24, C_ACCENT3);
+    } else if (id == WIN_EXTERNAL) {
+        icon_editor(ix, iy, 24, C_ACCENT3);
     } else {
         icon_settings(ix, iy, 24, C_ACCENT3);
     }
 
-    const char *title_text = id == WIN_FILES ? "Files" :
+    const char *custom_title = (id == WIN_SLYZ) ? gui_app_title(WIN_SLYZ) :
+                               (id == WIN_EXTERNAL) ? g_ext_title : 0;
+    const char *title_text = custom_title ? custom_title :
+                             id == WIN_FILES ? "Files" :
                              id == WIN_EDITOR ? "Text Editor" :
                              id == WIN_TERM ? "Terminal" :
                              id == WIN_BROWSER ? "Browser" :
@@ -2234,6 +2455,24 @@ static void gui_window_frame(int id, const ui_theme *t) {
         gui_calc_render(t, c);
     } else if (id == WIN_MEDIA) {
         if (!gui_app_render(WIN_MEDIA, c)) {
+            vbe_fill_rect((uint16_t)c.x, (uint16_t)c.y, (uint16_t)c.w,
+                          (uint16_t)c.h, 0x0B1017);
+        }
+    } else if (id == WIN_EXTERNAL) {
+        /* 原生预装应用：只画内容区，标题栏/边框/层级由窗口系统负责。
+         * 内容区尺寸变化时先通知应用重新布局，再让它绘制。 */
+        if (g_ext_host) {
+            int resized = (!g_ext_content_valid ||
+                           g_ext_content.w != c.w || g_ext_content.h != c.h);
+            g_ext_content = c;
+            g_ext_content_valid = 1;
+            if (resized && g_ext_host->resize) {
+                g_ext_host->resize(c.w, c.h);
+            }
+            if (g_ext_host->render) {
+                g_ext_host->render(c.x, c.y, c.w, c.h);
+            }
+        } else {
             vbe_fill_rect((uint16_t)c.x, (uint16_t)c.y, (uint16_t)c.w,
                           (uint16_t)c.h, 0x0B1017);
         }
@@ -2307,6 +2546,8 @@ static void gui_search_panel_render(void) {
             icon_chart(icon.x, icon.y, 32, C_ACCENT3);
         } else if (a->win == WIN_CALC) {
             icon_calc(icon.x, icon.y, 32, C_ACCENT3);
+        } else if (a->hidden) {
+            icon_fault(icon.x, icon.y, 32, C_WARN);
         } else {
             icon_settings(icon.x, icon.y, 32, C_ACCENT3);
         }
@@ -3825,7 +4066,7 @@ static void gui_editor_render(const ui_theme *t, ui_rect c) {
 
             if (w == 2) {
                 vbe_draw_cjk_transparent((uint16_t)cx, (uint16_t)y,
-                                         (uint16_t)cp, C_TEXT);
+                                         cp, C_TEXT);
             } else {
                 char ch = (char)cp;
                 if ((unsigned char)ch < 0x20 || (unsigned char)ch >= 0x7F) ch = '.';
@@ -4630,7 +4871,7 @@ static int gui_tm_sample(void) {
 
     uint32_t reads = 0;
     uint32_t writes = 0;
-    ata_stats(&reads, &writes);
+    blk_stats(&reads, &writes);
     (void)reads;
 
     uint32_t delta_sectors = writes - g_tm_last_write_sectors;
@@ -4853,7 +5094,7 @@ static void gui_tm_render_overview(ui_rect p) {
     ui_text_transparent(disk_card.x + 20, disk_card.y + 12, "DISK", C_DIM);
 
     uint32_t rd = 0, wr = 0;
-    ata_stats(&rd, &wr);
+    blk_stats(&rd, &wr);
     uint64_t written_bytes = (uint64_t)wr * 512ull;
 
     char rate[32];
@@ -4987,7 +5228,7 @@ static void gui_tm_render_processes(ui_rect p) {
     mem_stats(&heap_total, &heap_used, &heap_peak, &allocs, &frees, &failed);
 
     uint32_t rd = 0, wr = 0;
-    ata_stats(&rd, &wr);
+    blk_stats(&rd, &wr);
     (void)rd;
 
     uint32_t task_mem = task_total_used();
@@ -5088,7 +5329,7 @@ static void gui_tm_render_devices(ui_rect p) {
     mem_stats(&heap_total, &heap_used, &heap_peak, &allocs, &frees, &failed);
 
     uint32_t rd = 0, wr = 0;
-    ata_stats(&rd, &wr);
+    blk_stats(&rd, &wr);
 
     char buf[96];
     char val[32];
@@ -5163,7 +5404,7 @@ static void gui_tm_render_devices(ui_rect p) {
     ui_text_transparent(c3.x + 18, c3.y + 10, "STORAGE", C_DIM);
     ui_text_transparent(c3.x + 18, c3.y + 44, "ATA PIO (IDE primary master)", C_TEXT);
 
-    uint32_t sectors = ata_total_sectors();
+    uint32_t sectors = blk_total_sectors();
     tm_fmt_bytes((uint64_t)sectors * 512ull, val, sizeof(val));
     g_copy(buf, "capacity ", sizeof(buf));
     bp = 9;
@@ -8435,6 +8676,10 @@ static void gui_desktop_key(char key) {
         gui_calc_key(key);
     } else if (g_focus == WIN_MEDIA) {
         gui_app_key(WIN_MEDIA, (int)(unsigned char)key);
+    } else if (g_focus == WIN_EXTERNAL) {
+        if (g_ext_host && g_ext_host->key) {
+            g_ext_host->key((int)(unsigned char)key);
+        }
     }
 }
 
@@ -8473,6 +8718,7 @@ static void gui_taskbar_click(int x, int y) {
     }
 
     for (int i = 0; i < GUI_APP_COUNT; i++) {
+        if (g_apps[i].hidden) continue;
         ui_rect r = tb_app_rect(i);
         if (g_point_in(&r, x, y)) {
             launch_app(g_apps[i].win);
@@ -8641,6 +8887,10 @@ static void gui_window_click(int id, int x, int y) {
         if (gui_app_active(WIN_MEDIA)) {
             gui_app_click(WIN_MEDIA, x - c.x, y - c.y, 1);
         }
+    } else if (id == WIN_EXTERNAL) {
+        if (g_ext_host && g_ext_host->mouse) {
+            g_ext_host->mouse(x - c.x, y - c.y, 1);
+        }
     } else {
         gui_settings_click(c, x, y);
     }
@@ -8757,6 +9007,8 @@ static void dirty_blink_surface(void) {
     }
 }
 
+static void pf_account(int full, uint32_t pixels);
+
 static void gui_present_all(void) {
     gui_cursor_erase();
     hunt_reset();
@@ -8779,6 +9031,35 @@ static void gui_present_cursor(void) {
     }
     vbe_swap_rect((uint16_t)g_mx, (uint16_t)g_my,
                   GUI_CURSOR_W, GUI_CURSOR_H);
+
+    pf_account(0, (uint32_t)GUI_CURSOR_W * GUI_CURSOR_H * 2u);
+}
+
+/* ---- 临时呈现统计（验证稳态没有全屏 blit） ---- */
+extern void kserial_puts(const char *s);
+extern void kserial_dec32(uint32_t v);
+
+static uint32_t g_pf_frames = 0;
+static uint32_t g_pf_full = 0;
+static uint32_t g_pf_pixels = 0;
+
+static void pf_account(int full, uint32_t pixels) {
+    g_pf_frames++;
+    if (full) g_pf_full++;
+    g_pf_pixels += pixels;
+
+    if (g_pf_frames >= 600) {
+        kserial_puts("[GUI] frames=");
+        kserial_dec32(g_pf_frames);
+        kserial_puts(" full=");
+        kserial_dec32(g_pf_full);
+        kserial_puts(" avg_px=");
+        kserial_dec32(g_pf_pixels / g_pf_frames);
+        kserial_puts("\r\n");
+        g_pf_frames = 0;
+        g_pf_full = 0;
+        g_pf_pixels = 0;
+    }
 }
 
 static void gui_present_dirty(void) {
@@ -8799,10 +9080,20 @@ static void gui_present_dirty(void) {
 
     if (dirty_is_full()) {
         ui_swap();
+        pf_account(1, (uint32_t)gW * (uint32_t)gH);
         return;
     }
 
+    uint32_t px = (uint32_t)GUI_CURSOR_W * GUI_CURSOR_H * 2u;
+    int n_rects = dirty_rect_count();
+    for (int i = 0; i < n_rects; i++) {
+        ui_rect rr;
+        dirty_rect_get(i, &rr);
+        px += (uint32_t)rr.w * (uint32_t)rr.h;
+    }
+
     dirty_swap_all(old_x, old_y);
+    pf_account(0, px);
 }
 
 static int gui_desktop_run(void) {
@@ -8857,10 +9148,18 @@ static int gui_desktop_run(void) {
 
         gui_mouse_update();
 
-        /* 鼠标滚轮：终端内容区内的滚动查看历史；其它窗口暂不消费 */
+        /* 鼠标滚轮：优先交给内容区内的 SLYZ 应用（v3 声明式界面可滚动），
+         * 终端窗口沿用历史滚动。 */
         if (g_mwheel != 0) {
-            if (g_wins[WIN_TERM].open && !g_wins[WIN_TERM].minimized &&
-                win_topmost_at(g_mx, g_my) == WIN_TERM) {
+            int top = win_topmost_at(g_mx, g_my);
+            if (top >= 0 && gui_app_active(top)) {
+                ui_rect ac = win_content_rect(&g_wins[top].r);
+                if (g_point_in(&ac, g_mx, g_my)) {
+                    gui_app_wheel(top, g_mwheel);
+                    dirty_window(top);
+                }
+            } else if (g_wins[WIN_TERM].open && !g_wins[WIN_TERM].minimized &&
+                       top == WIN_TERM) {
                 ui_rect tc = win_content_rect(&g_wins[WIN_TERM].r);
                 if (g_point_in(&tc, g_mx, g_my)) {
                     gui_term_scroll_by(g_mwheel * 3);
@@ -8868,6 +9167,18 @@ static int gui_desktop_run(void) {
                 }
             }
             g_mwheel = 0;
+        }
+
+        /* v3 应用需要逐帧的鼠标位置来更新 hover；这里统一转发，
+         * 不在窗口内的坐标会作为 down=0 传入，从而清除旧 hover。 */
+        for (int mw = 0; mw < GUI_WIN_MAX; mw++) {
+            if (!g_wins[mw].open || g_wins[mw].minimized || !gui_app_active(mw)) continue;
+            ui_rect mc = win_content_rect(&g_wins[mw].r);
+            int lx = g_mx - mc.x;
+            int ly = g_my - mc.y;
+            int is_top = (win_topmost_at(g_mx, g_my) == mw);
+            int down = (is_top && g_point_in(&mc, g_mx, g_my) && g_mdown) ? 1 : 0;
+            gui_app_mouse(mw, lx, ly, down);
         }
 
         if (g_dragging >= 0 && g_mmoved) {
@@ -9067,6 +9378,9 @@ static int gui_desktop_run(void) {
                 dirty_window(WIN_TASKMGR);
             }
         }
+
+        /* 调试 HUD：画在 backbuffer 上并单独上屏，覆盖在所有窗口之上。 */
+        debug_hud_gui_tick();
     }
 }
 

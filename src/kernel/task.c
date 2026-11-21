@@ -353,7 +353,8 @@ int task_kill(int id) {
     return 1;
 }
 
-void task_wait(int id) {    struct Task *t = task_by_id(id);
+void task_wait(int id) {
+    struct Task *t = task_by_id(id);
     if (!t) return;
 
     int guard = 0;

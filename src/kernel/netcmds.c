@@ -16,6 +16,12 @@
 #include <stdint.h>
 #include "tty.h"
 #include "net.h"
+#include "tls.h"
+
+/* SlyzFS 写入（curl -o） */
+extern void *slyzfs_open(const char *path, const char *mode);
+extern int   slyzfs_write(void *fh, const uint8_t *buf, int n);
+extern void  slyzfs_close(void *fh);
 
 #define NC_LINE_MAX 512
 
@@ -147,9 +153,19 @@ static void nc_out_line(const char *s) {
 struct BodySink {
     uint32_t bytes;
     int      last_char;
+    void    *fh;
+    int      io_error;
 };
 
 static void body_write(struct BodySink *sink, const uint8_t *data, uint32_t len) {
+    if (sink->fh) {
+        if (slyzfs_write(sink->fh, data, (int)len) != (int)len) {
+            sink->io_error = 1;
+        }
+        sink->bytes += len;
+        return;
+    }
+
     tty_set_color(0x0F);
     for (uint32_t i = 0; i < len; i++) {
         uint8_t c = data[i];
@@ -172,6 +188,7 @@ struct HttpStream {
     int      len;
     int      eof;
     int      error;
+    int      tls;
     uint32_t timeout_ms;
 };
 
@@ -179,7 +196,13 @@ static int hs_fill(struct HttpStream *s) {
     s->pos = 0;
     s->len = 0;
 
-    int n = net_tcp_recv(s->buf, (uint32_t)sizeof(s->buf), s->timeout_ms);
+    int n;
+    if (s->tls) {
+        n = tls_read(s->buf, (uint32_t)sizeof(s->buf));
+    } else {
+        n = net_tcp_recv(s->buf, (uint32_t)sizeof(s->buf), s->timeout_ms);
+    }
+
     if (n > 0) {
         s->len = n;
         return n;
@@ -255,12 +278,22 @@ struct HttpUrl {
     char     host[128];
     uint16_t port;
     char     path[512];
+    int      tls;
 };
 
 static int parse_http_url(const char *url, struct HttpUrl *out) {
-    if (nc_strncasecmp(url, "http://", 7) != 0) return 0;
+    int tls = 0;
+    const char *p = 0;
 
-    const char *p = url + 7;
+    if (nc_strncasecmp(url, "https://", 8) == 0) {
+        tls = 1;
+        p = url + 8;
+    } else if (nc_strncasecmp(url, "http://", 7) == 0) {
+        p = url + 7;
+    } else {
+        return 0;
+    }
+
     const char *host_start = p;
 
     while (*p && *p != '/' && *p != ':') p++;
@@ -272,7 +305,8 @@ static int parse_http_url(const char *url, struct HttpUrl *out) {
     }
     out->host[host_len] = '\0';
 
-    out->port = 80;
+    out->port = tls ? 443 : 80;
+    out->tls = tls;
 
     if (*p == ':') {
         p++;
@@ -414,8 +448,12 @@ void netcmd_ip(const char *args) {
  * ============================================================ */
 
 static void curl_usage(void) {
-    printk("usage: curl [-i] [-I] [-v] [-s] [-A <agent>] [-m <seconds>] <url>\n");
-    printk("       url must start with http://, e.g. http://10.0.2.2:8000/index.html\n");
+    printk("usage: curl [-i] [-I] [-v] [-s] [-k] [-A <agent>] [-m <seconds>]\n");
+    printk("            [-X <method>] [-d <data>] [-H <header>] [-o <file>] <url>\n");
+    printk("  http:// and https:// (TLS 1.3) are supported.\n");
+    printk("  -d implies POST unless -X is given. Examples:\n");
+    printk("    curl https://example.com/\n");
+    printk("    curl -X PUT -H \"Content-Type: application/json\" -d \"{}\" https://api/items/1\n");
 }
 
 static void parse_status_code(const char *line, int *code) {
@@ -488,6 +526,30 @@ static int http_read_chunked(struct HttpStream *hs, struct BodySink *sink) {
     }
 }
 
+static int curl_send_bytes(int tls, const uint8_t *data, uint32_t len,
+                           uint32_t timeout_ms) {
+    if (tls) {
+        return tls_write(data, len) == (int)len;
+    }
+
+    uint32_t off = 0;
+    while (off < len) {
+        uint32_t chunk = len - off;
+        if (chunk > 4096u) chunk = 4096u;
+        if (net_tcp_send(data + off, chunk, timeout_ms) < 0) return 0;
+        off += chunk;
+    }
+    return 1;
+}
+
+static void curl_conn_close(int tls) {
+    if (tls) {
+        tls_close();
+    } else {
+        net_tcp_close();
+    }
+}
+
 void netcmd_curl(const char *args) {
     char work[NC_LINE_MAX];
     nc_copy(work, args ? args : "", (int)sizeof(work));
@@ -499,9 +561,21 @@ void netcmd_curl(const char *args) {
     int head_only = 0;
     int verbose = 0;
     int silent = 0;
+    int insecure = 0;
     const char *user_agent = "SaylterOS/0.3-Beta1 (x86_64)";
     uint32_t timeout_ms = 15000;
     const char *url = 0;
+    const char *method = 0;
+    const char *body = 0;
+    uint32_t body_len = 0;
+    const char *out_path = 0;
+
+    char body_store[2048];
+    uint32_t body_pos = 0;
+    body_store[0] = '\0';
+
+    const char *headers[8];
+    int header_count = 0;
 
     for (int i = 0; i < argc; i++) {
         if (nc_strcmp(argv[i], "-i") == 0) {
@@ -513,6 +587,8 @@ void netcmd_curl(const char *args) {
             verbose = 1;
         } else if (nc_strcmp(argv[i], "-s") == 0) {
             silent = 1;
+        } else if (nc_strcmp(argv[i], "-k") == 0) {
+            insecure = 1;
         } else if (nc_strcmp(argv[i], "-A") == 0 && i + 1 < argc) {
             user_agent = argv[++i];
         } else if (nc_strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
@@ -522,9 +598,51 @@ void netcmd_curl(const char *args) {
                 return;
             }
             timeout_ms = seconds * 1000u;
+        } else if (nc_strcmp(argv[i], "-X") == 0 && i + 1 < argc) {
+            method = argv[++i];
+        } else if (nc_strcmp(argv[i], "-d") == 0 && i + 1 < argc) {
+            const char *value = argv[++i];
+            uint32_t value_len = 0;
+            while (value[value_len]) value_len++;
+
+            if (body_pos != 0) {
+                if (body_pos + 1 >= sizeof(body_store)) {
+                    printk("curl: POST data exceeds the %u byte buffer\n",
+                           (unsigned int)sizeof(body_store));
+                    return;
+                }
+                body_store[body_pos++] = '&';
+            }
+            if (body_pos + value_len + 1 >= sizeof(body_store)) {
+                printk("curl: POST data exceeds the %u byte buffer\n",
+                       (unsigned int)sizeof(body_store));
+                return;
+            }
+            for (uint32_t k = 0; k < value_len; k++) {
+                body_store[body_pos + k] = value[k];
+            }
+            body_pos += value_len;
+            body_store[body_pos] = '\0';
+            body = body_store;
+            body_len = body_pos;
+        } else if (nc_strcmp(argv[i], "-H") == 0 && i + 1 < argc) {
+            if (header_count < 8) {
+                headers[header_count++] = argv[++i];
+            }
+        } else if (nc_strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
+            out_path = argv[++i];
         } else {
             url = argv[i];
         }
+    }
+
+    if (method && method[0] == '\0') {
+        printk("curl: empty method\n");
+        return;
+    }
+    if (!method) {
+        method = body ? "POST" : "GET";
+        if (head_only) method = "HEAD";
     }
 
     if (!url) {
@@ -534,7 +652,7 @@ void netcmd_curl(const char *args) {
 
     struct HttpUrl parsed;
     if (!parse_http_url(url, &parsed)) {
-        printk("curl: only http:// URLs are supported (https is not implemented)\n");
+        printk("curl: unsupported URL (expected http:// or https://)\n");
         curl_usage();
         return;
     }
@@ -553,27 +671,44 @@ void netcmd_curl(const char *args) {
     }
 
     uint32_t t0 = net_now_ms();
-    if (net_tcp_connect(ip, parsed.port, 5000u) != 0) {
-        printk("curl: connect to %s:%u failed (timeout or refused)\n",
-               ip_text, (unsigned int)parsed.port);
-        return;
+
+    if (parsed.tls) {
+        tls_set_debug(verbose);
+        int rc = tls_connect_addr(parsed.host, ip, parsed.port, insecure ? 0 : 1);
+        if (rc != TLS_OK) {
+            printk("curl: TLS handshake failed: %s\n", tls_error_text());
+            return;
+        }
+        if (verbose) {
+            printk("* TLS 1.3 connected: TLS_AES_128_GCM_SHA256 / x25519%s\n",
+                   insecure ? " (certificate verification skipped)" : "");
+            printk("* Connected to %s (%s) port %u\n",
+                   parsed.host, ip_text, (unsigned int)parsed.port);
+        }
+    } else {
+        if (net_tcp_connect(ip, parsed.port, 5000u) != 0) {
+            printk("curl: connect to %s:%u failed (timeout or refused)\n",
+                   ip_text, (unsigned int)parsed.port);
+            return;
+        }
+        if (verbose) {
+            printk("* Connected to %s (%s) port %u\n",
+                   parsed.host, ip_text, (unsigned int)parsed.port);
+        }
     }
 
-    if (verbose) {
-        printk("* Connected to %s (%s) port %u\n",
-               parsed.host, ip_text, (unsigned int)parsed.port);
-    }
-
-    char request[1024];
+    char request[4096];
     int pos = 0;
     request[0] = '\0';
 
-    nc_append(request, &pos, (int)sizeof(request),
-              head_only ? "HEAD " : "GET ");
+    nc_append(request, &pos, (int)sizeof(request), method);
+    nc_append(request, &pos, (int)sizeof(request), " ");
     nc_append(request, &pos, (int)sizeof(request), parsed.path);
     nc_append(request, &pos, (int)sizeof(request), " HTTP/1.1\r\nHost: ");
     nc_append(request, &pos, (int)sizeof(request), parsed.host);
-    if (parsed.port != 80) {
+
+    int default_port = parsed.tls ? 443 : 80;
+    if ((int)parsed.port != default_port) {
         char portbuf[8];
         uint32_t v = parsed.port;
         int n = 0;
@@ -589,15 +724,50 @@ void netcmd_curl(const char *args) {
         portbuf[k] = '\0';
         nc_append(request, &pos, (int)sizeof(request), portbuf);
     }
+
     nc_append(request, &pos, (int)sizeof(request), "\r\nUser-Agent: ");
     nc_append(request, &pos, (int)sizeof(request), user_agent);
     nc_append(request, &pos, (int)sizeof(request), "\r\nAccept: */*\r\n");
+
+    int custom_content_type = 0;
+    for (int i = 0; i < header_count; i++) {
+        if (nc_strncasecmp(headers[i], "Content-Type:", 13) == 0) {
+            custom_content_type = 1;
+        }
+        nc_append(request, &pos, (int)sizeof(request), headers[i]);
+        nc_append(request, &pos, (int)sizeof(request), "\r\n");
+    }
+
+    if (body) {
+        char clen[24];
+        int n = 0;
+        uint32_t v = body_len;
+        char tmp[16];
+        if (v == 0) tmp[n++] = '0';
+        while (v > 0) {
+            tmp[n++] = (char)('0' + (v % 10u));
+            v /= 10u;
+        }
+        int k = 0;
+        while (n > 0) clen[k++] = tmp[--n];
+        clen[k] = '\0';
+
+        nc_append(request, &pos, (int)sizeof(request), "Content-Length: ");
+        nc_append(request, &pos, (int)sizeof(request), clen);
+        nc_append(request, &pos, (int)sizeof(request), "\r\n");
+
+        if (!custom_content_type) {
+            nc_append(request, &pos, (int)sizeof(request),
+                      "Content-Type: application/x-www-form-urlencoded\r\n");
+        }
+    }
+
     nc_append(request, &pos, (int)sizeof(request), "Connection: close\r\n\r\n");
 
     if (pos >= (int)sizeof(request) - 1) {
         printk("curl: request headers exceed the %u byte buffer\n",
                (unsigned int)sizeof(request));
-        net_tcp_close();
+        curl_conn_close(parsed.tls);
         return;
     }
 
@@ -619,10 +789,20 @@ void netcmd_curl(const char *args) {
         }
     }
 
-    if (net_tcp_send(request, (uint32_t)pos, 10000u) != pos) {
+    if (!curl_send_bytes(parsed.tls, (const uint8_t *)request, (uint32_t)pos,
+                         timeout_ms)) {
         printk("curl: failed to send HTTP request\n");
-        net_tcp_close();
+        curl_conn_close(parsed.tls);
         return;
+    }
+
+    if (body && body_len > 0) {
+        if (!curl_send_bytes(parsed.tls, (const uint8_t *)body, body_len,
+                             timeout_ms)) {
+            printk("curl: failed to send request body\n");
+            curl_conn_close(parsed.tls);
+            return;
+        }
     }
 
     struct HttpStream hs;
@@ -630,12 +810,13 @@ void netcmd_curl(const char *args) {
     hs.len = 0;
     hs.eof = 0;
     hs.error = 0;
+    hs.tls = parsed.tls;
     hs.timeout_ms = timeout_ms;
 
     char line[NC_LINE_MAX];
     if (hs_readline(&hs, line, (int)sizeof(line)) < 0) {
         printk("curl: no response from server\n");
-        net_tcp_close();
+        curl_conn_close(parsed.tls);
         return;
     }
 
@@ -643,7 +824,7 @@ void netcmd_curl(const char *args) {
     parse_status_code(line, &status_code);
     if (status_code == 0) {
         printk("curl: malformed HTTP response: %s\n", line);
-        net_tcp_close();
+        curl_conn_close(parsed.tls);
         return;
     }
 
@@ -687,8 +868,22 @@ void netcmd_curl(const char *args) {
     struct BodySink sink;
     sink.bytes = 0;
     sink.last_char = '\n';
+    sink.fh = 0;
+    sink.io_error = 0;
 
-    int body_allowed = !head_only && status_code != 204 && status_code != 304 &&
+    if (out_path) {
+        sink.fh = slyzfs_open(out_path, "w");
+        if (!sink.fh) {
+            printk("curl: cannot open output file: %s\n", out_path);
+            curl_conn_close(parsed.tls);
+            return;
+        }
+    }
+
+    int is_head = nc_strncasecmp(method, "HEAD", 4) == 0 && method[4] == '\0';
+
+    int body_allowed = !is_head && !head_only &&
+                       status_code != 204 && status_code != 304 &&
                        !(status_code >= 100 && status_code < 200);
 
     if (body_allowed) {
@@ -722,11 +917,17 @@ void netcmd_curl(const char *args) {
         }
     }
 
-    if (sink.last_char != '\n') {
+    if (sink.fh) {
+        slyzfs_close(sink.fh);
+        sink.fh = 0;
+        if (sink.io_error && !silent) {
+            printk("curl: write to output file failed\n");
+        }
+    } else if (sink.last_char != '\n') {
         tty_putchar_vga('\n');
     }
 
-    net_tcp_close();
+    curl_conn_close(parsed.tls);
 
     if (!silent && verbose) {
         printk("* Received %u bytes in %u ms\n",

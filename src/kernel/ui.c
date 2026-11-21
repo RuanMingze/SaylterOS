@@ -14,6 +14,7 @@
 
 #include "vbe.h"
 #include "unicode.h"
+#include "slyertype.h"
 #include "ui.h"
 #include "keyboard.h"
 #include "mouse.h"
@@ -285,8 +286,16 @@ static void ui_text_px_n(int x, int y, const char *s, int n, uint32_t fg)
 
         if (w == 2) {
             vbe_draw_cjk_transparent((uint16_t)px, (uint16_t)y,
-                                     (uint16_t)cp, fg);
+                                     cp, fg);
             px += 32;
+            i += used;
+            count++;
+            continue;
+        }
+
+        /* 平滑字体按 16x32 单元格绘制；不覆盖时回退点阵。 */
+        if (slyertype_draw_cell_buf(px, y, 16, 32, cp, fg)) {
+            px += 16;
             i += used;
             count++;
             continue;
@@ -417,6 +426,14 @@ void ui_text_big(int x, int y, const char *s, uint32_t fg)
     int px = x;
 
     while (*s) {
+        /* 2 倍标题同样走平滑轮廓：单元格 32x64，字号随高度放大。 */
+        if (slyertype_draw_cell_buf(px, y, 32, 64,
+                                    (uint32_t)(uint8_t)(*s), fg)) {
+            px += 32;
+            s++;
+            continue;
+        }
+
         const uint8_t (*glyph)[2] = font16x32[(uint8_t)(*s)];
         for (int row = 0; row < 32; row++) {
             uint8_t left = glyph[row][0];

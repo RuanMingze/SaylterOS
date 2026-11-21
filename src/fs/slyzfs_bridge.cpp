@@ -10,7 +10,7 @@
 
 #include "slyzfs.h"
 #include "disk_io.h"
-#include "../kernel/ata.h"
+#include "../kernel/blk.h"
 #include "../kernel/io.h"
 #include <stdarg.h>
 
@@ -183,7 +183,7 @@ extern "C" int slyzfs_bridge_init(void) {
 extern "C" int slyzfs_format_and_mount(void) {
     slog("format_and_mount START");
     if (!slyzfs::g_inited) slyzfs_bridge_init();
-    uint32_t total = ata_total_sectors();
+    uint32_t total = blk_total_sectors();
     slog_u32("format: ata_total_sectors = ", total);
     if (total == 0) {
         FS_PRINTK("[SlyzFS] no disk - cannot format\n");

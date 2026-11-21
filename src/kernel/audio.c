@@ -73,10 +73,9 @@ void audio_start_task(void) {
 
 int audio_available(void) {
     if (!g_drv) return 0;
-    slys_lock();
-    int ok = g_drv->available();
-    slys_unlock();
-    return ok;
+    /* 只读查询不再抢驱动锁：后台任务解码时持锁，
+     * GUI 每帧查询播放状态会在锁上卡住，表现为拖动掉帧。 */
+    return g_drv->available();
 }
 
 int audio_play(const char *path) {
@@ -103,26 +102,17 @@ void audio_pause(int paused) {
 
 int audio_state(void) {
     if (!g_drv) return AUDIO_STOPPED;
-    slys_lock();
-    int st = g_drv->state();
-    slys_unlock();
-    return st;
+    return g_drv->state();
 }
 
 uint32_t audio_position_ms(void) {
     if (!g_drv) return 0;
-    slys_lock();
-    uint32_t ms = g_drv->position_ms();
-    slys_unlock();
-    return ms;
+    return g_drv->position_ms();
 }
 
 uint32_t audio_duration_ms(void) {
     if (!g_drv) return 0;
-    slys_lock();
-    uint32_t ms = g_drv->duration_ms();
-    slys_unlock();
-    return ms;
+    return g_drv->duration_ms();
 }
 
 void audio_set_volume(int volume) {
@@ -134,10 +124,7 @@ void audio_set_volume(int volume) {
 
 int audio_volume(void) {
     if (!g_drv) return 70;
-    slys_lock();
-    int v = g_drv->volume();
-    slys_unlock();
-    return v;
+    return g_drv->volume();
 }
 
 void audio_pump(void) {

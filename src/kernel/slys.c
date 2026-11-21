@@ -16,27 +16,38 @@
 #include <stdint.h>
 
 #include "slys.h"
+#include "blk.h"
 #include "smp.h"
 #include "mem.h"
 #include "net.h"
 #include "task.h"
+#include "slyzlink.h"
+#include "vbe.h"
+#include "slyertype.h"
+#include "keyboard.h"
+#include "gui.h"
+#include "tty.h"
 
 /* SlyzFS */
 extern void *slyzfs_open(const char *path, const char *mode);
 extern int   slyzfs_read(void *fh, uint8_t *buf, int n);
+extern int   slyzfs_write(void *fh, const uint8_t *buf, int n);
+extern int   slyzfs_seek(void *fh, uint32_t offset);
 extern void  slyzfs_close(void *fh);
 extern int   slyzfs_stat(const char *path, void *out);
 
 extern void kserial_puts(const char *s);
 extern void kserial_dec32(uint32_t v);
 
-/* 目录项布局（只用于读文件大小，与 SlyzFS 71 字节定义一致）。 */
+/* 目录项布局（与 src/include/slysfs.h 的 SlysDirEntry 一致）。 */
 #pragma pack(push, 1)
 struct SlysDirEntry {
     uint8_t  type;
-    uint8_t  name[52];
-    uint16_t start_cluster;
+    uint8_t  flags;
+    uint16_t name_len;
+    char     name[256];
     uint32_t size;
+    uint32_t start_lba;
     uint32_t created_ts;
     uint32_t modified_ts;
     uint16_t mode;
@@ -130,9 +141,19 @@ int slys_load(const char *path, void **entry, char *name, int name_cap) {
         kserial_puts("[SLYS] version/header mismatch\r\n");
         return 0;
     }
-    if (load_addr != SLYS_LOAD_ADDR) {
+    /* 固定基址模块共用同一套加载器：音频驱动在 0x02000000，
+     * 文件系统在 0x04000000，预装图形应用在 0x08000000。
+     * 这里只约束"驱动区"整体范围，并要求镜像 + BSS 不越过 512MB
+     * 恒等映射上限，避免任何模块覆盖 backbuffer 或内核堆。 */
+    if (load_addr < SLYS_LOAD_ADDR || load_addr >= 0x20000000u) {
         slyzfs_close(fh);
         kserial_puts("[SLYS] unsupported load address\r\n");
+        return 0;
+    }
+    if ((uint64_t)load_addr + (uint64_t)image_size + (uint64_t)bss_size >
+        0x20000000ull) {
+        slyzfs_close(fh);
+        kserial_puts("[SLYS] module exceeds mapped range\r\n");
         return 0;
     }
     if (image_size == 0 || image_size > SLYS_MAX_IMAGE ||
@@ -178,6 +199,113 @@ int slys_load(const char *path, void **entry, char *name, int name_cap) {
 
     kserial_puts("[SLYS] loaded ");
     kserial_puts(name ? name : path);
+    kserial_puts(" image=");
+    kserial_dec32(image_size);
+    kserial_puts(" bss=");
+    kserial_dec32(bss_size);
+    kserial_puts("\r\n");
+    return 1;
+}
+
+/* ============================================================
+ * 从原始 LBA 加载模块
+ * ------------------------------------------------------------
+ * 文件系统模块是启动链上第一个 .slys：此时还没有文件系统，
+ * 只能按扇区读。布局：
+ *   LBA + 0        64 字节头
+ *   LBA + 1..      镜像（image_size 字节，按扇区覆盖）
+ * ============================================================ */
+int slys_load_raw(uint32_t lba, void **entry, char *name, int name_cap) {
+    if (!entry) return 0;
+
+    uint8_t sec[512];
+    if (!blk_read(lba, sec)) {
+        kserial_puts("[SLYS] raw: header read failed\r\n");
+        return 0;
+    }
+    if (sec[0] != SLYS_MAGIC0 || sec[1] != SLYS_MAGIC1 ||
+        sec[2] != SLYS_MAGIC2 || sec[3] != SLYS_MAGIC3 ||
+        sec[4] != SLYS_MAGIC4 || sec[5] != SLYS_MAGIC5 ||
+        sec[6] != SLYS_MAGIC6 || sec[7] != 0) {
+        kserial_puts("[SLYS] raw: bad magic\r\n");
+        return 0;
+    }
+
+    uint16_t version = rd16(sec + 8);
+    uint16_t header_size = rd16(sec + 10);
+    uint32_t load_addr = rd32(sec + 12);
+    uint32_t image_size = rd32(sec + 16);
+    uint32_t bss_size = rd32(sec + 20);
+    uint32_t entry_off = rd32(sec + 24);
+    uint32_t checksum = rd32(sec + 32);
+
+    if (version != SLYS_VERSION || header_size != SLYS_HEADER_SIZE) {
+        kserial_puts("[SLYS] raw: version mismatch\r\n");
+        return 0;
+    }
+    if (image_size == 0 || image_size > SLYS_MAX_IMAGE ||
+        bss_size > SLYS_MAX_BSS) {
+        kserial_puts("[SLYS] raw: image/bss too large\r\n");
+        return 0;
+    }
+    if (entry_off >= image_size) {
+        kserial_puts("[SLYS] raw: bad entry offset\r\n");
+        return 0;
+    }
+    /* 只允许加载到内核区之上的固定物理地址，避免覆盖内核/栈/堆。 */
+    if (load_addr < 0x01000000u || load_addr >= 0x20000000u) {
+        kserial_puts("[SLYS] raw: unsupported load address\r\n");
+        return 0;
+    }
+    if (load_addr + image_size + bss_size < load_addr) {
+        kserial_puts("[SLYS] raw: address overflow\r\n");
+        return 0;
+    }
+
+    uint8_t *dst = (uint8_t *)(uintptr_t)load_addr;
+
+    /* .slys 文件 = 64 字节头 + 镜像。镜像紧跟在头之后，
+     * 因此第一个扇区里还剩 448 字节属于镜像，不能整扇区跳过。 */
+    uint32_t done = 0;
+    uint32_t first = 512u - SLYS_HEADER_SIZE;
+    if (first > image_size) first = image_size;
+    for (uint32_t i = 0; i < first; i++) dst[i] = sec[SLYS_HEADER_SIZE + i];
+    done = first;
+
+    uint32_t lba_cur = lba + 1u;
+    while (done < image_size) {
+        if (!blk_read(lba_cur, sec)) {
+            kserial_puts("[SLYS] raw: image read failed\r\n");
+            return 0;
+        }
+        uint32_t n = image_size - done;
+        if (n > 512u) n = 512u;
+        for (uint32_t i = 0; i < n; i++) dst[done + i] = sec[i];
+        done += n;
+        lba_cur++;
+    }
+
+    if (fnv1a(dst, image_size) != checksum) {
+        kserial_puts("[SLYS] raw: checksum mismatch\r\n");
+        return 0;
+    }
+
+    for (uint32_t i = 0; i < bss_size; i++) {
+        dst[image_size + i] = 0;
+    }
+
+    if (name && name_cap > 0) {
+        int n = 0;
+        while (n < 23 && sec[40 + n] && n < name_cap - 1) {
+            name[n] = (char)sec[40 + n];
+            n++;
+        }
+        name[n] = '\0';
+    }
+
+    *entry = (void *)(uintptr_t)(load_addr + entry_off);
+    kserial_puts("[SLYS] raw loaded ");
+    kserial_puts(name ? name : "?");
     kserial_puts(" image=");
     kserial_dec32(image_size);
     kserial_puts(" bss=");
@@ -251,6 +379,93 @@ static int api_file_exists(const char *path) {
     return slyzfs_stat(path, &ent) ? 1 : 0;
 }
 
+/* ---- 预装应用宿主 ---- */
+
+static void *api_fs_open(const char *path, const char *mode) {
+    return slyzfs_open(path, mode);
+}
+
+static int api_fs_read(void *fh, uint8_t *buf, int n) {
+    return slyzfs_read(fh, buf, n);
+}
+
+static int api_fs_write(void *fh, const uint8_t *buf, int n) {
+    return slyzfs_write(fh, buf, n);
+}
+
+static void api_fs_close(void *fh) {
+    slyzfs_close(fh);
+}
+
+static int api_fs_stat(const char *path, void *out) {
+    return slyzfs_stat(path, out);
+}
+
+static void api_fb_fill_rect(int x, int y, int w, int h, uint32_t color) {
+    if (w <= 0 || h <= 0 || !vbe_is_enabled()) return;
+    vbe_fill_rect((uint16_t)x, (uint16_t)y, (uint16_t)w, (uint16_t)h, color);
+}
+
+static int api_fb_draw_cell(int x, int y, int cw, int ch, uint32_t cp, uint32_t fg) {
+    if (!vbe_is_enabled()) return 0;
+    return slyertype_draw_cell_buf(x, y, cw, ch, cp, fg);
+}
+
+static void api_fb_swap(void) {
+    vbe_swap();
+}
+
+static uint32_t api_fb_width(void) {
+    return vbe_current.width;
+}
+
+static uint32_t api_fb_height(void) {
+    return vbe_current.height;
+}
+
+static char api_kbd_read(void) {
+    /* 图形会话会屏蔽 IRQ1 并自己轮询 8042；此时内核环形缓冲不会
+     * 再有新按键。预装应用必须跟随当前键盘所有者，否则在全屏编辑器
+     * 里收不到任何输入。 */
+    if (gui_keyboard_owned()) return gui_keyboard_poll();
+    return kb_read_char();
+}
+
+static void api_win_fill_rect(int x, int y, int w, int h, uint32_t color) {
+    gui_ext_fill_rect(x, y, w, h, color);
+}
+
+static int api_win_draw_cell(int x, int y, int cw, int ch,
+                             uint32_t cp, uint32_t fg) {
+    return gui_ext_draw_cell(x, y, cw, ch, cp, fg);
+}
+
+static uint32_t api_win_width(void) {
+    return gui_ext_width();
+}
+
+static uint32_t api_win_height(void) {
+    return gui_ext_height();
+}
+
+static void api_win_invalidate(void) {
+    gui_ext_invalidate();
+}
+
+static void api_win_close(void) {
+    gui_ext_request_close();
+}
+
+static const char *g_slys_arg = "";
+
+static const char *api_arg(void) {
+    return g_slys_arg;
+}
+
+void slys_set_arg(const char *arg) {
+    g_slys_arg = arg ? arg : "";
+}
+
 static const struct SlysKernelApi g_api = {
     1,
     api_alloc,
@@ -263,9 +478,403 @@ static const struct SlysKernelApi g_api = {
     api_unlock,
     api_yield,
     api_read_file,
-    api_file_exists
+    api_file_exists,
+    api_fs_open,
+    api_fs_read,
+    api_fs_write,
+    api_fs_close,
+    api_fs_stat,
+    api_fb_fill_rect,
+    api_fb_draw_cell,
+    api_fb_swap,
+    api_fb_width,
+    api_fb_height,
+    api_kbd_read,
+    api_arg,
+    api_win_fill_rect,
+    api_win_draw_cell,
+    api_win_width,
+    api_win_height,
+    api_win_invalidate,
+    api_win_close
 };
 
 const struct SlysKernelApi *slys_kernel_api(void) {
     return &g_api;
+}
+
+/* ============================================================
+ * .slyzd 动态链接加载器
+ * ------------------------------------------------------------
+ * 固定基址模型：模块头声明 load_addr，加载器不做搬移。
+ * 流程：校验头 -> 递归加载依赖 -> 复制镜像 -> 校验和 ->
+ *       注册导出 -> 回填导入槽 -> 应用重定位 -> 返回入口。
+ * 依赖从 system\modules\<name>.slyzd 读取。
+ * ============================================================ */
+
+#define SLYS_LINK_MAX        8
+#define SLYS_LINK_PATH_MAX   128
+#define SLYS_LINK_MIN_ADDR   0x06000000u   /* 系统模块区之上 */
+#define SLYS_LINK_MAX_ADDR   0x20000000u
+#define SLYS_LINK_TABLE_MAX  65536u
+
+struct SlysLoadedModule {
+    int      used;
+    char     name[SLYZ_MODULE_NAME_MAX];
+    uint32_t load_addr;
+    uint32_t image_size;
+    uint32_t bss_size;
+    uint32_t entry_addr;
+    struct SlyzSymbol *exports;
+    uint32_t export_count;
+};
+
+static struct SlysLoadedModule g_linked[SLYS_LINK_MAX];
+
+static int link_streq(const char *a, const char *b) {
+    while (*a && *b) {
+        if (*a != *b) return 0;
+        a++;
+        b++;
+    }
+    return *a == *b;
+}
+
+static struct SlysLoadedModule *link_find(const char *name) {
+    for (int i = 0; i < SLYS_LINK_MAX; i++) {
+        if (g_linked[i].used && link_streq(g_linked[i].name, name)) {
+            return &g_linked[i];
+        }
+    }
+    return 0;
+}
+
+static int link_range_overlaps(uint32_t addr, uint32_t size) {
+    uint32_t end = addr + size;
+    if (end < addr) return 1;
+
+    for (int i = 0; i < SLYS_LINK_MAX; i++) {
+        if (!g_linked[i].used) continue;
+        uint32_t a0 = g_linked[i].load_addr;
+        uint32_t a1 = a0 + g_linked[i].image_size + g_linked[i].bss_size;
+        if (addr < a1 && a0 < end) return 1;
+    }
+    return 0;
+}
+
+static int link_find_symbol(const char *name, uint16_t version, uint16_t kind,
+                            uint32_t *out) {
+    for (int i = 0; i < SLYS_LINK_MAX; i++) {
+        if (!g_linked[i].used) continue;
+        for (uint32_t j = 0; j < g_linked[i].export_count; j++) {
+            struct SlyzSymbol *s = &g_linked[i].exports[j];
+            if (s->version != version || s->kind != kind) continue;
+            if (!link_streq(s->name, name)) continue;
+            *out = g_linked[i].load_addr + s->offset;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int link_load_file(const char *path, int depth, uint32_t *entry_out) {
+    if (!path || !entry_out || depth > 8) return 0;
+
+    void *fh = slyzfs_open(path, "r");
+    if (!fh) {
+        kserial_puts("[LINK] open failed: ");
+        kserial_puts(path);
+        kserial_puts("\r\n");
+        return 0;
+    }
+
+    uint8_t hdr[SLYZLINK_HEADER_SIZE];
+    if (read_full(fh, hdr, (int)sizeof(hdr)) != (int)sizeof(hdr)) {
+        slyzfs_close(fh);
+        kserial_puts("[LINK] short header\r\n");
+        return 0;
+    }
+
+    if (hdr[0] != SLYZD_MAGIC0 || hdr[1] != SLYZD_MAGIC1 ||
+        hdr[2] != SLYZD_MAGIC2 || hdr[3] != SLYZD_MAGIC3 ||
+        hdr[4] != SLYZD_MAGIC4 || hdr[5] != SLYZD_MAGIC5 ||
+        hdr[6] != SLYZD_MAGIC6 || hdr[7] != SLYZD_MAGIC7) {
+        slyzfs_close(fh);
+        kserial_puts("[LINK] bad magic\r\n");
+        return 0;
+    }
+
+    uint16_t version = rd16(hdr + 8);
+    uint16_t flags = rd16(hdr + 10);
+    uint32_t header_size = rd32(hdr + 12);
+    uint32_t load_addr = rd32(hdr + 16);
+    uint32_t image_size = rd32(hdr + 20);
+    uint32_t bss_size = rd32(hdr + 24);
+    uint32_t entry_off = rd32(hdr + 28);
+    uint32_t image_off = rd32(hdr + 32);
+    uint32_t export_off = rd32(hdr + 36);
+    uint32_t export_count = rd32(hdr + 40);
+    uint32_t import_off = rd32(hdr + 44);
+    uint32_t import_count = rd32(hdr + 48);
+    uint32_t reloc_off = rd32(hdr + 52);
+    uint32_t reloc_count = rd32(hdr + 56);
+    uint32_t dep_off = rd32(hdr + 60);
+    uint32_t dep_count = rd32(hdr + 64);
+    uint32_t checksum = rd32(hdr + 68);
+
+    char name[SLYZ_MODULE_NAME_MAX];
+    for (int i = 0; i < (int)SLYZ_MODULE_NAME_MAX - 1; i++) {
+        name[i] = (char)hdr[72 + i];
+        if (name[i] == '\0') break;
+    }
+    name[SLYZ_MODULE_NAME_MAX - 1] = '\0';
+
+    if (version != SLYZLINK_VERSION || header_size != SLYZLINK_HEADER_SIZE) {
+        slyzfs_close(fh);
+        kserial_puts("[LINK] version/header mismatch\r\n");
+        return 0;
+    }
+    if (!(flags & SLYZ_MOD_DYNAMIC)) {
+        slyzfs_close(fh);
+        kserial_puts("[LINK] not a dynamic module\r\n");
+        return 0;
+    }
+    if (image_size == 0 || image_size > SLYS_MAX_IMAGE ||
+        bss_size > SLYS_MAX_BSS) {
+        slyzfs_close(fh);
+        kserial_puts("[LINK] image/bss too large\r\n");
+        return 0;
+    }
+    if (entry_off >= image_size || image_off < SLYZLINK_HEADER_SIZE ||
+        image_off > SLYS_LINK_TABLE_MAX) {
+        slyzfs_close(fh);
+        kserial_puts("[LINK] bad offsets\r\n");
+        return 0;
+    }
+    if (load_addr < SLYS_LINK_MIN_ADDR || load_addr >= SLYS_LINK_MAX_ADDR ||
+        load_addr + image_size + bss_size < load_addr ||
+        link_range_overlaps(load_addr, image_size + bss_size)) {
+        slyzfs_close(fh);
+        kserial_puts("[LINK] bad or overlapping load address\r\n");
+        return 0;
+    }
+
+    /* 已加载同名模块：直接复用。 */
+    struct SlysLoadedModule *existing = link_find(name);
+    if (existing) {
+        slyzfs_close(fh);
+        *entry_out = existing->entry_addr;
+        return 1;
+    }
+
+    uint32_t table_bytes = image_off - SLYZLINK_HEADER_SIZE;
+    uint8_t *tables = 0;
+    if (table_bytes > 0) {
+        tables = (uint8_t *)kmalloc(table_bytes);
+        if (!tables) {
+            slyzfs_close(fh);
+            kserial_puts("[LINK] out of memory for tables\r\n");
+            return 0;
+        }
+        if (read_full(fh, tables, (int)table_bytes) != (int)table_bytes) {
+            kfree(tables);
+            slyzfs_close(fh);
+            kserial_puts("[LINK] short tables\r\n");
+            return 0;
+        }
+    }
+
+    if (table_bytes > 0) {
+        if ((export_count &&
+             (export_off < SLYZLINK_HEADER_SIZE ||
+              export_off + export_count * sizeof(struct SlyzSymbol) > image_off)) ||
+            (import_count &&
+             (import_off < SLYZLINK_HEADER_SIZE ||
+              import_off + import_count * sizeof(struct SlyzImport) > image_off)) ||
+            (reloc_count &&
+             (reloc_off < SLYZLINK_HEADER_SIZE ||
+              reloc_off + reloc_count * sizeof(struct SlyzReloc) > image_off)) ||
+            (dep_count &&
+             (dep_off < SLYZLINK_HEADER_SIZE ||
+              dep_off + dep_count * sizeof(struct SlyzDep) > image_off))) {
+            kfree(tables);
+            slyzfs_close(fh);
+            kserial_puts("[LINK] table outside file\r\n");
+            return 0;
+        }
+    }
+
+    struct SlyzSymbol *exports = 0;
+    struct SlyzImport *imports = 0;
+    struct SlyzReloc *relocs = 0;
+    struct SlyzDep *deps = 0;
+    if (tables) {
+        if (export_count) exports = (struct SlyzSymbol *)(void *)(tables + (export_off - SLYZLINK_HEADER_SIZE));
+        if (import_count) imports = (struct SlyzImport *)(void *)(tables + (import_off - SLYZLINK_HEADER_SIZE));
+        if (reloc_count) relocs = (struct SlyzReloc *)(void *)(tables + (reloc_off - SLYZLINK_HEADER_SIZE));
+        if (dep_count) deps = (struct SlyzDep *)(void *)(tables + (dep_off - SLYZLINK_HEADER_SIZE));
+    }
+
+    /* 递归加载依赖（依赖先于本模块完成符号注册）。 */
+    for (uint32_t i = 0; i < dep_count; i++) {
+        char dep_path[SLYS_LINK_PATH_MAX];
+        int n = 0;
+        const char *prefix = "system\\modules\\";
+        const char *suffix = ".slyzd";
+        while (prefix[n] && n < SLYS_LINK_PATH_MAX - 1) { dep_path[n] = prefix[n]; n++; }
+        for (int k = 0; deps[i].name[k] && n < SLYS_LINK_PATH_MAX - 1; k++) {
+            dep_path[n++] = deps[i].name[k];
+        }
+        for (int k = 0; suffix[k] && n < SLYS_LINK_PATH_MAX - 1; k++) {
+            dep_path[n++] = suffix[k];
+        }
+        dep_path[n] = '\0';
+
+        uint32_t dep_entry = 0;
+        if (!link_load_file(dep_path, depth + 1, &dep_entry)) {
+            kfree(tables);
+            slyzfs_close(fh);
+            kserial_puts("[LINK] dependency failed: ");
+            kserial_puts(deps[i].name);
+            kserial_puts("\r\n");
+            return 0;
+        }
+    }
+
+    uint8_t *dst = (uint8_t *)(uintptr_t)load_addr;
+    if (!slyzfs_seek(fh, image_off) ||
+        read_full(fh, dst, (int)image_size) != (int)image_size) {
+        kfree(tables);
+        slyzfs_close(fh);
+        kserial_puts("[LINK] short image\r\n");
+        return 0;
+    }
+
+    if (fnv1a(dst, image_size) != checksum) {
+        kfree(tables);
+        slyzfs_close(fh);
+        kserial_puts("[LINK] checksum mismatch\r\n");
+        return 0;
+    }
+
+    for (uint32_t i = 0; i < bss_size; i++) {
+        dst[image_size + i] = 0;
+    }
+
+    /* 注册导出。 */
+    int slot = -1;
+    for (int i = 0; i < SLYS_LINK_MAX; i++) {
+        if (!g_linked[i].used) { slot = i; break; }
+    }
+    if (slot < 0) {
+        kfree(tables);
+        slyzfs_close(fh);
+        kserial_puts("[LINK] module table full\r\n");
+        return 0;
+    }
+
+    struct SlysLoadedModule *mod = &g_linked[slot];
+    mod->used = 1;
+    mod->load_addr = load_addr;
+    mod->image_size = image_size;
+    mod->bss_size = bss_size;
+    mod->entry_addr = load_addr + entry_off;
+    mod->export_count = export_count;
+
+    int k = 0;
+    while (name[k] && k < (int)SLYZ_MODULE_NAME_MAX - 1) {
+        mod->name[k] = name[k];
+        k++;
+    }
+    mod->name[k] = '\0';
+
+    mod->exports = 0;
+    if (export_count) {
+        mod->exports = (struct SlyzSymbol *)kmalloc(export_count * (uint32_t)sizeof(struct SlyzSymbol));
+        if (!mod->exports) {
+            mod->used = 0;
+            kfree(tables);
+            slyzfs_close(fh);
+            kserial_puts("[LINK] out of memory for exports\r\n");
+            return 0;
+        }
+        for (uint32_t i = 0; i < export_count; i++) {
+            mod->exports[i] = exports[i];
+        }
+    }
+
+    /* 回填导入槽。 */
+    for (uint32_t i = 0; i < import_count; i++) {
+        uint32_t addr = 0;
+        if (!link_find_symbol(imports[i].name, imports[i].version,
+                              imports[i].kind, &addr)) {
+            kserial_puts("[LINK] unresolved import: ");
+            kserial_puts(imports[i].name);
+            kserial_puts("\r\n");
+            mod->used = 0;
+            if (mod->exports) kfree(mod->exports);
+            kfree(tables);
+            slyzfs_close(fh);
+            return 0;
+        }
+        if (imports[i].slot_offset + 8u > image_size) {
+            mod->used = 0;
+            if (mod->exports) kfree(mod->exports);
+            kfree(tables);
+            slyzfs_close(fh);
+            kserial_puts("[LINK] import slot outside image\r\n");
+            return 0;
+        }
+        *(volatile uint64_t *)(uintptr_t)(load_addr + imports[i].slot_offset) = addr;
+    }
+
+    /* 绝对地址重定位：镜像里的值作为 addend。 */
+    for (uint32_t i = 0; i < reloc_count; i++) {
+        uint32_t at = load_addr + relocs[i].offset;
+        if (relocs[i].type == SLYZ_RELOC_ABS64) {
+            if (relocs[i].offset + 8u > image_size) continue;
+            uint64_t addend = *(volatile uint64_t *)(uintptr_t)at;
+            *(volatile uint64_t *)(uintptr_t)at = addend + load_addr;
+        } else if (relocs[i].type == SLYZ_RELOC_ABS32) {
+            if (relocs[i].offset + 4u > image_size) continue;
+            uint32_t addend = *(volatile uint32_t *)(uintptr_t)at;
+            *(volatile uint32_t *)(uintptr_t)at = addend + load_addr;
+        }
+    }
+
+    kfree(tables);
+    slyzfs_close(fh);
+
+    kserial_puts("[LINK] loaded ");
+    kserial_puts(name);
+    kserial_puts(" image=");
+    kserial_dec32(image_size);
+    kserial_puts(" exports=");
+    kserial_dec32(export_count);
+    kserial_puts("\r\n");
+
+    *entry_out = mod->entry_addr;
+    return 1;
+}
+
+int slys_load_dynamic(const char *path, void **entry) {
+    if (!path || !entry) return 0;
+    uint32_t addr = 0;
+    if (!link_load_file(path, 0, &addr)) return 0;
+    *entry = (void *)(uintptr_t)addr;
+    return 1;
+}
+
+int slys_link_selftest(void) {
+    void *entry = 0;
+    if (!slys_load_dynamic("system\\modules\\demo.slyzd", &entry)) {
+        kserial_puts("[LINK] self-test: demo.slyzd load failed\r\n");
+        return 0;
+    }
+
+    SlysModuleEntryFn fn = (SlysModuleEntryFn)entry;
+    if (fn) (void)fn(slys_kernel_api());
+
+    kserial_puts("[LINK] self-test: demo.slyzd completed\r\n");
+    return 1;
 }

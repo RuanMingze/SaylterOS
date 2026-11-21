@@ -90,6 +90,9 @@ int utf8_encode(uint32_t cp, uint8_t *buf) {
 }
 
 int utf32_width(uint32_t cp) {
+    /* SlyzOS 私有区字形：占两个 16px 单元格（32x32）。 */
+    if (cp == 0xF0001u) return 2;
+
     /* 控制字符与零宽字符不占列 */
     if (cp == 0 || cp == 0x200Bu || cp == 0x200Cu || cp == 0x200Du ||
         (cp >= 0x200Eu && cp <= 0x200Fu) || cp == 0xFEFFu) {

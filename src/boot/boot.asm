@@ -27,15 +27,21 @@ jmp short start
 nop
 
 start:
-    ; --- 先保存 BIOS 传入的启动驱动器号 (DL) ---
-    ;    我们后面设 ax=0 会覆盖它
-    mov byte [drive_num], dl
-
-    ; --- 关中断，设置栈 ---
+    ; --- 关中断，段寄存器归零 ---
     cli
     xor ax, ax
     mov ds, ax
     mov es, ax
+
+    ; --- 在任何 int 0x13 之前保存 BIOS 启动盘号 ---
+    ; BIOS 的磁盘中断可能改写 DL，stage2 再保存就晚了。
+    ; 0x500 属于常规内存空闲区（EBDA 在 0x9FC00），不受 MBR 数据布局影响。
+    mov byte [0x0500], dl
+
+    ; --- 再保存一份给本文件的 lba_read 用 ---
+    mov byte [drive_num], dl
+
+    ; --- 设置栈 ---
     mov ss, ax
     mov sp, 0x7C00
     sti

@@ -15,6 +15,7 @@
 #include "task.h"
 #include "mem.h"
 #include "tty.h"
+#include "faultlab.h"
 
 #define BSOD_ATTR 0x1F          /* 蓝底亮白 */
 #define BSOD_LINE_MAX 128
@@ -71,6 +72,10 @@ static void bsod_text(int row, int col, const char *text) {
 }
 
 void bsod(uint32_t stop_code, const char *reason) {
+    /* 0. 冻结前先落盘：按配置写崩溃转储并刷新串口日志缓冲。
+     *    该路径内部把串口置为静默，写 SlyzFS 不会反过来触发串口落盘。 */
+    faultlab_on_bsod(stop_code, reason);
+
     /* 1. 冻结中断源 */
     __asm__ volatile ("cli");
     outb(0x21, 0xFF);           /* 主 PIC 全部屏蔽 */
@@ -139,6 +144,10 @@ void bsod(uint32_t stop_code, const char *reason) {
 
     bsod_text(18, 3, "Press the power button or reset the machine to restart.");
     bsod_text(20, 3, "If this persists, check the serial log for the crash reason.");
+
+    /* 把刚写入的串口摘要刷进磁盘日志（若开启了串口落盘）。
+     * 刷新期间串口静默，因此不会再次产生新的日志字节。 */
+    faultlab_serial_flush();
 
     /* 5. 冻结 CPU —— 只能靠电源键或复位离开 */
     for (;;) {

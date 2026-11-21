@@ -25,6 +25,14 @@
 #   -MemoryMB 128     调整内存
 #   -NoReboot         禁止 guest 重启（QEMU 在 reboot 时退出）
 #   -Headless         无窗口 + monitor tcp:4470（自动化用）
+#   -UsbDisk          IDE 引导，内核优先从 U 盘读 SlyzFS
+#   -UsbOnly          只挂 U 盘：BIOS 与内核都必须走 USB
+#   -Usb2             用 EHCI(USB 2.0) 而不是 xHCI(USB 3.0)
+#   -Sata             额外挂一块 SATA(AHCI) 磁盘，验证内核 SATA 后端
+#   -Hell             地狱模式：q35 + AHCI 512GB 动态稀疏盘 + 4 CPU
+#                     + HDA 声卡 + virtio-rng，尽量贴近实体机；
+#                     直接写盘（不走 snapshot），用于掉电/日志重放测试
+#   -HellDiskGB 512   地狱盘容量（默认 512GB，逻辑大小，实际按写入增长）
 #   -Image <path>     直接指定镜像
 # ============================================================
 
@@ -32,7 +40,14 @@ param(
     [switch]$Persist,
     [switch]$NoReboot,
     [switch]$Headless,
-    [int]$MemoryMB = 64,
+    [switch]$UsbDisk,
+    [switch]$UsbOnly,
+    [switch]$Usb2,
+    [switch]$Sata,
+    [switch]$Hell,
+    [switch]$VirtGpu,
+    [int]$HellDiskGB = 512,
+    [int]$MemoryMB = 256,
     [int]$Smp = 3,
     [string]$Image = ''
 )
@@ -40,7 +55,30 @@ param(
 $ErrorActionPreference = 'Stop'
 $bld = 'build'
 
-if (-not (Test-Path "$bld\saylter-ide.img")) {
+# 地狱模式：q35 + AHCI 大容量稀疏盘，尽量贴近实体机。
+# 盘是动态扩张的：逻辑 512GB，实际只占用已写入的几十 MB。
+if ($Hell) {
+    if ($Image -eq '') { $Image = "$bld\saylter-hell.img" }
+    if ($MemoryMB -lt 2048) { $MemoryMB = 2048 }
+    if ($Smp -lt 4) { $Smp = 4 }
+
+    $needBuild = $true
+    if (Test-Path $Image) {
+        $needBuild = $false
+        if (Test-Path "$bld\kernel.bin") {
+            $needBuild = (Get-Item $Image).LastWriteTime -lt (Get-Item "$bld\kernel.bin").LastWriteTime
+        }
+    }
+    if ($needBuild) {
+        Write-Host ("Building {0}GB hell image: {1}" -f $HellDiskGB, $Image)
+        powershell -ExecutionPolicy Bypass -File .\build.ps1 `
+            -ImageSizeGB $HellDiskGB -ImagePath $Image
+        if ($LASTEXITCODE -ne 0 -or !(Test-Path $Image)) {
+            Write-Host 'Hell image build failed.' -ForegroundColor Red
+            exit 1
+        }
+    }
+} elseif (-not (Test-Path "$bld\saylter-ide.img")) {
     Write-Host 'IDE image not found, rebuilding...'
     powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
     if (-not (Test-Path "$bld\saylter-ide.img")) {
@@ -86,18 +124,89 @@ if (-not $qemu) {
 $serialLog = "$bld\serial-run.log"
 Remove-Item $serialLog -ErrorAction SilentlyContinue
 
-$qargs = @(
-    '-machine','pc',
-    '-cpu','qemu64',
-    '-smp',"$Smp",
-    '-m',"$MemoryMB",
-    '-boot','c',
-    '-drive',"format=raw,file=$Image,if=ide",
+if ($Hell) {
+    $qargs = @(
+        '-machine','q35',
+        '-cpu','max',
+        '-smp',"$Smp",
+        '-m',"$MemoryMB",
+        '-boot','order=c',
+        '-rtc','base=localtime,driftfix=slew',
+        '-global','ICH9-LPC.disable_s3=0'
+    )
+} else {
+    $qargs = @(
+        '-machine','pc',
+        '-cpu','qemu64',
+        '-smp',"$Smp",
+        '-m',"$MemoryMB",
+        '-boot','c'
+    )
+}
+
+# 虚拟显卡：virtio-vga 保留 VGA/VBE 兼容层，SeaBIOS 与我们现有的
+# VBE 初始化都能工作；后续再为 virtio-gpu 2D 命令加驱动。
+if ($VirtGpu) {
+    $qargs += @('-vga','none','-device','virtio-vga')
+}
+
+# 地狱模式：SATA(AHCI) 512GB 动态盘，写缓存开启；出错要报告而不是吞掉。
+if ($Hell) {
+    $qargs += @('-device','ich9-ahci,id=ahci')
+    $qargs += @('-drive',"if=none,id=hell0,format=raw,file=$Image,cache=writeback,aio=threads,werror=report,rerror=report")
+    $qargs += @('-device','ide-hd,drive=hell0,bus=ahci.0')
+} elseif (-not $UsbOnly) {
+    # IDE 引导盘：-UsbOnly 时不挂载，完全从 USB 启动
+    $qargs += @('-drive',"format=raw,file=$Image,if=ide")
+}
+
+# USB 存储：qemu-xhci + usb-storage
+#   -UsbDisk : IDE 引导，内核优先从 U 盘读 SlyzFS
+#   -UsbOnly : 只有 U 盘，BIOS 与内核都必须走 USB
+if ($UsbDisk -or $UsbOnly) {
+    $usbImg = "$bld\saylter-usb.img"
+    $needCopy = $true
+    if (Test-Path $usbImg) {
+        $needCopy = (Get-Item $Image).LastWriteTime -gt (Get-Item $usbImg).LastWriteTime
+    }
+    if ($needCopy) {
+        Copy-Item $Image $usbImg -Force
+        Write-Host "Created fresh USB image: $usbImg"
+    }
+    if ($Usb2) {
+        $qargs += @('-device','usb-ehci,id=ehci')
+        $qargs += @('-drive',"if=none,id=usb0,format=raw,file=$usbImg")
+        $qargs += @('-device','usb-storage,drive=usb0,bus=ehci.0')
+    } else {
+        $qargs += @('-device','qemu-xhci,id=xhci')
+        $qargs += @('-drive',"if=none,id=usb0,format=raw,file=$usbImg")
+        $qargs += @('-device','usb-storage,drive=usb0,bus=xhci.0')
+    }
+}
+
+# SATA 测试盘：ICH9 AHCI 控制器 + 一块与系统盘内容相同的 SATA 磁盘。
+# 内核仍在 IDE 上引导，但 blk.c 会优先选中 AHCI，SlyzFS 实际从
+# SATA 盘读写，用来验证 ahci.c 的 DMA 路径。
+if ($Sata) {
+    $sataImg = "$bld\saylter-sata.img"
+    $needCopy = $true
+    if (Test-Path $sataImg) {
+        $needCopy = (Get-Item $Image).LastWriteTime -gt (Get-Item $sataImg).LastWriteTime
+    }
+    if ($needCopy) {
+        Copy-Item $Image $sataImg -Force
+        Write-Host "Created fresh SATA image: $sataImg"
+    }
+    $qargs += @('-device','ich9-ahci,id=ahci')
+    $qargs += @('-drive',"if=none,id=sata0,format=raw,file=$sataImg")
+    $qargs += @('-device','ide-hd,drive=sata0,bus=ahci.0')
+}
+
+$qargs += @(
     '-device','e1000,netdev=n0',
     '-netdev','user,id=n0',
     '-serial',"file:$($serialLog -replace '\\','/')"
 )
-
 # AC'97 声卡：
 #   交互模式用 SDL 的 winmm 后端（Windows waveOut，兼容性比
 #   DirectSound 更好）；自动化模式用 SDL dummy，保证 DMA 按真实
@@ -108,7 +217,13 @@ if ($Headless) {
     $env:SDL_AUDIODRIVER = 'winmm'
 }
 $qargs += @('-audiodev','sdl,id=snd0')
-$qargs += @('-device','AC97,audiodev=snd0')
+if ($Hell) {
+    # 实体机常见 HDA；同时保留 e1000 网卡与 HPET/ACPI。
+    $qargs += @('-device','intel-hda','-device','hda-duplex,audiodev=snd0')
+    $qargs += @('-device','virtio-rng-pci')
+} else {
+    $qargs += @('-device','AC97,audiodev=snd0')
+}
 
 if ($Headless) {
     $qargs += @('-display','none','-monitor','tcp:127.0.0.1:4470,server,nowait')
@@ -116,7 +231,8 @@ if ($Headless) {
     $qargs += @('-display','gtk,zoom-to-fit=on')
 }
 
-if (-not $Persist) {
+# 地狱模式直接写盘（不走 snapshot），用来验证掉电/重启后的日志重放。
+if (-not $Persist -and -not $Hell) {
     $qargs += '-snapshot'
 }
 if ($NoReboot) {
@@ -125,6 +241,9 @@ if ($NoReboot) {
 
 $modeText = 'snapshot (changes discarded)'
 if ($Persist) { $modeText = 'persistent' }
+if ($Hell) {
+    $modeText = "hell / persistent {0}GB sparse disk" -f $HellDiskGB
+}
 
 Write-Host ("Image  : {0}" -f $Image)
 Write-Host ("Memory : {0} MB" -f $MemoryMB)

@@ -22,6 +22,7 @@
 #include "tty.h"
 #include "vbe.h"
 #include "unicode.h"
+#include "debug.h"
 
 /* VGA 文本模式常量 */
 #define VGA_MEM   0xB8000
@@ -102,12 +103,12 @@ static inline uint32_t cell_value(char c, uint8_t attr) {
     return ((uint32_t)attr << 24) | (uint32_t)(uint8_t)c;
 }
 
-static inline uint32_t cell_make(uint16_t cp, uint8_t attr) {
-    return ((uint32_t)attr << 24) | (uint32_t)cp;
+static inline uint32_t cell_make(uint32_t cp, uint8_t attr) {
+    return ((uint32_t)attr << 24) | (cp & 0x00FFFFFFu);
 }
 
-static inline uint16_t cell_cp(uint32_t cell) {
-    return (uint16_t)(cell & 0xFFFFu);
+static inline uint32_t cell_cp(uint32_t cell) {
+    return cell & 0x00FFFFFFu;
 }
 
 static inline uint8_t cell_attr(uint32_t cell) {
@@ -130,7 +131,7 @@ static inline uint32_t blank_cell(uint8_t attr) {
 
 /* 单元是否属于一个双宽字符的头格 */
 static inline int cell_is_wide_head(uint32_t cell) {
-    uint16_t cp = cell_cp(cell);
+    uint32_t cp = cell_cp(cell);
     return (cp != CELL_CONT) && (utf32_width(cp) == 2);
 }
 
@@ -162,7 +163,7 @@ uint16_t tty_get_cursor_y(void) { return cursor_y; }
 static void gfx_draw_glyph(int x, int y) {
     if (x < 0 || y < 0 || x >= (int)tty_cols || y >= (int)tty_rows) return;
     uint32_t cell = cells[y][x];
-    uint16_t cp = cell_cp(cell);
+    uint32_t cp = cell_cp(cell);
     uint8_t attr = cell_attr(cell);
 
     if (cp == CELL_CONT) {
@@ -235,6 +236,9 @@ static void gfx_present(void) {
  * ============================================================ */
 
 void tty_tick(void) {
+    debug_cpu_idle_mark();
+    debug_tick();
+
     if (!tty_gfx) return;
 
     uint16_t now = pit_read_count();
@@ -277,7 +281,7 @@ static void gfx_paint_all(void) {
     for (int y = 0; y < (int)tty_rows; y++) {
         for (int x = 0; x < (int)tty_cols; x++) {
             uint32_t cell = cells[y][x];
-            uint16_t cp = cell_cp(cell);
+            uint32_t cp = cell_cp(cell);
             uint8_t attr = cell_attr(cell);
             if (cp == CELL_CONT) continue;
             if (cp == ' ' && (uint8_t)((attr >> 4) & 0x0F) == clear_bg) continue;
@@ -291,6 +295,14 @@ static void gfx_paint_all(void) {
         }
     }
     gfx_draw_cursor_overlay();
+}
+
+/* 从影子字符矩阵强制重绘整个屏幕。
+ * 调试 HUD 关闭时需要它：HUD 直接覆盖在 LFB 上，不清掉会残留。 */
+void tty_repaint(void) {
+    if (tty_gfx) {
+        gfx_paint_all();
+    }
 }
 
 /* ============================================================
@@ -727,7 +739,7 @@ static void tty_put_cp(uint32_t cp) {
 
     int px = cursor_x;
     int py = cursor_y;
-    cells[py][px] = cell_make((uint16_t)cp, tty_color);
+    cells[py][px] = cell_make(cp, tty_color);
     if (w == 2 && px + 1 < (int)tty_cols) {
         cells[py][px + 1] = cell_make(CELL_CONT, tty_color);
     }
@@ -813,6 +825,9 @@ void tty_putchar(char c) {
     /* COM1 echo: 等 TX buffer 空再写, 否则 printk 快速输出时丢字节 */
     while ((inb(0x3FD) & 0x20) == 0) {}
     outb(0x3F8, (uint8_t)c);
+
+    /* 调试模式：把实际送出的串口字节镜像到落盘缓冲。 */
+    debug_serial_byte(c);
 
     tty_screen_putc(c);
 }

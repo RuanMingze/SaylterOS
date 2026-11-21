@@ -20,6 +20,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include <cstdint>
 
 #include "disk_io.h"
@@ -94,6 +98,31 @@ static void make_parent_dirs(slyzfs::SlyzFS &fs, const char *dest) {
     }
 }
 
+/* Windows 的 argv 使用 ANSI 代码页（简体中文机器是 GBK）。
+ * SlyzFS 内部统一按 UTF-8 存文件名，一旦直接写入 GBK，内核按
+ * UTF-8 解码就会变成乱码。这里只转换目标路径；源路径仍交给
+ * fopen 按 ANSI 解析。 */
+static void dest_path_to_utf8(const char *src, char *dst, size_t cap) {
+    if (!dst || cap == 0) return;
+    if (!src) { dst[0] = '\0'; return; }
+
+#ifdef _WIN32
+    wchar_t wide[1024];
+    int wn = MultiByteToWideChar(CP_ACP, 0, src, -1, wide,
+                                 (int)(sizeof(wide) / sizeof(wide[0])));
+    if (wn > 0) {
+        int un = WideCharToMultiByte(CP_UTF8, 0, wide, -1, dst, (int)cap,
+                                     nullptr, nullptr);
+        if (un > 0) return;
+    }
+#endif
+
+    size_t n = strlen(src);
+    if (n >= cap) n = cap - 1;
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+}
+
 int main(int argc, char **argv) {
     if (argc < 3) {
         fprintf(stderr,
@@ -157,7 +186,9 @@ int main(int argc, char **argv) {
         }
         *eq = '\0';
         const char *src_path = spec;
-        const char *dest_path = eq + 1;
+        const char *dest_ansi = eq + 1;
+        char dest_path[1024];
+        dest_path_to_utf8(dest_ansi, dest_path, sizeof(dest_path));
 
         uint32_t size = 0;
         uint8_t *data = read_file(src_path, &size);

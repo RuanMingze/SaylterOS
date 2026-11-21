@@ -167,6 +167,24 @@
 #define SLE_SYS_TIME_TEXT   44u  /* ()             "HH:MM:SS" */
 #define SLE_SYS_DATE_TEXT   45u  /* ()             "YYYY-MM-DD" */
 
+/* 故障注入与终端输入（SylFault 使用；宿主实现见 faultlab.c）。
+ * fault.trigger 成功注入后系统会停机，因此正常路径不会返回。 */
+#define SLE_SYS_FAULT_TRIGGER  46u /* (kind)       触发蓝屏，未知类型返回 -1 */
+#define SLE_SYS_FAULT_DUMP     47u /* ()           立即写崩溃转储，0 成功 */
+#define SLE_SYS_FAULT_LEAK     48u /* (kb)         再泄漏约 kb 千字节，返回累计 KB */
+#define SLE_SYS_FAULT_LEAK_FREE 49u /* ()          释放泄漏块，返回释放的 KB */
+#define SLE_SYS_FAULT_SET      52u /* (key, value) 写故障实验室配置，0 成功 */
+#define SLE_SYS_FAULT_GET      53u /* (key)        dump / serial_to_disk / leak_kb */
+#define SLE_SYS_INPUT          54u /* (prompt)     终端读一行，GUI 返回 "" */
+
+/* SLYZ v3 声明式界面（screen/style 由编译器内嵌，运行时解析）。
+ * present 每帧布局、绘制并返回事件数组；没有事件时返回 nil。 */
+#define SLE_SYS_UI_MARKUP      55u /* (text)       设置 screen 标记文本 */
+#define SLE_SYS_UI_STYLE       56u /* (css)        设置样式表 */
+#define SLE_SYS_UI_PRESENT     57u /* ()           布局 + 绘制 + 取事件 */
+#define SLE_SYS_UI_SET         58u /* (id, text)   更新控件文本，0 成功 */
+#define SLE_SYS_UI_GET         59u /* (id)         读取控件文本 */
+
 #define SLE_SYS_EXEC        50u  /* (cmdline)      shell 执行，返回退出码 */
 #define SLE_SYS_EXIT        51u  /* (code)         立即结束程序 */
 

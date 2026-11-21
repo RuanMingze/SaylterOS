@@ -115,6 +115,32 @@ os.info(key) os.proc(index, field) os.proc_name(index)
 `os.info` 的 key 与 `os.proc` 的 field 定义在
 `src/include/slyz.h` 的 `SLE_INFO_*` / `SLE_PROC_*`。
 
+## 故障注入与终端输入
+
+```text
+fault.trigger(kind)   fault.dump()
+fault.leak(kb)        fault.leak_free()
+fault.set(key, val)   fault.get(key)
+input(prompt)
+```
+
+`fault.trigger` 的 kind 取值：0 手动、1 除零、2 空指针、3 非法指令、
+4 双重释放、5 栈溢出、6 内存耗尽、7 IRQL 违规、8 安全校验失败、
+9 关键结构损坏、10 驱动 IRQL 违规。成功注入后系统按对应的 STOP
+码进入蓝屏并停机，函数不会返回；未知 kind 返回 -1。
+
+`fault.get` 支持 `dump`、`serial_to_disk`、`leak_kb` 三个键；
+`fault.set` 可写前两个，值接受 `0/1`、`off/on`、`false/true`。
+配置保存在 `etc\faultlab.cfg`。
+
+`fault.dump` 把内存统计、任务表和 STOP 现场写到
+`system\crash\dump-<uptime_ms>.txt`；`serial_to_disk` 开启时串口
+输出写入 `system\logs\serial.log`。写盘期间串口被内核静默，
+避免 SlyzFS 的诊断输出反过来触发串口落盘形成循环。
+
+`input(prompt)` 只在 TTY 会话返回用户输入；图形会话固定返回空串，
+图形应用应使用 `event.poll` 的按键事件。
+
 ## 窗口与绘图
 
 ```slyz

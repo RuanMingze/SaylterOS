@@ -6,9 +6,16 @@
  * ============================================================ */
 
 #include "vbe.h"
+#include "gpu.h"
 #include "font_cjk.h"
 #include "unicode.h"
+#include "slyertype.h"
 #include <stddef.h>
+
+/* GPU 搬运的最小面积：小矩形（光标、单行文本）走 GPU 的提交/等待
+ * 开销大于 CPU 直接 rep movsq，保持在 CPU 路径。128x128 以上才
+ * 交给 BCS。 */
+#define VBE_GPU_MIN_PIXELS (128u * 128u)
 
 vbe_info_t vbe_current;
 
@@ -26,6 +33,51 @@ static uint32_t back_pitch_bytes = 0;   /* 每行 stride (字节) */
 static inline uint32_t *back_ptr(uint16_t x, uint16_t y) {
     return (uint32_t *)((uint8_t *)back + (uint32_t)y * back_pitch_bytes + (uint32_t)x * 4);
 }
+
+/* ---- 快速内存搬运与填充 ----
+ * 逐像素 C 循环在 QEMU TCG 下无法向量化，1600x900 全屏 blit 要执行
+ * 144 万次 load/store，是旧版卡顿的主因。rep movsq / rep stosq 由
+ * CPU 内部按 8 字节推进，同样的数据量指令数降到 1/2，而且不需要
+ * 编译器展开循环。dst 是 volatile 的 LFB，必须用内联汇编绕开
+ * volatile 访问模型，并用 memory clobber 防止编译器重排。 */
+static void fast_copy_dwords(volatile uint32_t *dst, const uint32_t *src,
+                             uint32_t dwords) {
+    if (dwords == 0) return;
+
+    uint32_t *d = (uint32_t *)(uintptr_t)dst;
+    const uint32_t *s = src;
+    uint32_t qwords = dwords >> 1;
+
+    if (qwords != 0) {
+        __asm__ volatile ("cld\n\trep movsq"
+                          : "+D"(d), "+S"(s), "+c"(qwords)
+                          :
+                          : "memory");
+    }
+    /* 奇数尾部：rep movsq 已经推进了寄存器，必须用原始指针。 */
+    if (dwords & 1u) {
+        ((uint32_t *)(uintptr_t)dst)[dwords - 1] = src[dwords - 1];
+    }
+}
+
+static void fast_fill_dwords(uint32_t *dst, uint32_t dwords, uint32_t color) {
+    if (dwords == 0) return;
+
+    uint64_t pattern = ((uint64_t)color << 32) | (uint64_t)color;
+    uint64_t *d = (uint64_t *)(void *)dst;
+    uint64_t qwords = dwords >> 1;
+
+    if (qwords != 0) {
+        __asm__ volatile ("cld\n\trep stosq"
+                          : "+D"(d), "+c"(qwords)
+                          : "a"(pattern)
+                          : "memory");
+    }
+    if (dwords & 1u) {
+        dst[dwords - 1] = color;
+    }
+}
+
 
 /* ---- 全局裁剪矩形 ----
  * GUI 的局部重绘依赖它：渲染整棵场景树，但只有落在裁剪矩形内的像素
@@ -146,20 +198,48 @@ uint8_t vbe_is_enabled(void) {
     return vbe_current.magic == VBE_MAGIC_OK && back != NULL;
 }
 
-/* ---- 核心：把 backbuffer 全量 blit 到 LFB (DWORD 拷贝) ---- */
+/* ---- backbuffer 物理信息（GPU 后端用） ----
+ * backbuffer 固定放在 BACKBUFFER_PHYS，恒等映射下虚拟地址与物理地址
+ * 相同；这里只暴露物理基址和步长，避免 GPU 模块反向依赖 vbe.c 的
+ * 内部静态变量。 */
+uint32_t vbe_backbuffer_phys(void) {
+    if (!vbe_is_enabled()) return 0;
+    return BACKBUFFER_PHYS;
+}
+
+uint32_t vbe_backbuffer_stride(void) {
+    if (!vbe_is_enabled()) return 0;
+    return back_pitch_bytes;
+}
+
+uint32_t vbe_backbuffer_bytes(void) {
+    if (!vbe_is_enabled()) return 0;
+    return back_pitch_bytes * (uint32_t)vbe_current.height;
+}
+
+/* ---- 核心：把 backbuffer 全量 blit 到 LFB ----
+ * backbuffer 的 stride 与 LFB 的 pitch 完全一致，整帧是一段连续内存，
+ * 因此可以一次 rep movsq 完成，不再按行逐像素拷贝。 */
 void vbe_swap(void) {
     if (!vbe_is_enabled()) return;
+
+    /* 整屏搬运优先交给 GPU；任何失败（未启用/超时）都落回下面的
+     * rep movsq 路径，行为与没有 GPU 时完全一致。 */
+    if (gpu_copy_all() == 0) return;
+
     volatile uint32_t *fb32 = (volatile uint32_t *)(uintptr_t)vbe_current.framebuffer;
-    uint32_t width = vbe_current.width;
     uint32_t height = vbe_current.height;
     uint32_t lfb_stride = vbe_current.pitch / 4;
     uint32_t back_stride = back_pitch_bytes / 4;
+
+    if (lfb_stride == back_stride) {
+        fast_copy_dwords(fb32, back, back_stride * height);
+        return;
+    }
+
     for (uint32_t y = 0; y < height; y++) {
-        volatile uint32_t *dst = fb32 + y * lfb_stride;
-        const uint32_t *src = back + y * back_stride;
-        for (uint32_t x = 0; x < width; x++) {
-            dst[x] = src[x];
-        }
+        fast_copy_dwords(fb32 + y * lfb_stride, back + y * back_stride,
+                         vbe_current.width);
     }
 }
 
@@ -169,15 +249,19 @@ void vbe_swap_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
     if ((uint32_t)x + w > vbe_current.width) w = (uint16_t)(vbe_current.width - x);
     if ((uint32_t)y + h > vbe_current.height) h = (uint16_t)(vbe_current.height - y);
     if (w == 0 || h == 0) return;
+
+    /* 大面积脏矩形交给 GPU 的 XY_SRC_COPY_BLT；失败自动回退 */
+    if ((uint32_t)w * (uint32_t)h >= VBE_GPU_MIN_PIXELS) {
+        if (gpu_copy_rect(x, y, w, h) == 0) return;
+    }
+
     volatile uint32_t *fb32 = (volatile uint32_t *)(uintptr_t)vbe_current.framebuffer;
     uint32_t lfb_stride = vbe_current.pitch / 4;
     uint32_t back_stride = back_pitch_bytes / 4;
+
     for (uint16_t row = 0; row < h; row++) {
-        volatile uint32_t *dst = fb32 + (uint32_t)(y + row) * lfb_stride + x;
-        const uint32_t *src = back + (uint32_t)(y + row) * back_stride + x;
-        for (uint16_t col = 0; col < w; col++) {
-            dst[col] = src[col];
-        }
+        fast_copy_dwords(fb32 + (uint32_t)(y + row) * lfb_stride + x,
+                         back + (uint32_t)(y + row) * back_stride + x, w);
     }
 }
 
@@ -189,10 +273,7 @@ void vbe_fill_color(uint32_t color) {
      * 线性填会错位并越过 backbuffer 尾部。 */
     uint32_t stride = back_pitch_bytes / 4;
     for (uint32_t y = 0; y < vbe_current.height; y++) {
-        uint32_t *row = back + y * stride;
-        for (uint32_t x = 0; x < vbe_current.width; x++) {
-            row[x] = color;
-        }
+        fast_fill_dwords(back + y * stride, vbe_current.width, color);
     }
 }
 
@@ -315,9 +396,7 @@ void vbe_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint32_t colo
 
     for (int row = y0; row < y1; row++) {
         uint32_t *r = back_ptr((uint16_t)x0, (uint16_t)row);
-        for (int col = 0; col < x1 - x0; col++) {
-            r[col] = color;
-        }
+        fast_fill_dwords(r, (uint32_t)(x1 - x0), color);
     }
 }
 
@@ -335,11 +414,105 @@ void vbe_save_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint32_t *buf
 
 void vbe_restore_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, const uint32_t *buf) {
     if (!vbe_is_enabled() || !buf) return;
-    uint32_t idx = 0;
     for (uint16_t row = 0; row < h; row++) {
         uint32_t *dst = back_ptr(x, y + row);
-        for (uint16_t col = 0; col < w; col++) {
-            dst[col] = buf[idx++];
+        fast_copy_dwords((volatile uint32_t *)dst, buf + (uint32_t)row * w, w);
+    }
+}
+
+/* ============================================================
+ * 覆盖率掩码绘制（SlyerType 字形上屏）
+ * ------------------------------------------------------------
+ * 掩码来自平滑光栅器：每个字节代表一个像素的字形覆盖率。
+ * 背景已知时（终端）直接用 bg 参与混合，避免回读 uncached 显存；
+ * GUI 的透明文本才需要读取 backbuffer 现有像素。
+ * ============================================================ */
+
+static inline uint32_t blend_over(uint32_t dst, uint32_t src, uint32_t a) {
+    if (a == 0) return dst;
+    if (a >= 255) return src;
+
+    uint32_t dr = (dst >> 16) & 0xFFu;
+    uint32_t dg = (dst >> 8) & 0xFFu;
+    uint32_t db = dst & 0xFFu;
+    uint32_t sr = (src >> 16) & 0xFFu;
+    uint32_t sg = (src >> 8) & 0xFFu;
+    uint32_t sb = src & 0xFFu;
+    uint32_t inv = 255u - a;
+
+    uint32_t r = (sr * a + dr * inv + 127u) / 255u;
+    uint32_t g = (sg * a + dg * inv + 127u) / 255u;
+    uint32_t b = (sb * a + db * inv + 127u) / 255u;
+    return (r << 16) | (g << 8) | b;
+}
+
+void vbe_draw_mask_buf(int x, int y, int w, int h,
+                       const uint8_t *mask, int stride, uint32_t fg) {
+    if (!vbe_is_enabled() || !mask || w <= 0 || h <= 0 || stride < w) return;
+
+    int x0 = x;
+    int y0 = y;
+    int x1 = x + w;
+    int y1 = y + h;
+    int mx = 0;
+    int my = 0;
+
+    if (x0 < 0) { mx = -x0; x0 = 0; }
+    if (y0 < 0) { my = -y0; y0 = 0; }
+    if (x1 > (int)vbe_current.width) x1 = (int)vbe_current.width;
+    if (y1 > (int)vbe_current.height) y1 = (int)vbe_current.height;
+
+    if (g_clip_active) {
+        if (x0 < g_clip_x0) { mx += g_clip_x0 - x0; x0 = g_clip_x0; }
+        if (y0 < g_clip_y0) { my += g_clip_y0 - y0; y0 = g_clip_y0; }
+        if (x1 > g_clip_x1) x1 = g_clip_x1;
+        if (y1 > g_clip_y1) y1 = g_clip_y1;
+    }
+    if (x0 >= x1 || y0 >= y1) return;
+
+    uint32_t back_stride = back_pitch_bytes / 4;
+    for (int row = y0; row < y1; row++) {
+        const uint8_t *m = mask + (uint32_t)(my + row - y) * (uint32_t)stride
+                           + (uint32_t)mx;
+        uint32_t *line = back + (uint32_t)row * back_stride;
+        for (int col = x0; col < x1; col++) {
+            uint32_t a = m[col - x0];
+            if (a != 0) {
+                line[col] = blend_over(line[col], fg, a);
+            }
+        }
+    }
+}
+
+void vbe_draw_mask_fb(int x, int y, int w, int h,
+                      const uint8_t *mask, int stride,
+                      uint32_t fg, uint32_t bg) {
+    if (!vbe_is_enabled() || !mask || w <= 0 || h <= 0 || stride < w) return;
+
+    int x0 = x;
+    int y0 = y;
+    int x1 = x + w;
+    int y1 = y + h;
+    int mx = 0;
+    int my = 0;
+
+    if (x0 < 0) { mx = -x0; x0 = 0; }
+    if (y0 < 0) { my = -y0; y0 = 0; }
+    if (x1 > (int)vbe_current.width) x1 = (int)vbe_current.width;
+    if (y1 > (int)vbe_current.height) y1 = (int)vbe_current.height;
+    if (x0 >= x1 || y0 >= y1) return;
+
+    for (int row = y0; row < y1; row++) {
+        const uint8_t *m = mask + (uint32_t)(my + row - y) * (uint32_t)stride
+                           + (uint32_t)mx;
+        volatile uint32_t *line =
+            (volatile uint32_t *)((uint8_t *)(uintptr_t)vbe_current.framebuffer +
+                                  (uint32_t)row * vbe_current.pitch);
+        for (int col = x0; col < x1; col++) {
+            uint32_t a = m[col - x0];
+            if (a != 0) {
+                line[col] = blend_over(bg, fg, a);
+            }
         }
     }
 }
@@ -379,6 +552,12 @@ void vbe_draw_char(uint16_t cx, uint16_t cy, char c, uint32_t fg, uint32_t bg) {
     if ((uint32_t)px + FONT16_W > vbe_current.width) return;
     if ((uint32_t)py + FONT16_H > vbe_current.height) return;
 
+    /* 平滑字体优先；字体不覆盖该码位时回退点阵。 */
+    if (slyertype_draw_cell_buf_opaque(px, py, FONT16_W, FONT16_H,
+                                       (uint32_t)(uint8_t)c, fg, bg)) {
+        return;
+    }
+
     build_row_lut(fg, bg);
 
     const uint8_t (*glyph)[2] = font16x32[(uint8_t)c];
@@ -405,6 +584,11 @@ static void draw_ascii_px(uint16_t x, uint16_t y, uint8_t ch,
                           uint32_t fg, uint32_t bg) {
     if ((uint32_t)x + FONT16_W > vbe_current.width) return;
     if ((uint32_t)y + FONT16_H > vbe_current.height) return;
+
+    if (slyertype_draw_cell_buf_opaque(x, y, FONT16_W, FONT16_H,
+                                       (uint32_t)ch, fg, bg)) {
+        return;
+    }
 
     uint32_t stride = back_pitch_bytes / 4;
     const uint8_t (*glyph)[2] = font16x32[ch];
@@ -473,7 +657,7 @@ void vbe_draw_utf8_px(uint16_t x, uint16_t y, const char *s, uint32_t fg, uint32
 
         if (w == 2) {
             if ((uint32_t)px + FONT_CJK_W > vbe_current.width) return;
-            vbe_draw_cjk_px(px, y, (uint16_t)cp, fg, bg);
+            vbe_draw_cjk_px(px, y, cp, fg, bg);
             px = (uint16_t)(px + FONT_CJK_W);
         } else {
             if ((uint32_t)px + FONT16_W > vbe_current.width) return;
@@ -488,6 +672,11 @@ void vbe_draw_utf8_px(uint16_t x, uint16_t y, const char *s, uint32_t fg, uint32
 static void draw_ascii_transparent(uint16_t x, uint16_t y, uint8_t ch, uint32_t fg) {
     if ((uint32_t)x + FONT16_W > vbe_current.width) return;
     if ((uint32_t)y + FONT16_H > vbe_current.height) return;
+
+    if (slyertype_draw_cell_buf(x, y, FONT16_W, FONT16_H,
+                                (uint32_t)ch, fg)) {
+        return;
+    }
 
     uint32_t stride = back_pitch_bytes / 4;
     const uint8_t (*glyph)[2] = font16x32[ch];
@@ -524,7 +713,7 @@ void vbe_draw_utf8_transparent(uint16_t x, uint16_t y, const char *s, uint32_t f
 
         if (w == 2) {
             if ((uint32_t)px + FONT_CJK_W > vbe_current.width) return;
-            vbe_draw_cjk_transparent(px, y, (uint16_t)cp, fg);
+            vbe_draw_cjk_transparent(px, y, cp, fg);
             px = (uint16_t)(px + FONT_CJK_W);
         } else {
             if ((uint32_t)px + FONT16_W > vbe_current.width) return;
@@ -555,7 +744,7 @@ uint16_t vbe_draw_utf8_max_px(uint16_t x, uint16_t y, const char *s,
         if ((uint32_t)(px - x) + need > max_px) break;
 
         if (w == 2) {
-            vbe_draw_cjk_px(px, y, (uint16_t)cp, fg, bg);
+            vbe_draw_cjk_px(px, y, cp, fg, bg);
         } else {
             draw_ascii_px(px, y, (uint8_t)cp, fg, bg);
         }
@@ -606,6 +795,12 @@ void vbe_fb_draw_char(uint16_t cx, uint16_t cy, char c, uint32_t fg, uint32_t bg
     if ((uint32_t)px + FONT16_W > vbe_current.width) return;
     if ((uint32_t)py + FONT16_H > vbe_current.height) return;
 
+    /* 终端直写路径：SlyerType 用 bg 计算混合色，不回读显存。 */
+    if (slyertype_draw_cell_fb(px, py, FONT16_W, FONT16_H,
+                               (uint32_t)(uint8_t)c, fg, bg)) {
+        return;
+    }
+
     build_row_lut(fg, bg);
 
     const uint8_t (*glyph)[2] = font16x32[(uint8_t)c];
@@ -645,14 +840,20 @@ int font_cjk_index(uint16_t cp) {
     return -1;
 }
 
-void vbe_fb_draw_cjk(uint16_t cx, uint16_t cy, uint16_t cp, uint32_t fg, uint32_t bg) {
+void vbe_fb_draw_cjk(uint16_t cx, uint16_t cy, uint32_t cp, uint32_t fg, uint32_t bg) {
     if (!vbe_is_enabled()) return;
     uint32_t px = (uint32_t)cx * FONT16_W;
     uint32_t py = (uint32_t)cy * FONT16_H;
     if (px + FONT_CJK_W > vbe_current.width) return;
     if (py + FONT_CJK_H > vbe_current.height) return;
 
-    int idx = font_cjk_index(cp);
+    /* 系统装了 CJK TrueType 时走平滑轮廓；否则回退 32x32 点阵。 */
+    if (slyertype_draw_cell_fb((int)px, (int)py, FONT_CJK_W, FONT_CJK_H,
+                               cp, fg, bg)) {
+        return;
+    }
+
+    int idx = (cp <= 0xFFFFu) ? font_cjk_index((uint16_t)cp) : -1;
     for (int row = 0; row < FONT_CJK_H; row++) {
         uint32_t bits = (idx >= 0) ? font_cjk_rows[idx][row]
                                    : missing_row_bits(row);
@@ -671,12 +872,17 @@ void vbe_fb_draw_cjk(uint16_t cx, uint16_t cy, uint16_t cp, uint32_t fg, uint32_
     }
 }
 
-void vbe_draw_cjk_px(uint16_t x, uint16_t y, uint16_t cp, uint32_t fg, uint32_t bg) {
+void vbe_draw_cjk_px(uint16_t x, uint16_t y, uint32_t cp, uint32_t fg, uint32_t bg) {
     if (!vbe_is_enabled()) return;
     if ((uint32_t)x + FONT_CJK_W > vbe_current.width) return;
     if ((uint32_t)y + FONT_CJK_H > vbe_current.height) return;
 
-    int idx = font_cjk_index(cp);
+    if (slyertype_draw_cell_buf_opaque(x, y, FONT_CJK_W, FONT_CJK_H,
+                                       cp, fg, bg)) {
+        return;
+    }
+
+    int idx = (cp <= 0xFFFFu) ? font_cjk_index((uint16_t)cp) : -1;
     uint32_t stride = back_pitch_bytes / 4;
 
     for (int row = 0; row < FONT_CJK_H; row++) {
@@ -696,12 +902,16 @@ void vbe_draw_cjk_px(uint16_t x, uint16_t y, uint16_t cp, uint32_t fg, uint32_t 
 /* 透明背景版本：只写前景像素。
  * GUI 的选区高亮、渐变背景、候选窗底色都需要"字形叠加"，
  * 用不透明版本会把底下的高亮整块盖掉。 */
-void vbe_draw_cjk_transparent(uint16_t x, uint16_t y, uint16_t cp, uint32_t fg) {
+void vbe_draw_cjk_transparent(uint16_t x, uint16_t y, uint32_t cp, uint32_t fg) {
     if (!vbe_is_enabled()) return;
     if ((uint32_t)x + FONT_CJK_W > vbe_current.width) return;
     if ((uint32_t)y + FONT_CJK_H > vbe_current.height) return;
 
-    int idx = font_cjk_index(cp);
+    if (slyertype_draw_cell_buf(x, y, FONT_CJK_W, FONT_CJK_H, cp, fg)) {
+        return;
+    }
+
+    int idx = (cp <= 0xFFFFu) ? font_cjk_index((uint16_t)cp) : -1;
     if (idx < 0) {
         /* 缺字：只画一个 1px 方框，保留底色 */
         for (int row = 0; row < FONT_CJK_H; row++) {

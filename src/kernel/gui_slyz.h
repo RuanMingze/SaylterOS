@@ -41,6 +41,7 @@ int  gui_app_render(int win, ui_rect content);
 
 /* 事件投递：坐标为内容区局部坐标 */
 void gui_app_click(int win, int x, int y, int button);
+void gui_app_mouse(int win, int x, int y, int down);
 void gui_app_key(int win, int ch);
 void gui_app_wheel(int win, int delta);
 
@@ -49,5 +50,9 @@ int  gui_app_should_close(int win);
 
 /* 调试/状态文本（崩溃原因等），无应用时返回 0 */
 const char *gui_app_status(int win);
+
+/* 应用通过 win.title() 设置的窗口标题；未设置时返回 0，
+ * 桌面据此回退到窗口 id 对应的默认标题。 */
+const char *gui_app_title(int win);
 
 #endif /* GUI_SLYZ_H */

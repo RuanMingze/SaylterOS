@@ -1,0 +1,6 @@
+# demo.slyzd 清单
+name demo
+org 0x06020000
+entry 0
+import slyz_add 0x80 0 1
+dep libmath 1

@@ -44,7 +44,8 @@ static void drv_log_u32(uint32_t v) {
 }
 
 static void audio_report_stats(void) {
-    if (g_stat_count < 12000u) return;
+    /* 只在调试时打开：串口输出会明显拖慢播放与 GUI。 */
+    if (g_stat_count < 120000u) return;
 
     uint32_t rms = au_isqrt((uint32_t)(g_stat_sum / g_stat_count));
 
@@ -551,8 +552,13 @@ static void audio_hw_refill(void) {
     }
 
     int last_filled = -1;
+    int filled = 0;
 
     for (int guard = 0; guard < AUDIO_DESC_COUNT; guard++) {
+        /* 每次最多补两个描述符：首次启动时不要为了填满 16 个
+         * 缓冲区而长时间占着锁，导致 GUI 起播瞬间卡住。 */
+        if (filled >= 2) break;
+
         int idx = g_fill_desc;
         if (idx == civ || idx == ((civ + 1) % AUDIO_DESC_COUNT)) break;
 
@@ -566,6 +572,7 @@ static void audio_hw_refill(void) {
             g_fill_off = 0;
             g_fill_desc = (idx + 1) % AUDIO_DESC_COUNT;
             last_filled = idx;
+            filled++;
         }
 
         if (made < room) break;
@@ -651,8 +658,9 @@ int audio_play(const char *path) {
     fifo_clear();
     g_state = 1;
 
-    /* 预解码约 0.3 秒音频，后台任务接管后立刻有数据可送。 */
-    for (int i = 0; i < 12; i++) {
+    /* 预解码约 0.1 秒音频，后台任务接管后立刻有数据可送。
+     * 不再一次解 12 帧：那会让双击文件后的第一帧明显停顿。 */
+    for (int i = 0; i < 4; i++) {
         if (g_eof || fifo_free() < MP3_MAX_SAMPLES) break;
         if (!media_decode_one()) break;
     }
@@ -743,7 +751,7 @@ void audio_beep(uint32_t freq, uint32_t ms) {
 static void audio_driver_step(void) {
     g_kin->lock();
 
-    int budget = 2;
+    int budget = 3;
     while (budget-- > 0 && g_state == 1 &&
            g_fifo_count < AUDIO_FIFO_FRAMES * 3u / 4u &&
            fifo_free() >= MP3_MAX_SAMPLES) {
@@ -761,8 +769,9 @@ static void audio_driver_step(void) {
 
     g_kin->unlock();
 
-    /* 让出 CPU 给 GUI/应用任务，同时限制本任务的唤醒频率。 */
-    g_kin->sleep_ms(2);
+    /* 让出 CPU 给 GUI/应用任务。3 帧 ≈ 78ms 音频，25ms 的间隔
+     * 仍有约 3 倍实时余量，同时给 GUI 留下足够长的连续绘制窗口。 */
+    g_kin->sleep_ms(25);
     g_kin->yield();
 }
 
