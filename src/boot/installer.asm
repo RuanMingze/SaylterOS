@@ -1112,11 +1112,13 @@ draw_progress:
     push si
     push di
 
-    mov ax, [written]
-    mov bx, 100
-    mul bx
-    mov bx, PAYLOAD_SECTORS
-    div bx
+    ; 16 位乘 100 会溢出（written 很大时 DX:AX 被截断），
+    ; 统一用 32 位除法计算百分比。
+    movzx eax, word [written]
+    imul eax, eax, 100
+    xor edx, edx
+    mov ebx, PAYLOAD_SECTORS
+    div ebx
     mov [percent], ax
 
     mov ax, [percent]
@@ -1200,8 +1202,9 @@ draw_done:
 ; ============================================================
 ; 从目标盘引导：把硬盘 LBA0 读回 0x7C00 并跳转
 ; ------------------------------------------------------------
-; 这样安装完成后不需要重启、也不需要手动移除软盘，直接进入
-; 刚装好的系统（系统引导扇区会继续从硬盘 LBA1 起加载）。
+; 安装介质与目标盘可能都是硬盘，BIOS 给谁 0x80 并不固定。
+; 这里扫描 BIOS 驱动器号 0x80..0x8F，读出各自 LBA0 与目标盘
+; LBA0 逐字节比较，命中者才是目标盘，跳转时传入正确的 DL。
 ; ============================================================
 boot_from_disk:
     push es
@@ -1215,16 +1218,45 @@ boot_from_disk:
     cmp byte [io_result], 0
     jne .fail
 
+    mov byte [bios_drive], 0x80
+.try_drive:
+    mov dl, [bios_drive]
+    call bios_read_lba0
+    cmp byte [io_result], 0
+    jne .next_drive
+
+    ; 比较 BIOS 读到的 LBA0 与目标盘 LBA0（0x7C00）
+    push ds
+    push es
+    mov ax, BUF_SEG
+    mov ds, ax
+    xor si, si
+    xor ax, ax
+    mov es, ax
+    mov di, 0x7C00
+    mov cx, 256
+    cld
+    repe cmpsw
+    pop es
+    pop ds
+    jne .next_drive
+
+    ; 命中：用该 BIOS 驱动器号引导刚装好的系统
+    mov dl, [bios_drive]
     cli
     xor ax, ax
     mov ds, ax
     mov es, ax
     mov ss, ax
     mov sp, 0x7C00
-    mov dl, 0x80                ; 启动设备 = 第一块硬盘
     db 0xEA
     dw 0x7C00
     dw 0x0000
+
+.next_drive:
+    inc byte [bios_drive]
+    cmp byte [bios_drive], 0x90
+    jb .try_drive
 
 .fail:
     mov si, msg_boot_fail
@@ -1238,10 +1270,62 @@ boot_from_disk:
     hlt
     jmp .halt
 
+; ------------------------------------------------------------
+; bios_read_lba0: 用 INT13 AH=42 读 DL 盘的 LBA0 到 0x5000
+; 结果写 io_result（0=成功，1=失败）。会按 BIOS 约定重置 DS。
+; ------------------------------------------------------------
+bios_read_lba0:
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+
+    xor ax, ax
+    mov ds, ax
+
+    mov ah, 0x41
+    mov bx, 0x55AA
+    int 0x13
+    jc .bad
+    cmp bx, 0xAA55
+    jne .bad
+
+    xor ax, ax
+    mov ds, ax
+    mov word [dap_count], 1
+    mov word [dap_off], 0
+    mov word [dap_seg], BUF_SEG
+    mov dword [dap_lba], 0
+    mov dword [dap_lba + 4], 0
+
+    mov si, dap
+    mov dl, [bios_drive]
+    mov ah, 0x42
+    int 0x13
+    jc .bad
+
+    xor ax, ax
+    mov ds, ax
+    mov byte [io_result], 0
+    jmp .out
+.bad:
+    xor ax, ax
+    mov ds, ax
+    mov byte [io_result], 1
+.out:
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
 ; ============================================================
 ; 数据
 ; ============================================================
 boot_drive:     db 0
+bios_drive:     db 0
 ata_status:     db 0
 confirm:        db 0
 done_all:       db 0
@@ -1283,7 +1367,7 @@ msg_title:      db ' SaylterOS Installer v1.0 '
 msg_title_end:
 msg_rule:       times 80 db 0x2D
 msg_rule_end:
-msg_source:     db 'Source : floppy (1.44MB)'
+msg_source:     db 'Source : installer media (LBA)'
 msg_source_end:
 msg_target:     db 'Target : IDE primary master (0x1F0)'
 msg_target_end:
@@ -1297,9 +1381,9 @@ msg_fs:         db 'Filesystem: SlyzFS will be formatted on first boot.'
 msg_fs_end:
 msg_ide:        db 'IDE status:'
 msg_ide_end:
-msg_probe_ok:   db 'Floppy payload: readable'
+msg_probe_ok:   db 'Source payload: readable'
 msg_probe_ok_end:
-msg_probe_bad:  db 'Floppy payload: UNREADABLE'
+msg_probe_bad:  db 'Source payload: UNREADABLE'
 msg_probe_bad_end:
 msg_warning:    db 'WARNING: target disk LBA0..payload will be overwritten.'
 msg_warning_end:
@@ -1315,7 +1399,7 @@ msg_done:       db 'Installation complete.'
 msg_done_end:
 msg_done2:      db 'SlyzFS will be formatted on first boot.'
 msg_done2_end:
-msg_reboot:     db 'Remove the floppy, then press any key to boot from disk.'
+msg_reboot:     db 'Remove the installation media, then press any key to boot from disk.'
 msg_reboot_end:
 msg_boot_fail:  db 'ERROR: cannot boot from installed disk.'
 msg_boot_fail_end:
