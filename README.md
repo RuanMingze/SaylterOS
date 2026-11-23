@@ -71,22 +71,7 @@ powershell -NoProfile -File build.ps1
 ```powershell
 powershell -NoProfile -File run-ide.ps1
 ```
-
-等价命令：
-
-```powershell
-qemu-system-i386 -machine pc -cpu pentium2 -m 64 -display gtk `
-  -boot c -drive format=raw,file=build\saylter-ide.img,if=ide `
-  -snapshot -no-reboot
-```
-
-查看串口日志（调试时常用）：
-
-```powershell
-qemu-system-i386 -drive format=raw,file=build\saylter-ide.img,if=ide `
-  -display none -serial file:build\serial.log `
-  -monitor tcp:127.0.0.1:4444,server,nowait -m 128
-```
+详细参数见 `run-ide.ps1` 源代码
 
 ---
 
