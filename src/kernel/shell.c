@@ -14,6 +14,8 @@
 #include "acpica_glue.h"
 #include "auth.h"
 #include "slyzvm.h"
+#include "slyz3.h"
+#include "slyz3_tty.h"
 #include "mem.h"
 #include "task.h"
 #include "bsod.h"
@@ -294,6 +296,30 @@ static void ata_program_lba(uint32_t lba, int lba48) {
     }
 }
 
+/* ATA PIO 的整扇区搬运必须用 rep ins/outs。
+ * 逐 word 的 256 次 inw/outw 在 QEMU 下每次都是一次 VM exit，
+ * 读 4MB 壁纸要 215 万次端口访问，实测把一次登录拖到十几秒；
+ * rep 版本让 CPU 在一条指令内完成整个串，次数降到每扇区一次。 */
+static void ata_read_words(uint16_t *dst, int words) {
+    uint32_t port = ATA_DATA_PORT;
+    __asm__ volatile (
+        "cld\n\t"
+        "rep insw"
+        : "+D"(dst), "+c"((uint32_t)words)
+        : "d"(port)
+        : "memory");
+}
+
+static void ata_write_words(const uint16_t *src, int words) {
+    uint32_t port = ATA_DATA_PORT;
+    __asm__ volatile (
+        "cld\n\t"
+        "rep outsw"
+        : "+S"(src), "+c"((uint32_t)words)
+        : "d"(port)
+        : "memory");
+}
+
 int ata_read_sector(uint32_t lba, uint8_t *buf) {
     if (!ata_disk_present()) return 0;
     ata_identify_capacity();
@@ -309,13 +335,229 @@ int ata_read_sector(uint32_t lba, uint8_t *buf) {
         serial_putc('\n');
         return 0;
     }
-    for (int i = 0; i < 256; i++) {
-        uint16_t word = inw(ATA_DATA_PORT);
-        buf[i * 2] = (uint8_t)(word & 0xFF);
-        buf[i * 2 + 1] = (uint8_t)((word >> 8) & 0xFF);
-    }
+    ata_read_words((uint16_t *)(void *)buf, 256);
     g_ata_read_sectors++;
     return 1;
+}
+
+/* ============================================================
+ * IDE 总线主控 DMA（只用于读）
+ * ------------------------------------------------------------
+ * PIO 模式下每个 word 都是一次端口访问，QEMU 里读 4MB 壁纸要
+ * 两百多万次 I/O，CPU 全部陷在这里；顺序读文件（字体、壁纸、
+ * 驱动镜像）因此被拖到秒级。总线主控 DMA 让 IDE 控制器直接
+ * 把数据写进内存，读取吞吐提升一个数量级。
+ *
+ * 写路径保持 PIO：写入还要经过日志与 flush，DMA 出错会直接
+ * 破坏盘上数据，风险与收益不成比例。
+ * ============================================================ */
+
+#define BMIDE_CMD       0
+#define BMIDE_STATUS    2
+#define BMIDE_PRDT      4
+#define BMIDE_EOT       0x8000u
+
+struct IdePrd {
+    uint32_t phys;
+    uint16_t count;      /* 字节数；0 表示 64KB */
+    uint16_t flags;
+};
+
+static uint16_t g_bm_base = 0;
+static int g_bm_checked = 0;
+static int g_bm_ok = 0;
+static int g_dma_failed = 0;   /* 首次失败后永久回退 PIO，避免反复超时 */
+
+static uint32_t ide_pci_read32(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off) {
+    uint32_t addr = 0x80000000u | ((uint32_t)bus << 16) | ((uint32_t)slot << 11) |
+                    ((uint32_t)func << 8) | (uint32_t)(off & 0xFCu);
+    outl(0xCF8, addr);
+    return inl(0xCFC);
+}
+
+static void ide_pci_write32(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off,
+                            uint32_t value) {
+    uint32_t addr = 0x80000000u | ((uint32_t)bus << 16) | ((uint32_t)slot << 11) |
+                    ((uint32_t)func << 8) | (uint32_t)(off & 0xFCu);
+    outl(0xCF8, addr);
+    outl(0xCFC, value);
+}
+
+/* 在 PCI 总线上找 IDE 控制器（class 0x01 / subclass 0x01），
+ * 读 BAR4 得到总线主控寄存器组的 IO 基址。找不到就直接放弃，
+ * 所有调用方回退到 PIO，行为与没有 DMA 时一致。 */
+static void ide_dma_probe(void) {
+    if (g_bm_checked) return;
+    g_bm_checked = 1;
+
+    for (int bus = 0; bus < 4 && !g_bm_ok; bus++) {
+        for (int slot = 0; slot < 32 && !g_bm_ok; slot++) {
+            for (int fn = 0; fn < 2; fn++) {
+                uint32_t id = ide_pci_read32((uint8_t)bus, (uint8_t)slot,
+                                             (uint8_t)fn, 0x00);
+                if ((id & 0xFFFFu) == 0xFFFFu) break;
+                uint32_t cls = ide_pci_read32((uint8_t)bus, (uint8_t)slot,
+                                              (uint8_t)fn, 0x08);
+                if (((cls >> 24) & 0xFFu) != 0x01u) continue;
+                if (((cls >> 16) & 0xFFu) != 0x01u) continue;
+
+                uint32_t bar4 = ide_pci_read32((uint8_t)bus, (uint8_t)slot,
+                                               (uint8_t)fn, 0x20);
+                if ((bar4 & 0x1u) == 0) continue;
+                uint16_t base = (uint16_t)(bar4 & 0xFFFCu);
+                if (base == 0) continue;
+
+                /* DMA 之前必须打开 PCI 命令寄存器的 I/O 空间与总线主控
+                 * 位，否则 BMIDE 命令不会真正发起传输，状态位永远停在
+                 * active——表现出来就是读取挂死。 */
+                uint32_t cmd = ide_pci_read32((uint8_t)bus, (uint8_t)slot,
+                                              (uint8_t)fn, 0x04);
+                cmd |= 0x0005u;              /* I/O space + bus master */
+                ide_pci_write32((uint8_t)bus, (uint8_t)slot, (uint8_t)fn,
+                                0x04, cmd);
+
+                g_bm_base = base;
+                g_bm_ok = 1;
+                break;
+            }
+        }
+    }
+
+    kserial_puts("[ATA] bus-master DMA ");
+    if (g_bm_ok) {
+        kserial_puts("enabled base=");
+        kserial_hex32(g_bm_base);
+        kserial_puts("\r\n");
+    } else {
+        kserial_puts("unavailable, using PIO\r\n");
+    }
+}
+
+static void bmide_stop(void) {
+    if (!g_bm_ok) return;
+    outb((uint16_t)(g_bm_base + BMIDE_CMD), 0);
+    for (int i = 0; i < 200000; i++) {
+        if ((inb((uint16_t)(g_bm_base + BMIDE_STATUS)) & 0x01) == 0) return;
+        __asm__ volatile ("pause");
+    }
+}
+
+/* DMA 读 count 个扇区。返回 0 表示不可用/失败，调用方回退 PIO。
+ * 缓冲区只需 4KB 对齐；跨 64KB 边界时拆成两条 PRDT 条目。 */
+static int ata_dma_read(uint32_t lba, uint32_t count, uint8_t *buf) {
+    ide_dma_probe();
+    if (!g_bm_ok || g_dma_failed || count == 0 || count > 256) return 0;
+    if (((uintptr_t)buf & 0x1FFu) != 0) return 0;
+    if (g_ata_lba48 && lba > 0x0FFFFFFFu) return 0;
+    if (!ata_disk_present()) return 0;
+
+    ata_identify_capacity();
+    if (!ata_wait_busy_clear(20000)) return 0;
+
+    static struct IdePrd prd[2] __attribute__((aligned(16)));
+    uint32_t bytes = count * 512u;
+    uintptr_t addr = (uintptr_t)buf;
+    uint32_t left = bytes;
+    int np = 0;
+
+    while (left > 0 && np < 2) {
+        uint32_t chunk = 0x10000u - (uint32_t)(addr & 0xFFFFu);
+        if (chunk > left) chunk = left;
+        prd[np].phys = (uint32_t)addr;
+        prd[np].count = (uint16_t)(chunk >= 65536u ? 0u : chunk);
+        prd[np].flags = 0;
+        np++;
+        addr += chunk;
+        left -= chunk;
+    }
+    if (left != 0) return 0;        /* 超过 128KB 的请求不由 DMA 处理 */
+    prd[np - 1].flags = BMIDE_EOT;
+
+    /* 关闭设备中断：本内核没有注册 IRQ14 处理函数，
+     * 传输完成由 BMIDE 状态位轮询判断。 */
+    outb(ATA_CTRL_PORT, 0x02);
+
+    bmide_stop();
+    outb((uint16_t)(g_bm_base + BMIDE_STATUS), 0x06);
+    outl((uint16_t)(g_bm_base + BMIDE_PRDT), (uint32_t)(uintptr_t)&prd);
+
+    outb(ATA_DRIVE_PORT, 0xE0 | ((lba >> 24) & 0x0F));
+    outb(ATA_ERR_PORT, 0x00);
+    outb(ATA_SECCNT_PORT, (uint8_t)(count == 256u ? 0u : count));
+    outb(ATA_LBA_LOW_PORT, (uint8_t)lba);
+    outb(ATA_LBA_MID_PORT, (uint8_t)(lba >> 8));
+    outb(ATA_LBA_HIGH_PORT, (uint8_t)(lba >> 16));
+
+    outb((uint16_t)(g_bm_base + BMIDE_CMD), 0x09);   /* start + 读方向 */
+    outb(ATA_CMD_PORT, 0xC8);                        /* READ DMA */
+
+    int ok = 0;
+    for (uint32_t i = 0; i < 400000u; i++) {
+        uint8_t st = inb((uint16_t)(g_bm_base + BMIDE_STATUS));
+        if (st & 0x02) break;                        /* 控制器错误 */
+        if ((st & 0x01) == 0) {
+            ok = 1;                                  /* 传输结束 */
+            break;
+        }
+        __asm__ volatile ("pause");
+    }
+
+    (void)ata_wait_busy_clear(20000);
+    bmide_stop();
+    outb((uint16_t)(g_bm_base + BMIDE_STATUS), 0x06);
+    outb(ATA_CTRL_PORT, 0x00);
+
+    if (!ok) {
+        g_dma_failed = 1;
+        kserial_puts("[ATA] DMA read failed, falling back to PIO\r\n");
+        return 0;
+    }
+    g_ata_read_sectors += count;
+    return 1;
+}
+
+/* 多扇区 PIO：一条 READ SECTORS 命令后连续搬 count×256 个 word。
+ * DMA 不可用（或缓冲区未对齐）时仍比逐扇区省掉命令握手。 */
+static int ata_read_pio_multi(uint32_t lba, uint32_t count, uint8_t *buf) {
+    if (count == 0) return 1;
+    if (g_ata_lba48 && lba > 0x0FFFFFFFu) {
+        for (uint32_t i = 0; i < count; i++) {
+            if (!ata_read_sector(lba + i, buf + i * 512u)) return 0;
+        }
+        return 1;
+    }
+    if (!ata_wait_busy_clear(20000)) return 0;
+
+    outb(ATA_DRIVE_PORT, 0xE0 | ((lba >> 24) & 0x0F));
+    outb(ATA_ERR_PORT, 0x00);
+    outb(ATA_SECCNT_PORT, (uint8_t)(count == 256u ? 0u : count));
+    outb(ATA_LBA_LOW_PORT, (uint8_t)lba);
+    outb(ATA_LBA_MID_PORT, (uint8_t)(lba >> 8));
+    outb(ATA_LBA_HIGH_PORT, (uint8_t)(lba >> 16));
+    outb(ATA_CMD_PORT, 0x20);
+
+    for (uint32_t s = 0; s < count; s++) {
+        if (!ata_wait_drq(200000)) return 0;
+        ata_read_words((uint16_t *)(void *)(buf + s * 512u), 256);
+    }
+    g_ata_read_sectors += count;
+    return 1;
+}
+
+int ata_read_multi(uint32_t lba, uint32_t count, uint8_t *buf) {
+    if (count == 0) return 1;
+    if (count > 256) {
+        uint32_t done = 0;
+        while (done < count) {
+            uint32_t n = count - done;
+            if (n > 256u) n = 256u;
+            if (!ata_read_multi(lba + done, n, buf + done * 512u)) return 0;
+            done += n;
+        }
+        return 1;
+    }
+    if (ata_dma_read(lba, count, buf)) return 1;
+    return ata_read_pio_multi(lba, count, buf);
 }
 
 int ata_write_sector(uint32_t lba, const uint8_t *buf) {
@@ -333,17 +575,12 @@ int ata_write_sector(uint32_t lba, const uint8_t *buf) {
         serial_putc('\n');
         return 0;
     }
-    for (int i = 0; i < 256; i++) {
-        uint16_t word = (uint16_t)buf[i * 2] | ((uint16_t)buf[i * 2 + 1] << 8);
-        outw(ATA_DATA_PORT, word);
-    }
+    ata_write_words((const uint16_t *)(const void *)buf, 256);
     /* 不在这里逐扇区 FLUSH：那会把机械盘拖成龟速。
      * 事务落盘时机由文件系统在日志提交点调用 blk_flush() 决定。 */
     g_ata_write_sectors++;
     return 1;
-}
-
-/* 显式刷盘：FLUSH CACHE。必须在日志提交、目录元数据更新、
+}/* 显式刷盘：FLUSH CACHE。必须在日志提交、目录元数据更新、
  * 文件 close 与卸载后调用，机械盘掉电时才不会丢已提交事务。 */
 int ata_flush(void) {
     if (!ata_disk_present()) return 0;
@@ -423,7 +660,7 @@ static const char banner[] =
     " ____) | (_| |  __/ | | || (_) | ____) | |___| |     \n"
     "|_____/ \\__,_|\\___| |_|\\__\\___/ |_____/|_____|_|     \n"
     "\n"
-    "  [ SAYLTER OPERATING SYSTEM ] v0.3 Beta1 - TTY Shell\n"
+    "  [ SAYLTER OPERATING SYSTEM ] v0.3 Beta2 - TTY Shell\n"
     "\n";
 
 static const char *help_text[] = {
@@ -1041,7 +1278,7 @@ static int levenshtein(const char *a, const char *b) {
 
 static const char *builtin_cmds[] = {
     "help","min","clear","cls","echo","dir","ls","pwd","cd","run","ask","dd","remove",
-    "mkdir","rmdir","rm","del","df","nano","edit","vizcormin","cat","run","bg","kill","gui","version","uname","whoami","date","mem","linktest",
+    "mkdir","rmdir","rm","del","df","nano","edit","vizcormin","app","cat","run","bg","kill","gui","ime","version","uname","whoami","date","mem","linktest",
     "reboot","poweroff","shutdown","halt","acpi","powercfg","bootmode","ps","smp","cpu",
     "useradd","passwd","su","logout","chmod","chown",
     "ip","ifconfig","curl","ping","nslookup", 0
@@ -1518,6 +1755,47 @@ static void cmd_run(const char *args) {
         return;
     }
     printk("run: %s not found\n", args);
+}
+
+/* ---- app：加载并执行 .slys 预装模块 ----
+ * 模块按头部声明的固定地址加载，入口签名为
+ *   void *entry(const struct SlysKernelApi *api)
+ * 入口返回后控制权回到 shell；musl 应用通过 longjmp 把 exit
+ * 转成"入口返回"，因此这里能拿到退出码。 */
+static void cmd_app(const char *args) {
+    char rel[SHELL_PATH_MAX];
+    while (args && (*args == ' ' || *args == '\t')) args++;
+    if (!args || *args == '\0') {
+        printk("usage: app <program.slys>\n");
+        return;
+    }
+
+    shell_resolve_path(rel, shell_cwd, args);
+    if (rel[0] == '\0') {
+        printk("app: invalid path\n");
+        return;
+    }
+
+    char full[SHELL_PATH_MAX + 4];
+    int n = 0;
+    full[n++] = 'C';
+    full[n++] = ':';
+    full[n++] = '\\';
+    for (int i = 0; rel[i] && n < (int)sizeof(full) - 1; i++) {
+        full[n++] = rel[i];
+    }
+    full[n] = '\0';
+
+    void *entry = 0;
+    char name[24];
+    if (!slys_load(full, &entry, name, (int)sizeof(name))) {
+        printk("app: cannot load %s\n", full);
+        return;
+    }
+
+    SlysModuleEntryFn fn = (SlysModuleEntryFn)entry;
+    void *rc = fn(slys_kernel_api());
+    printk("\napp: '%s' exited with %d\n", name, (int)(intptr_t)rc);
 }
 
 /* ---- nano / edit：全屏文本编辑器 ----
@@ -2421,10 +2699,10 @@ static int try_run_slyz_by_name(const char *name) {
     uint8_t *image = 0;
     int got = 0;
 
-    for (int attempt = 0; attempt < 2 && !got; attempt++) {
+    for (int attempt = 0; attempt < 4 && !got; attempt++) {
         if (attempt == 0) {
             shell_resolve_path(path, shell_cwd, name);
-        } else {
+        } else if (attempt == 1) {
             char with_ext[SHELL_PATH_MAX];
             int pos = 0;
             while (name[pos] && pos < SHELL_PATH_MAX - 8) {
@@ -2438,6 +2716,24 @@ static int try_run_slyz_by_name(const char *name) {
             with_ext[pos++] = 'z';
             with_ext[pos] = '\0';
             shell_resolve_path(path, shell_cwd, with_ext);
+        } else {
+            /* PATH 语义：当前目录找不到时再到 system\apps 下找。
+             * 这样 `run slyzfs` 与 `run system\apps\slyzfs.slyz` 等价。 */
+            static const char *prefix = "system\\apps\\";
+            int pos = 0;
+            for (int i = 0; prefix[i] && pos < SHELL_PATH_MAX - 1; i++) {
+                path[pos++] = prefix[i];
+            }
+            for (int i = 0; name[i] && pos < SHELL_PATH_MAX - 1; i++) {
+                path[pos++] = name[i];
+            }
+            if (attempt == 3) {
+                const char *ext = ".slyz";
+                for (int i = 0; ext[i] && pos < SHELL_PATH_MAX - 1; i++) {
+                    path[pos++] = ext[i];
+                }
+            }
+            path[pos] = '\0';
         }
 
         struct SlyzDirEntry ent;
@@ -2480,6 +2776,26 @@ static int try_run_slyz_by_name(const char *name) {
 
     if (!got || !image) {
         return 0;
+    }
+
+    /* SLYZ v3（SLYZ3BIN）：声明式 GUI 程序必须由图形会话创建窗口。
+     * 旧路径只认 v2 魔数，v3 镜像会被当成文本脚本执行，结果既没有
+     * 窗口也没有可读输出；这里显式分派到 GUI 宿主。 */
+    if (slyz3_is_binary(image, got)) {
+        if (gui_keyboard_owned()) {
+            int win = gui_open_file_path(path);
+            kfree(image);
+            if (win < 0) {
+                printk("run: cannot open SLYZ v3 window\n");
+            }
+            /* 窗口已交给 GUI 宿主，不再走 TTY 任务/异常提示路径。 */
+            return 1;
+        }
+        /* 终端会话：没有声明式 GUI 的程序（文件系统工具、批处理）
+         * 交给 v3 终端宿主同步执行；需要窗口的镜像会被明确拒绝。 */
+        int rc = slyz3_tty_run(image, got, path);
+        kfree(image);
+        return rc ? 1 : 2;
     }
 
     /* 二进制镜像：交给字节码虚拟机执行 */
@@ -2946,7 +3262,11 @@ static void cmd_remove(char *args) {
 
 #ifdef SAYLTER_VBE
 static void shell_enter_gui(void) {
+    uint32_t t0 = net_now_ms();
     vbe_init();
+    kserial_puts("[PERF] vbe_init +");
+    kserial_dec32(net_now_ms() - t0);
+    kserial_puts("ms\r\n");
     if (!vbe_is_enabled()) {
         printk("[GUI] VBE not available.\n");
         return;
@@ -2960,7 +3280,7 @@ static void shell_enter_gui(void) {
     printk("[GUI] returned to shell\n");
 }
 #endif
-static void cmd_version(void) { printk("SaylterOS v0.3 Beta1 (TTY shell)\n"); }
+static void cmd_version(void) { printk("SaylterOS v0.3 Beta2 (TTY shell)\n"); }
 static void cmd_uname(void)   { printk("SaylterOS x86_64 64-bit long mode\n"); }
 
 /* 中文与输入法自检：一次跑完 UTF-8 输出、字库覆盖与候选数据三个环节，
@@ -2977,6 +3297,28 @@ static void cmd_cjk(void) {
            (int)IME_SYLLABLE_COUNT, (int)IME_POOL_COUNT);
     printk("当前模式：%s\n", ime_chinese_enabled() ? "中文" : "英文");
 }
+static void cmd_ime(const char *args) {
+    while (args && (*args == ' ' || *args == '\t')) args++;
+
+    if (!args || *args == '\0') {
+        printk("ime: %s\n", ime_chinese_enabled() ? "chinese" : "english");
+        return;
+    }
+    if (cmd_strcmp(args, "on") == 0 || cmd_strcmp(args, "zh") == 0 ||
+        cmd_strcmp(args, "1") == 0) {
+        ime_set_chinese(1);
+    } else if (cmd_strcmp(args, "off") == 0 || cmd_strcmp(args, "en") == 0 ||
+               cmd_strcmp(args, "0") == 0) {
+        ime_set_chinese(0);
+    } else if (cmd_strcmp(args, "toggle") == 0) {
+        ime_toggle_chinese();
+    } else {
+        printk("usage: ime [on|off|toggle]\n");
+        return;
+    }
+    printk("ime: %s\n", ime_chinese_enabled() ? "chinese" : "english");
+}
+
 static void cmd_whoami(void) {
     const struct AuthUser *u = auth_current();
     if (u) {
@@ -3526,7 +3868,7 @@ static void cmd_logout(void) {
     }
 
     tty_clear();
-    printk("SaylterOS v0.3 Beta1 - type 'help' for commands\n\n");
+    printk("SaylterOS v0.3 Beta2 - type 'help' for commands\n\n");
     shell_refresh_prompt();
 }
 
@@ -3751,6 +4093,7 @@ static int exec_cmd(const char *cmd, char *args) {
     else if (cmd_strcmp(cmd, "rm") == 0 || cmd_strcmp(cmd, "del") == 0) cmd_rm(args);
     else if (cmd_strcmp(cmd, "df") == 0) cmd_df();
     else if (cmd_strcmp(cmd, "run") == 0)   cmd_run(args);
+    else if (cmd_strcmp(cmd, "app") == 0)   cmd_app(args);
     else if (cmd_strcmp(cmd, "bg") == 0)    cmd_bg(args);
     else if (cmd_strcmp(cmd, "kill") == 0)  cmd_kill(args);
     else if (cmd_strcmp(cmd, "nano") == 0 || cmd_strcmp(cmd, "edit") == 0) cmd_edit(args);
@@ -3769,6 +4112,7 @@ static int exec_cmd(const char *cmd, char *args) {
     else if (cmd_strcmp(cmd, "version") == 0) cmd_version();
     else if (cmd_strcmp(cmd, "uname") == 0) cmd_uname();
     else if (cmd_strcmp(cmd, "cjk") == 0)   cmd_cjk();
+    else if (cmd_strcmp(cmd, "ime") == 0)   cmd_ime(args);
     else if (cmd_strcmp(cmd, "whoami") == 0) cmd_whoami();
     else if (cmd_strcmp(cmd, "date") == 0)  cmd_date();
     else if (cmd_strcmp(cmd, "mem") == 0)   cmd_mem();
@@ -3908,8 +4252,12 @@ void shell_main(void) {
      * 必须在 SlyzFS 挂载之后：字体是系统盘里的普通文件。
      * 未启用 VBE（80x25 文本模式）时 slyertype_init 直接返回 0，
      * 不分配内存，终端继续保持点阵与两个 '?' 的回退行为。 */
+    uint32_t st_t0 = net_now_ms();
     slyertype_init();
     printk("[SlyerType] %s\n", slyertype_status());
+    kserial_puts("[PERF] tty_fonts +");
+    kserial_dec32(net_now_ms() - st_t0);
+    kserial_puts("ms\r\n");
 
     /* ---- 分页 / 虚拟内存 / swap ----
      * 必须在 SlyzFS 挂载之后：pagefile.os 是文件系统里的普通文件。
@@ -3968,6 +4316,8 @@ void shell_main(void) {
     if (!auth_login()) {
         printk("[!] login unavailable - continuing as root without a session\n");
     }
+    /* 按登录用户加载输入法词频（home\user\ime.freq）。 */
+    ime_reload_user();
 
     /* 登录成功后从干净屏幕开始 */
     tty_clear();
@@ -3979,7 +4329,7 @@ void shell_main(void) {
         shell_cwd[0] = '\0';
     }
 
-    printk("SaylterOS v0.3 Beta1 - type 'help' for commands\n");
+    printk("SaylterOS v0.3 Beta2 - type 'help' for commands\n");
     printk("User: %s (uid %u)   Home: %s\n\n",
            session ? session->name : "root",
            (unsigned int)(session ? session->uid : 0),

@@ -1,0 +1,58 @@
+# ============================================================
+# hello3.slyz3 - SLYZ v3 语言自检
+# ------------------------------------------------------------
+# 覆盖变量、字符串、数组、方法、函数、递归、while 循环、
+# 短路逻辑与类型转换。终端程序（无 screen）。
+# ============================================================
+
+state greeting = "Hello, SLYZ v3!"
+
+fn shout(text) {
+    return upper(text) + "!"
+}
+
+fn fib(n) {
+    if n < 2 {
+        return n
+    }
+    return fib(n - 1) + fib(n - 2)
+}
+
+fn main() {
+    println(greeting)
+    println(shout(greeting))
+
+    let nums = [3, 1, 2]
+    nums.push(4)
+
+    let total = 0
+    let i = 0
+    while i < nums.length {
+        total = total + nums.at(i)
+        i = i + 1
+    }
+    println("sum = " + str(total))
+    println("items = " + str(nums))
+
+    let line = ""
+    i = 0
+    while i < 10 {
+        line = line + str(fib(i)) + " "
+        i = i + 1
+    }
+    println("fib: " + trim(line))
+
+    if total > 5 && nums.length == 4 {
+        println("logic ok")
+    } else {
+        println("logic broken")
+    }
+
+    let found = index_of(greeting, "SLYZ")
+    println("index_of SLYZ = " + str(found))
+    println("date = " + time.date() + " " + time.text())
+}
+
+on start {
+    main()
+}

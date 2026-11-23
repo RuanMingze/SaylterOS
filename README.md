@@ -136,6 +136,7 @@ root 的 hash 为空表示无密码。普通用户读取 `\etc\shadow` 会被文
 | `nano <file>` / `edit` | 全屏编辑器（Ctrl+S 保存、Ctrl+X 退出、Ctrl+K 删行） |
 | `run <file>` | 执行 SLYZ 镜像或文本脚本 |
 | `bg <file>` | 在后台任务中运行 SLYZ 镜像 |
+| `app <file.slys>` | 加载 `.slys` 模块（可执行 musl 静态应用）并以退出码返回 |
 | `kill <pid>` | 终止任务；`kill 0` 触发内核蓝屏 |
 | `ask <prompt>` | 读取 y/n 确认 |
 | `dd` | 扇区 / 文件 / 文本 / stdout 之间的裸数据复制 |
@@ -156,6 +157,14 @@ root 的 hash 为空表示无密码。普通用户读取 `\etc\shadow` 会被文
 | `exit` / `quit` | 退出 Shell |
 
 编辑器快捷键：方向键、Home/End、PageUp/PageDown 移动，Backspace/Delete 删除，Tab 插入 4 空格。
+
+`app` 加载的 `.slys` 既可以是驱动，也可以是 musl 静态链接的用户程序
+（`SlysKernelApi` 版本 2 追加了 write/read/open/close/lseek/fstat/
+time_ms/map/unmap 九个 POSIX 字段）。musl 源码在 `third_party/musl`，
+适配层在 `src/slyzlibc`，用 `tools/build-musl.ps1` 构建。
+内核用 MinGW（Win64 ABI）编译、musl 模块用 x86_64-elf（SysV ABI）编译，
+跨 ABI 调用统一由 `src/slyzlibc/msabi.s` 的 thunk 完成，模块侧不需要
+感知参数寄存器差异。
 
 ---
 

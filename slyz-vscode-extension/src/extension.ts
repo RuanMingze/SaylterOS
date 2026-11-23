@@ -1,371 +1,351 @@
+/* ============================================================
+ * SLYZ 语言支持：语法高亮 + 由 slyzc 提供的实时诊断
+ * ------------------------------------------------------------
+ * 诊断规则只保留一份——编译器本身。扩展启动一个常驻的
+ * `slyzc serve` 进程，按 JSON Lines 协议把文档全文发过去，
+ * 再把返回的诊断映射成 VS Code Diagnostic。
+ *
+ * 为什么不在这里重新实现语法检查：手写规则一定会和编译器漂移，
+ * 之前那一版还停留在旧文本脚本（if yes/endif），对 v2 的
+ * let/fn/while/for 完全无能为力。
+ * ============================================================ */
+
 import * as vscode from 'vscode';
+import { spawn, ChildProcessWithoutNullStreams } from 'child_process';
+import * as fs from 'fs';
+import * as path from 'path';
 
 const diagnosticCollection = vscode.languages.createDiagnosticCollection('slyz');
 
-/* 与内核 gui.c 的解析器保持一致的上限：
- *   GUI_SLZ_MAX   = 32  控件数量
- *   GUI_SLZ_SRC   = 16384  源文件字节数
- *   单行          = 199  字符（第 200 个字符起被截断） */
-const GUI_MAX_CONTROLS = 32;
-const GUI_MAX_SRC_BYTES = 16384;
-const GUI_MAX_LINE_CHARS = 199;
-
-const GUI_KEYWORDS = ['title', 'size', 'label', 'input', 'button', 'space', 'hr'];
-const GUI_ACTION_PREFIXES = ['set:', 'open:', 'shell:'];
-
-function makeDiagnostic(message: string, line: number, column: number,
-                        length: number,
-                        severity: vscode.DiagnosticSeverity): vscode.Diagnostic {
-  const end = Math.max(column + Math.max(1, length), column + 1);
-  const range = new vscode.Range(new vscode.Position(line, column),
-                                 new vscode.Position(line, end));
-  return new vscode.Diagnostic(range, message, severity);
+interface RawDiagnostic {
+  line: number;
+  col: number;
+  severity: string;
+  message: string;
 }
 
-function errorAt(message: string, line: number, column = 0, length = 1): vscode.Diagnostic {
-  return makeDiagnostic(message, line, column, length, vscode.DiagnosticSeverity.Error);
+interface CheckResponse {
+  id?: number;
+  ok?: boolean;
+  errorCount?: number;
+  diagnostics?: RawDiagnostic[];
+  fatal?: string;
+  restart?: boolean;
 }
 
-function warnAt(message: string, line: number, column = 0, length = 1): vscode.Diagnostic {
-  return makeDiagnostic(message, line, column, length, vscode.DiagnosticSeverity.Warning);
+interface PendingRequest {
+  resolve: (value: CheckResponse) => void;
+  reject: (reason: Error) => void;
+  timer: NodeJS.Timeout;
 }
 
-function infoAt(message: string, line: number, column = 0, length = 1): vscode.Diagnostic {
-  return makeDiagnostic(message, line, column, length, vscode.DiagnosticSeverity.Information);
-}
+const REQUEST_TIMEOUT_MS = 15000;
+const MAX_RESTARTS = 10;
 
-/* 取一行去掉注释后的有效内容。SLYZ 的注释规则是行首 #，
- * 但 #gui 是程序标记，不能当注释吃掉。 */
-function stripGuiComment(line: string): string {
-  const trimmed = line.trim();
-  if (trimmed.startsWith('#') && !/^#gui\b/i.test(trimmed)) {
-    return '';
-  }
-  return trimmed;
-}
+class SlyzChecker implements vscode.Disposable {
+  private proc: ChildProcessWithoutNullStreams | undefined;
+  private readonly pending = new Map<number, PendingRequest>();
+  private nextId = 1;
+  private buffer = '';
+  private disposed = false;
+  private restartTimer: NodeJS.Timeout | undefined;
+  private restartCount = 0;
+  private readonly output = vscode.window.createOutputChannel('SLYZ');
 
-function isGuiProgram(lines: string[]): boolean {
-  for (const line of lines) {
-    if (!line.trim()) continue;
-    return /^\s*#gui\b/i.test(line);
-  }
-  return false;
-}
+  constructor(private readonly extensionPath: string) {}
 
-/* 收集所有 input 的名称，供按钮动作里的 {name} 占位符校验 */
-function collectInputNames(lines: string[]): Set<string> {
-  const names = new Set<string>();
-  for (let i = 1; i < lines.length; i++) {
-    const line = stripGuiComment(lines[i]);
-    if (!line) continue;
-    const m = /^input\b(.*)$/i.exec(line);
-    if (!m) continue;
-    const parts = m[1].trim().split(/\s+/).filter(Boolean);
-    if (parts.length === 0) continue;
-    let name = parts[0];
-    if (name.startsWith('"')) {
-      const close = name.indexOf('"', 1);
-      name = close > 1 ? name.slice(1, close) : name.slice(1);
+  dispose(): void {
+    this.disposed = true;
+    if (this.restartTimer) {
+      clearTimeout(this.restartTimer);
+      this.restartTimer = undefined;
     }
-    if (name) names.add(name);
-  }
-  return names;
-}
-
-function analyzeGuiProgram(lines: string[], diagnostics: vscode.Diagnostic[]): void {
-  const first = lines.length > 0 ? lines[0] : '';
-  if (!/^\s*#gui\b/i.test(first)) {
-    diagnostics.push(errorAt('GUI 程序第一行必须是 #gui（大小写不敏感，允许前导空白）', 0, 0, first.length));
-    return;
+    this.rejectAll(new Error('SLYZ checker disposed'));
+    const proc = this.proc;
+    this.proc = undefined;
+    if (proc && !proc.killed) {
+      try {
+        proc.stdin.write('{"method":"exit"}\n');
+      } catch {
+        /* stdin 可能已经关闭，直接 kill */
+      }
+      proc.kill();
+    }
+    this.output.dispose();
   }
 
-  const inputs = collectInputNames(lines);
-  let controls = 0;
+  /** 解析可用的 slyzc.exe：配置项 > 工作区构建产物 > 扩展自带 */
+  private resolveCompiler(): string | undefined {
+    const config = vscode.workspace.getConfiguration('slyz');
+    const configured = (config.get<string>('compilerPath') ?? '').trim();
+    const candidates: string[] = [];
 
-  for (let i = 1; i < lines.length; i++) {
-    const raw = lines[i];
-
-    if (raw.length > GUI_MAX_LINE_CHARS) {
-      diagnostics.push(warnAt(
-        `单行超过 ${GUI_MAX_LINE_CHARS} 字符，内核会截断第 ${GUI_MAX_LINE_CHARS + 1} 个字符之后的内容`,
-        i, GUI_MAX_LINE_CHARS, raw.length - GUI_MAX_LINE_CHARS));
-    }
-
-    const line = stripGuiComment(raw);
-    if (!line) continue;
-
-    const m = /^([A-Za-z]+)\b(.*)$/.exec(line);
-    if (!m) {
-      diagnostics.push(warnAt('无法识别的行：GUI 指令必须以字母关键字开头', i, 0, line.length));
-      continue;
-    }
-
-    const keyword = m[1].toLowerCase();
-    const rest = m[2].trim();
-
-    switch (keyword) {
-      case 'title': {
-        if (!rest) {
-          diagnostics.push(errorAt('title 需要窗口标题，例如：title "My App"', i, 0, 5));
-        }
-        break;
-      }
-
-      case 'size': {
-        const nums = rest.split(/\s+/).filter(Boolean);
-        if (nums.length === 0) {
-          diagnostics.push(errorAt('size 需要宽度和高度，例如：size 560 460', i, 0, 4));
-          break;
-        }
-        const limits = [360, 260];
-        const names = ['宽度', '高度'];
-        for (let k = 0; k < nums.length && k < 2; k++) {
-          if (!/^\d+$/.test(nums[k])) {
-            diagnostics.push(errorAt(`size 的${names[k]}必须是十进制数字`, i, 0, line.length));
-            continue;
-          }
-          const value = parseInt(nums[k], 10);
-          if (value < limits[k]) {
-            diagnostics.push(warnAt(
-              `size 的${names[k]} ${value} 小于内核下限 ${limits[k]}，会被提升到 ${limits[k]}`,
-              i, 0, line.length));
-          }
-        }
-        if (nums.length > 2) {
-          diagnostics.push(warnAt('size 只接受宽度和高度两个参数', i, 0, line.length));
-        }
-        break;
-      }
-
-      case 'label': {
-        if (!rest) {
-          diagnostics.push(errorAt('label 需要显示文本，例如：label "Hello"', i, 0, 5));
-        }
-        controls++;
-        break;
-      }
-
-      case 'input': {
-        const parts = rest.split(/\s+/).filter(Boolean);
-        if (parts.length === 0) {
-          diagnostics.push(errorAt('input 需要名称和标签，例如：input name "Your name"', i, 0, 5));
-        } else {
-          let name = parts[0];
-          if (name.startsWith('"')) {
-            const close = name.indexOf('"', 1);
-            name = close > 1 ? name.slice(1, close) : name.slice(1);
-          }
-          if (!name) {
-            diagnostics.push(errorAt('input 的名称不能为空', i, 0, line.length));
-          } else if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
-            diagnostics.push(warnAt(
-              `输入框名称 "${name}" 含有非字母数字字符；{${name}} 占位符可能无法匹配`,
-              i, 0, line.length));
-          }
-        }
-        controls++;
-        break;
-      }
-
-      case 'button': {
-        const arrow = rest.indexOf('->');
-        if (arrow < 0) {
-          diagnostics.push(errorAt('button 必须写成：button "文本" -> 动作', i, 0, line.length));
-          break;
-        }
-
-        const labelText = rest.slice(0, arrow).trim();
-        const action = rest.slice(arrow + 2).trim();
-
-        if (!labelText) {
-          diagnostics.push(warnAt('button 缺少显示文本', i, 0, 6));
-        }
-        if (!action) {
-          diagnostics.push(errorAt('button 缺少动作，支持 close / set: / open: / shell:', i, arrow, 2));
-          break;
-        }
-
-        const isClose = /^close$/i.test(action);
-        const prefix = GUI_ACTION_PREFIXES.find(p => action.toLowerCase().startsWith(p));
-        if (!isClose && !prefix) {
-          diagnostics.push(warnAt(
-            `未知动作 "${action}"；支持 close / set:<文本> / open:<路径> / shell:<命令>`,
-            i, 0, line.length));
-        } else if (prefix) {
-          const payload = action.slice(prefix.length).trim();
-          if (!payload) {
-            diagnostics.push(errorAt(`${prefix} 动作缺少参数`, i, arrow, 2));
-          }
-        }
-
-        const placeholder = /\{([^}]*)\}/g;
-        let match: RegExpExecArray | null;
-        while ((match = placeholder.exec(action)) !== null) {
-          const key = match[1].trim();
-          if (key && !inputs.has(key)) {
-            diagnostics.push(warnAt(
-              `占位符 {${key}} 没有对应的 input 名称`,
-              i, 0, line.length));
-          }
-        }
-
-        controls++;
-        break;
-      }
-
-      case 'space': {
-        if (rest && !/^\d+$/.test(rest)) {
-          diagnostics.push(warnAt('space 需要一个像素数字，例如：space 8', i, 0, line.length));
-        }
-        controls++;
-        break;
-      }
-
-      case 'hr': {
-        if (rest) {
-          diagnostics.push(warnAt('hr 不接受参数', i, 0, line.length));
-        }
-        controls++;
-        break;
-      }
-
-      default: {
-        diagnostics.push(warnAt(
-          `未知的 GUI 指令 "${m[1]}"；支持 ${GUI_KEYWORDS.join(' / ')}`,
-          i, 0, m[1].length));
-        break;
-      }
-    }
-  }
-
-  if (controls > GUI_MAX_CONTROLS) {
-    diagnostics.push(errorAt(
-      `控件数量 ${controls} 超过内核上限 ${GUI_MAX_CONTROLS}，超出的控件会被静默忽略`,
-      0, 0, Math.max(1, first.length)));
-  }
-}
-
-/* 旧文本脚本：if / endif / ask 规则保持不变 */
-function analyzeTextScript(lines: string[], diagnostics: vscode.Diagnostic[]): void {
-  const ifStack: Array<{ line: number; indent: number }> = [];
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const trimmed = line.trimStart();
-    if (!trimmed || trimmed.startsWith('#')) {
-      continue;
-    }
-
-    const indent = line.length - trimmed.length;
-
-    if (ifStack.length > 0 && /^ +/.test(line) && !line.startsWith('\t')) {
-      diagnostics.push(infoAt(
-        '嵌套块使用空格缩进；建议统一使用 Tab。',
-        i, 0, Math.max(1, indent)));
-    }
-
-    const invalidIf = /^\s*if\b(?!\s+(yes|no)\b)/i.exec(line);
-    if (invalidIf) {
-      diagnostics.push(errorAt('if 条件无效，只能写：if yes 或 if no', i, invalidIf.index));
-    }
-
-    const ifMatch = /^\s*if\s+(yes|no)\b/i.exec(line);
-    if (ifMatch) {
-      ifStack.push({ line: i, indent });
-      continue;
-    }
-
-    const endifMatch = /^\s*endif\b/i.exec(line);
-    if (endifMatch) {
-      if (ifStack.length === 0) {
-        diagnostics.push(errorAt('多余的 endif：没有匹配的 if 块', i, endifMatch.index));
+    if (configured) {
+      if (path.isAbsolute(configured)) {
+        candidates.push(configured);
       } else {
-        ifStack.pop();
+        for (const folder of vscode.workspace.workspaceFolders ?? []) {
+          candidates.push(path.join(folder.uri.fsPath, configured));
+        }
       }
-      continue;
     }
 
-    const askMatch = /^\s*ask\b/i.exec(line);
-    if (askMatch) {
-      const remaining = trimmed.slice(3).trim();
-      if (!remaining || remaining === '""' || remaining === "''") {
-        diagnostics.push(errorAt('ask 需要提示文本', i, askMatch.index));
+    for (const folder of vscode.workspace.workspaceFolders ?? []) {
+      candidates.push(path.join(folder.uri.fsPath, 'build', 'slyzc.exe'));
+      candidates.push(path.join(folder.uri.fsPath, 'tools', 'slyzc', 'build', 'slyzc.exe'));
+    }
+    candidates.push(path.join(this.extensionPath, 'bin', 'slyzc.exe'));
+
+    for (const candidate of candidates) {
+      if (candidate && fs.existsSync(candidate)) {
+        return candidate;
       }
+    }
+    return undefined;
+  }
+
+  start(): void {
+    if (this.disposed || this.proc) {
+      return;
+    }
+
+    const compiler = this.resolveCompiler();
+    if (!compiler) {
+      this.reportMissingCompiler();
+      return;
+    }
+
+    let proc: ChildProcessWithoutNullStreams;
+    try {
+      proc = spawn(compiler, ['serve'], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        windowsHide: true,
+      });
+    } catch (error) {
+      this.output.appendLine(`[slyzc] 启动失败: ${String(error)}`);
+      this.scheduleRestart();
+      return;
+    }
+
+    this.proc = proc;
+    proc.stdout.setEncoding('utf8');
+    proc.stderr.setEncoding('utf8');
+    proc.stdout.on('data', (chunk: string) => this.onStdout(chunk));
+    proc.stderr.on('data', (chunk: string) => {
+      this.output.append(chunk);
+    });
+    proc.on('error', (error: Error) => {
+      this.output.appendLine(`[slyzc] 进程错误: ${error.message}`);
+    });
+    proc.on('exit', (code: number | null) => this.onExit(code));
+
+    this.output.appendLine(`[slyzc] 已启动: ${compiler}`);
+  }
+
+  private reportMissingCompiler(): void {
+    this.output.appendLine(
+      '[slyzc] 找不到 slyzc.exe。请先运行 tools\\slyzc\\build.ps1，' +
+      '或在设置里配置 slyz.compilerPath 指向可执行文件。'
+    );
+    this.output.show(true);
+    vscode.window.setStatusBarMessage('SLYZ: 未找到 slyzc.exe（语法检查不可用）', 6000);
+  }
+
+  private onStdout(chunk: string): void {
+    this.buffer += chunk;
+    for (;;) {
+      const index = this.buffer.indexOf('\n');
+      if (index < 0) {
+        break;
+      }
+      const line = this.buffer.slice(0, index).trim();
+      this.buffer = this.buffer.slice(index + 1);
+      if (!line) {
+        continue;
+      }
+
+      let message: CheckResponse;
+      try {
+        message = JSON.parse(line) as CheckResponse;
+      } catch {
+        this.output.appendLine(`[slyzc] 无法解析的输出: ${line}`);
+        continue;
+      }
+
+      if (message.restart) {
+        this.output.appendLine('[slyzc] 达到内存水位，重启检查进程');
+        continue;
+      }
+
+      if (typeof message.id !== 'number') {
+        continue;
+      }
+      const entry = this.pending.get(message.id);
+      if (!entry) {
+        continue;
+      }
+      this.pending.delete(message.id);
+      clearTimeout(entry.timer);
+      entry.resolve(message);
     }
   }
 
-  for (const entry of ifStack) {
-    diagnostics.push(errorAt('if 块未闭合：缺少 endif', entry.line, 0));
+  private onExit(code: number | null): void {
+    this.proc = undefined;
+    this.rejectAll(new Error(`SLYZ checker exited (${code ?? 'null'})`));
+    if (this.disposed) {
+      return;
+    }
+    this.scheduleRestart();
   }
 
-  /* GUI 指令出现在没有 #gui 的文件里，内核不会把它当界面程序 */
-  for (let i = 0; i < lines.length; i++) {
-    const trimmed = lines[i].trim();
-    if (!trimmed || trimmed.startsWith('#')) continue;
-    const m = /^([A-Za-z]+)\b/.exec(trimmed);
-    if (m && GUI_KEYWORDS.includes(m[1].toLowerCase())) {
-      diagnostics.push(infoAt(
-        `这看起来是 GUI 指令，但文件第一行不是 #gui，内核会把它当普通脚本执行`,
-        i, 0, m[1].length));
-      break;
+  private scheduleRestart(): void {
+    if (this.disposed || this.restartTimer) {
+      return;
     }
+    if (this.restartCount >= MAX_RESTARTS) {
+      this.output.appendLine('[slyzc] 连续重启次数过多，已停止自动重启');
+      return;
+    }
+    const delay = Math.min(30000, 1000 * Math.pow(2, this.restartCount));
+    this.restartCount++;
+    this.restartTimer = setTimeout(() => {
+      this.restartTimer = undefined;
+      this.start();
+    }, delay);
+  }
+
+  private rejectAll(reason: Error): void {
+    for (const [, entry] of this.pending) {
+      clearTimeout(entry.timer);
+      entry.reject(reason);
+    }
+    this.pending.clear();
+  }
+
+  private request(payload: Record<string, unknown>): Promise<CheckResponse> {
+    this.start();
+    const proc = this.proc;
+    if (!proc) {
+      return Promise.reject(new Error('slyzc.exe 未启动'));
+    }
+
+    const id = this.nextId++;
+    const body = JSON.stringify({ id, ...payload });
+
+    return new Promise<CheckResponse>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error('检查超时'));
+      }, REQUEST_TIMEOUT_MS);
+
+      this.pending.set(id, { resolve, reject, timer });
+      try {
+        proc.stdin.write(body + '\n');
+      } catch (error) {
+        clearTimeout(timer);
+        this.pending.delete(id);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
+  }
+
+  /** 请求一次检查；失败时返回空数组并记录原因，不让编辑器弹窗。 */
+  async check(pathLabel: string, text: string): Promise<vscode.Diagnostic[]> {
+    let response: CheckResponse;
+    try {
+      response = await this.request({ path: pathLabel, text });
+      this.restartCount = 0;
+    } catch (error) {
+      this.output.appendLine(`[slyzc] 检查失败: ${String(error)}`);
+      return [];
+    }
+
+    if (response.fatal) {
+      this.output.appendLine(`[slyzc] ${response.fatal}`);
+      return [];
+    }
+
+    const result: vscode.Diagnostic[] = [];
+    for (const item of response.diagnostics ?? []) {
+      const line = Math.max(0, (item.line | 0) - 1);
+      const column = Math.max(0, (item.col | 0) - 1);
+      const range = new vscode.Range(
+        new vscode.Position(line, column),
+        new vscode.Position(line, column + 1)
+      );
+      const severity = item.severity === 'warning'
+        ? vscode.DiagnosticSeverity.Warning
+        : vscode.DiagnosticSeverity.Error;
+      const diagnostic = new vscode.Diagnostic(range, item.message, severity);
+      diagnostic.source = 'slyzc';
+      result.push(diagnostic);
+    }
+    return result;
   }
 }
 
-function analyzeDocument(document: vscode.TextDocument): vscode.Diagnostic[] {
-  const diagnostics: vscode.Diagnostic[] = [];
-  const text = document.getText();
-  const lines = text.split(/\r?\n/);
+let checker: SlyzChecker | undefined;
+let debounceTimer: NodeJS.Timeout | undefined;
 
-  if (isGuiProgram(lines)) {
-    if (text.length > GUI_MAX_SRC_BYTES) {
-      diagnostics.push(warnAt(
-        `文件 ${text.length} 字节，超过内核读取上限 ${GUI_MAX_SRC_BYTES} 字节，尾部会被截断`,
-        0, 0, (lines[0] ?? '').length));
-    }
-    analyzeGuiProgram(lines, diagnostics);
-  } else {
-    analyzeTextScript(lines, diagnostics);
+function debounceMs(): number {
+  const value = vscode.workspace.getConfiguration('slyz').get<number>('checkDebounceMs', 250);
+  if (typeof value !== 'number' || Number.isNaN(value)) {
+    return 250;
   }
-
-  return diagnostics;
+  return Math.max(0, Math.min(5000, value));
 }
 
-function refreshDiagnostics(document?: vscode.TextDocument): void {
-  if (!document || document.languageId !== 'slyz') {
+async function refresh(document: vscode.TextDocument): Promise<void> {
+  if (!checker || document.languageId !== 'slyz') {
     return;
   }
+  // 异步返回期间文档可能又被编辑：版本不一致就丢弃这次结果，
+  // 否则旧诊断会覆盖新诊断。
+  const version = document.version;
+  const diagnostics = await checker.check(document.uri.fsPath || document.fileName,
+                                         document.getText());
+  if (document.version !== version) {
+    return;
+  }
+  diagnosticCollection.set(document.uri, diagnostics);
+}
 
-  diagnosticCollection.set(document.uri, analyzeDocument(document));
+function scheduleRefresh(document: vscode.TextDocument): void {
+  if (document.languageId !== 'slyz') {
+    return;
+  }
+  if (debounceTimer) {
+    clearTimeout(debounceTimer);
+  }
+  debounceTimer = setTimeout(() => {
+    debounceTimer = undefined;
+    void refresh(document);
+  }, debounceMs());
 }
 
 export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(diagnosticCollection);
 
-  const trigger = () => {
-    const editor = vscode.window.activeTextEditor;
-    if (editor && editor.document.languageId === 'slyz') {
-      refreshDiagnostics(editor.document);
-    }
-  };
-
-  trigger();
+  checker = new SlyzChecker(context.extensionPath);
+  context.subscriptions.push(checker);
+  checker.start();
 
   context.subscriptions.push(
-    vscode.window.onDidChangeActiveTextEditor((editor) => {
-      if (editor && editor.document.languageId === 'slyz') {
-        refreshDiagnostics(editor.document);
-      }
+    vscode.workspace.onDidOpenTextDocument((document) => {
+      void refresh(document);
     })
   );
 
   context.subscriptions.push(
-    vscode.workspace.onDidOpenTextDocument(refreshDiagnostics)
+    vscode.workspace.onDidChangeTextDocument((event) => {
+      scheduleRefresh(event.document);
+    })
   );
 
   context.subscriptions.push(
-    vscode.workspace.onDidChangeTextDocument((event) => {
-      refreshDiagnostics(event.document);
+    vscode.workspace.onDidSaveTextDocument((document) => {
+      void refresh(document);
     })
   );
 
@@ -374,8 +354,38 @@ export function activate(context: vscode.ExtensionContext): void {
       diagnosticCollection.delete(document.uri);
     })
   );
+
+  context.subscriptions.push(
+    vscode.window.onDidChangeActiveTextEditor((editor) => {
+      if (editor) {
+        void refresh(editor.document);
+      }
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration((event) => {
+      if (event.affectsConfiguration('slyz.compilerPath')) {
+        checker?.dispose();
+        checker = new SlyzChecker(context.extensionPath);
+        context.subscriptions.push(checker);
+        checker.start();
+      }
+    })
+  );
+
+  const active = vscode.window.activeTextEditor;
+  if (active) {
+    void refresh(active.document);
+  }
 }
 
 export function deactivate(): void {
+  if (debounceTimer) {
+    clearTimeout(debounceTimer);
+    debounceTimer = undefined;
+  }
+  checker?.dispose();
+  checker = undefined;
   diagnosticCollection.clear();
 }

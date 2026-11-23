@@ -50,4 +50,10 @@ void     vm_frame_stats(uint32_t *total, uint32_t *free_frames, uint32_t *reside
 uint32_t vm_swap_slots_used(void);
 uint32_t vm_swap_slot_capacity(void);
 
+/* 连续物理页分配（恒等映射，返回值可直接当指针用）。
+ * 图片解码这类远超内核堆容量（6MB）的大缓冲走这里；物理页不进
+ * 按需分页统计，也不参与 swap。bytes 不能为 0，分配失败返回 0。 */
+uint32_t vm_alloc_phys_bytes(uint32_t bytes);
+void     vm_free_phys_bytes(uint32_t phys, uint32_t bytes);
+
 #endif /* VM_H */

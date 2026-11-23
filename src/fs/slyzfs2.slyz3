@@ -1040,32 +1040,37 @@ fn file_read(idx, pos, p, n) {
     let left = n
     if pos + left > size { left = size - pos }
 
-    let done = 0
+    let cnt = ext_count(d)
+    let e = 0
+    let base = 0
     let curpos = pos
-    while left > 0 {
-        let base = 0
-        let e = 0
-        let cnt = ext_count(d)
-        let found = 0
-        while e < cnt {
-            let bytes = ext_clusters(d, e) * 4096
-            if curpos >= base && curpos < base + bytes {
-                found = 1
-                let chunk = base + bytes - curpos
-                if chunk > left { chunk = left }
-                let sec = ext_lba(d, e) + (curpos - base) / 512
-                let off = (curpos - base) % 512
-                if rd_bytes(sec, off, p, chunk) == 0 { return done }
-                p = p + chunk
-                curpos = curpos + chunk
-                left = left - chunk
-                done = done + chunk
-                break
-            }
-            base = base + bytes
-            e = e + 1
-        }
-        if found == 0 { break }
+
+    # 先按区间累加定位到包含 pos 的扩展（只做一次）
+    while e < cnt {
+        let bytes = ext_clusters(d, e) * 4096
+        if curpos < base + bytes { break }
+        base = base + bytes
+        e = e + 1
+    }
+
+    # 顺序读：扩展游标只前进，绝不回到 0。
+    # 旧实现每读 512 字节都从第一个扩展重新扫描，文件越大扩展越多，
+    # 读取时间按平方增长；4MB 壁纸在 QEMU 下要十几秒，TTY 读字体
+    # 也一起被拖慢。
+    let done = 0
+    while left > 0 && e < cnt {
+        let bytes = ext_clusters(d, e) * 4096
+        let chunk = base + bytes - curpos
+        if chunk > left { chunk = left }
+        let sec = ext_lba(d, e) + (curpos - base) / 512
+        let off = (curpos - base) % 512
+        if rd_bytes(sec, off, p, chunk) == 0 { break }
+        p = p + chunk
+        curpos = curpos + chunk
+        left = left - chunk
+        done = done + chunk
+        base = base + bytes
+        e = e + 1
     }
     return done
 }
@@ -1396,8 +1401,45 @@ fn op_remove(drive, path, want_dir) {
     return 1
 }
 
-fn op_usage(drive, out) {
+# 同卷改名/移动：只动父目录索引项，数据扩展完全不动。
+# 这是"剪切/移动一秒完成"的基础。
+fn op_rename(drive, oldp, newp) {
     if use_vol(drive) == 0 { return 0 }
+
+    let op = resolve_parent(oldp)
+    if op < 0 { return 0 }
+    let old_seg = seg_start
+    let old_len = seg_len
+    if check_name(old_len) == 0 { return 0 }
+
+    let np = resolve_parent(newp)
+    if np < 0 { return 0 }
+    let new_seg = seg_start
+    let new_len = seg_len
+    if check_name(new_len) == 0 { return 0 }
+
+    let idx = resolve(oldp)
+    if idx < 0 { return 0 }
+    if resolve(newp) >= 0 { return 0 }
+    if rec_read(idx) == 0 { return 0 }
+    let flags = load16(recbuf, 22) & 1
+
+    if dir_remove(op, oldp + old_seg, old_len) == 0 { return 0 }
+    # 目录块已在 jbuf 里暂存；必须先提交，否则后续 dir_insert 从磁盘
+    # 读到的是未删除的旧块，会把删除效果覆盖成“只新增一条同名目录项”。
+    if jcommit() == 0 { return 0 }
+
+    if dir_insert(np, newp + new_seg, new_len, idx, flags) == 0 {
+        dir_insert(op, oldp + old_seg, old_len, idx, flags)
+        jcommit()
+        return 0
+    }
+    sync_vol()
+    if jcommit() == 0 { return 0 }
+    return 1
+}
+
+fn op_usage(drive, out) {    if use_vol(drive) == 0 { return 0 }
     store32(out, 0, vclusters(drive) & 0xFFFFFFFF)
     store32(out, 4, vused(drive))
     store32(out, 8, 4096)
@@ -1696,6 +1738,28 @@ fn count_volumes() {
     return n
 }
 
+# 卸载：先把当前卷的日志提交落盘，再释放位图并清空卷上下文。
+# 卸载后卷仍保存在分区表里，下次启动 mount_all 会重新挂载。
+fn vol_unmount(v) {
+    if v < 0 { return 0 }
+    if v > 2 { return 0 }
+    if vmounted(v) != 0 {
+        sync_vol()
+        jcommit()
+        disk.flush()
+        let bp = vbmp(v)
+        if bp != 0 { mem.free(bp) }
+        mem.zero(V + v * 96, 96)
+        if cur == v {
+            cur = 0
+            bmp = 0
+            used_clusters = 0
+            alloc_hint = 0
+        }
+    }
+    return 1
+}
+
 # ------------------------------------------------------------
 # 入口
 # ------------------------------------------------------------
@@ -1726,7 +1790,7 @@ fn slyzfs_call(op, a, b, c, d) {
     if op == 2 { return mount_all() }
     if op == 3 { return vol_format(a, b, c, d) }
     if op == 4 { return vol_mount(a, b, c) }
-    if op == 5 { return 1 }
+    if op == 5 { return vol_unmount(a) }
     if op == 6 { sync_vol() return jcommit() }
 
     if op == 7 { return op_list(a, b, c, d) }
@@ -1751,6 +1815,7 @@ fn slyzfs_call(op, a, b, c, d) {
     if op == 24 { return op_volume_info(a, b) }
     if op == 25 { return fault_read(b) }
     if op == 26 { return fault_write(b) }
+    if op == 27 { return op_rename(a, b, c) }
     return 0
 }
 

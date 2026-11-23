@@ -48,4 +48,13 @@ void image_draw_scaled(int handle, int x, int y, int w, int h);
  * 用于用户头像：圆外像素不会被写入。 */
 void image_draw_circle(int handle, int cx, int cy, int radius);
 
+/* 把整张图缩放进调用方提供的 32 位像素缓冲（dw×dh，行距 = dw）。
+ * 桌面壁纸用它把"缩放结果"缓存起来：之后每帧只按脏矩形拷贝像素，
+ * 不再重复做 1600×900 次采样。透明像素与 bg 合成。 */
+int image_scale_to_buffer(int handle, uint32_t *dst, int dw, int dh, uint32_t bg);
+
+/* 大块像素缓冲：优先从 VM 物理帧池分配，失败再回落内核堆。 */
+void *image_alloc_buffer(uint32_t bytes);
+void image_free_buffer(void *ptr);
+
 #endif /* IMAGE_H */

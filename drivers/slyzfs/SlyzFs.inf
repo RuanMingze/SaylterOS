@@ -1,0 +1,37 @@
+; ============================================================
+; SlyzFs.inf - SaylterOS SlyzFS v3 文件系统驱动
+; ------------------------------------------------------------
+; 非 PnP 的 legacy 文件系统驱动。推荐用 install.ps1（sc.exe）
+; 安装；本 INF 的 DefaultInstall 也可右键安装。
+; ============================================================
+
+[Version]
+Signature="$Windows NT$"
+Class=FileSystem
+ClassGuid={53D29EF7-377C-4D14-864B-EB3A85769359}
+Provider=%Provider%
+DriverVer=11/22/2026,1.0.0.0
+
+[DestinationDirs]
+DefaultDestDir=12
+
+[DefaultInstall]
+CopyFiles=DriverCopyFiles
+AddService=SlyzFs.Service
+
+[DefaultInstall.Services]
+AddService=SlyzFs.Service,ServiceInstall
+
+[DriverCopyFiles]
+SlyzFs.sys
+
+[ServiceInstall]
+DisplayName=%ServiceName%
+ServiceType=2
+StartType=1
+ErrorControl=1
+ServiceBinary=%12%\SlyzFs.sys
+
+[Strings]
+Provider="SaylterOS"
+ServiceName="SaylterOS SlyzFS"

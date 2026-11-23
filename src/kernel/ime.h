@@ -30,9 +30,18 @@
 
 void ime_init(void);
 
+/* 登录后调用：按当前用户加载 home\<user>\ime.freq。
+ * 词频表在首次按键时也会懒加载，这里显式调用只是让候选顺序
+ * 在登录后的第一帧就正确。 */
+void ime_reload_user(void);
+
+/* 立即把脏词频写回磁盘（关机/注销前调用）。 */
+void ime_flush(void);
+
 /* 中文模式开关（Ctrl+Space） */
 int  ime_chinese_enabled(void);
 void ime_toggle_chinese(void);
+void ime_set_chinese(int on);
 
 /* 当前拼音缓冲（NUL 结尾），空串表示没有正在输入的音节 */
 const char *ime_composing(void);

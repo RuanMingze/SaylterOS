@@ -9,6 +9,7 @@
 #include "blk.h"
 #include "usb_msc.h"
 #include "ehci_msc.h"
+#include "nvme.h"
 #include "ahci.h"
 #include "ata.h"
 
@@ -16,6 +17,7 @@
 #define BLK_XHCI  1
 #define BLK_EHCI  2
 #define BLK_AHCI  3
+#define BLK_NVME  4
 
 static int g_initialized;
 static int g_backend;
@@ -34,6 +36,10 @@ void blk_init(void) {
         g_backend = BLK_EHCI;
         return;
     }
+    if (nvme_init() && nvme_present()) {
+        g_backend = BLK_NVME;
+        return;
+    }
     if (ahci_init() && ahci_present()) {
         g_backend = BLK_AHCI;
         return;
@@ -44,12 +50,29 @@ void blk_init(void) {
     ata_enable_write_cache();
 }
 
+int blk_try_usb(void) {
+    if (g_initialized) {
+        return 1;
+    }
+    if (usb_msc_init() && usb_msc_present()) {
+        g_backend = BLK_XHCI;
+        g_initialized = 1;
+        return 1;
+    }
+    if (ehci_msc_init() && ehci_msc_present()) {
+        g_backend = BLK_EHCI;
+        g_initialized = 1;
+        return 1;
+    }
+    return 0;
+}
+
 int blk_present(void) {
     if (!g_initialized) {
         blk_init();
     }
     if (g_backend == BLK_XHCI || g_backend == BLK_EHCI ||
-        g_backend == BLK_AHCI) {
+        g_backend == BLK_AHCI || g_backend == BLK_NVME) {
         return 1;
     }
     return ata_disk_present();
@@ -68,7 +91,28 @@ int blk_read(uint32_t lba, uint8_t *buf) {
     if (g_backend == BLK_AHCI) {
         return ahci_read(lba, buf);
     }
+    if (g_backend == BLK_NVME) {
+        return nvme_read(lba, buf);
+    }
     return ata_read_sector(lba, buf);
+}
+
+int blk_read_multi(uint32_t lba, uint32_t count, uint8_t *buf) {
+    if (!g_initialized) {
+        blk_init();
+    }
+    if (count == 0) return 1;
+
+    /* ATA 后端支持总线主控 DMA；其它后端逐扇区回退，
+     * 语义与 blk_read 完全一致（AHCI/NVMe 本身已是 DMA）。 */
+    if (g_backend == BLK_ATA && count > 1) {
+        if (ata_read_multi(lba, count, buf)) return 1;
+    }
+
+    for (uint32_t i = 0; i < count; i++) {
+        if (!blk_read(lba + i, buf + i * 512u)) return 0;
+    }
+    return 1;
 }
 
 int blk_write(uint32_t lba, const uint8_t *buf) {
@@ -83,6 +127,9 @@ int blk_write(uint32_t lba, const uint8_t *buf) {
     }
     if (g_backend == BLK_AHCI) {
         return ahci_write(lba, buf);
+    }
+    if (g_backend == BLK_NVME) {
+        return nvme_write(lba, buf);
     }
     return ata_write_sector(lba, buf);
 }
@@ -100,6 +147,9 @@ int blk_flush(void) {
     if (g_backend == BLK_AHCI) {
         return ahci_flush();
     }
+    if (g_backend == BLK_NVME) {
+        return nvme_flush();
+    }
     return ata_flush();
 }
 
@@ -115,6 +165,9 @@ uint32_t blk_total_sectors(void) {    if (!g_initialized) {
     if (g_backend == BLK_AHCI) {
         return ahci_total_sectors();
     }
+    if (g_backend == BLK_NVME) {
+        return nvme_total_sectors();
+    }
     return ata_total_sectors();
 }
 
@@ -128,6 +181,8 @@ void blk_stats(uint32_t *reads, uint32_t *writes) {
         ehci_msc_stats(reads, writes);
     } else if (g_backend == BLK_AHCI) {
         ahci_stats(reads, writes);
+    } else if (g_backend == BLK_NVME) {
+        nvme_stats(reads, writes);
     } else {
         ata_stats(reads, writes);
     }
@@ -145,6 +200,9 @@ const char *blk_backend(void) {
     }
     if (g_backend == BLK_AHCI) {
         return "SATA(AHCI)";
+    }
+    if (g_backend == BLK_NVME) {
+        return "NVMe(PCIe)";
     }
     return "ATA PIO";
 }

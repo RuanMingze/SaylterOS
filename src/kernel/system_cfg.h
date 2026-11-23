@@ -46,4 +46,20 @@ int system_cfg_set_wallpaper(const char *path);
 const char *system_cfg_avatar(void);
 int system_cfg_set_avatar(const char *path);
 
+/* 界面主题：
+ *   0 = 科技橙（深色，默认）
+ *   1 = 清晰绿（浅色）
+ * 配置项写作 theme=dark / theme=light（也接受 orange / green）。 */
+#define SYSTEM_THEME_DARK_ORANGE 0
+#define SYSTEM_THEME_LIGHT_GREEN 1
+
+int system_cfg_theme(void);
+int system_cfg_set_theme(int id);
+
+/* 界面动画：0 = 关闭（默认），1 = 开启淡入淡出。
+ * 配置项写作 anim=on / anim=off。低配机器或 QEMU TCG 下关闭可获得
+ * 更稳定的帧时间，因此出厂默认关闭。 */
+int system_cfg_anim(void);
+int system_cfg_set_anim(int on);
+
 #endif /* SYSTEM_CFG_H */

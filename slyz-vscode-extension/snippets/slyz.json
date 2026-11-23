@@ -1,52 +1,97 @@
 {
-  "Slyz GUI program": {
-    "prefix": "gui",
+  "SLYZ v2 程序骨架": {
+    "prefix": "main",
     "body": [
-      "#gui",
-      "title \"${1:My App}\"",
-      "size ${2:560} ${3:460}",
-      "",
-      "label \"${4:Hello}\"",
-      "",
-      "input name \"${5:Your name}\"",
-      "",
-      "button \"${6:Say hi}\" -> set:Hi {name}",
-      "button \"Date\" -> shell:date",
-      "space 8",
-      "hr",
-      "button \"Close\" -> close",
-      "$0"
+      "fn main() {",
+      "    ${1:// 在这里写代码}",
+      "    $0",
+      "}",
+      ""
     ],
-    "description": "声明式 Slyz GUI 程序骨架（#gui 首行）"
+    "description": "函数入口；存在 main() 时，顶层语句先执行，再调用 main"
   },
-  "GUI label": {
-    "prefix": "label",
-    "body": ["label \"${1:Text}\"", "$0"],
-    "description": "静态文本"
+  "变量声明": {
+    "prefix": "let",
+    "body": ["let ${1:name} = ${2:0}", "$0"],
+    "description": "声明局部变量"
   },
-  "GUI input": {
-    "prefix": "input",
-    "body": ["input ${1:name} \"${2:Label}\"", "$0"],
-    "description": "文本输入框；名称用于 {name} 占位符"
+  "函数定义": {
+    "prefix": "fn",
+    "body": [
+      "fn ${1:name}(${2:args}) {",
+      "    $0",
+      "}"
+    ],
+    "description": "定义函数"
   },
-  "GUI button": {
-    "prefix": "button",
-    "body": ["button \"${1:Label}\" -> ${2|close,set:,open:,shell:|}${3}", "$0"],
-    "description": "按钮与动作：close / set: / open: / shell:"
+  "if / else": {
+    "prefix": "if",
+    "body": [
+      "if ${1:condition} {",
+      "    $2",
+      "} else {",
+      "    $0",
+      "}"
+    ],
+    "description": "条件分支"
   },
-  "GUI button with shell": {
-    "prefix": "buttonshell",
-    "body": ["button \"${1:Run}\" -> shell:${2:date}", "$0"],
-    "description": "执行 shell 命令并把输出写入窗口"
+  "while 循环": {
+    "prefix": "while",
+    "body": [
+      "while ${1:condition} {",
+      "    $0",
+      "}"
+    ],
+    "description": "while 循环"
   },
-  "GUI button with input": {
-    "prefix": "buttonset",
-    "body": ["button \"${1:Say hi}\" -> set:${2:Hi} {${3:name}}", "$0"],
-    "description": "把输入框内容代入文本并输出"
+  "for 区间循环": {
+    "prefix": "for",
+    "body": [
+      "for ${1:i} in ${2:0}..${3:10} {",
+      "    $0",
+      "}"
+    ],
+    "description": "按区间迭代"
   },
-  "GUI size": {
-    "prefix": "size",
-    "body": ["size ${1:560} ${2:460}"],
-    "description": "窗口尺寸，最小 360 × 260"
+  "遍历数组": {
+    "prefix": "foreach",
+    "body": [
+      "for ${1:item} in ${2:items} {",
+      "    $0",
+      "}"
+    ],
+    "description": "遍历数组或区间"
+  },
+  "输出一行": {
+    "prefix": "println",
+    "body": ["println(${1:\"text\"})", "$0"],
+    "description": "打印并换行"
+  },
+  "读取文件": {
+    "prefix": "readfile",
+    "body": ["let ${1:text} = fs.read(${2:\"path\"})", "$0"],
+    "description": "读取整个文件为字符串"
+  },
+  "写入文件": {
+    "prefix": "writefile",
+    "body": ["fs.write(${1:\"path\"}, ${2:text})", "$0"],
+    "description": "写入整个文件"
+  },
+  "打开窗口": {
+    "prefix": "winopen",
+    "body": ["let ${1:w} = win.open(${2:\"Title\"}, ${3:640}, ${4:480})", "$0"],
+    "description": "打开 GUI 窗口（需要 GUI 宿主）"
+  },
+  "事件循环": {
+    "prefix": "eventloop",
+    "body": [
+      "while true {",
+      "    let ${1:ev} = event.poll()",
+      "    if ${1:ev} != nil {",
+      "        $0",
+      "    }",
+      "}"
+    ],
+    "description": "窗口事件轮询"
   }
 }

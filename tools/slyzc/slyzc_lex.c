@@ -29,21 +29,21 @@ static int         g_has_ahead = 0;
 
 void diag_error(int line, int col, const char *fmt, ...) {
     va_list ap;
+    char msg[SLYZ_DIAG_MSG_MAX];
     va_start(ap, fmt);
-    fprintf(stderr, "%s:%d:%d: error: ", g_cc.path ? g_cc.path : "<source>", line, col);
-    vfprintf(stderr, fmt, ap);
-    fprintf(stderr, "\n");
+    vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
+    slyz_diag_record(0, line, col, msg);
     g_cc.error_count++;
 }
 
 void diag_warn(int line, int col, const char *fmt, ...) {
     va_list ap;
+    char msg[SLYZ_DIAG_MSG_MAX];
     va_start(ap, fmt);
-    fprintf(stderr, "%s:%d:%d: warning: ", g_cc.path ? g_cc.path : "<source>", line, col);
-    vfprintf(stderr, fmt, ap);
-    fprintf(stderr, "\n");
+    vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
+    slyz_diag_record(1, line, col, msg);
 }
 
 /* ---------- 基础字符分类 ---------- */

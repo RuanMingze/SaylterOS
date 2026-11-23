@@ -9,6 +9,9 @@ extern "C" {
 
 int ata_disk_present(void);
 int ata_read_sector(uint32_t lba, uint8_t* buf);
+/* 一次读多个扇区：优先总线主控 DMA，失败回退多扇区 PIO。
+ * count 上限 256（128KB）。成功返回 1。 */
+int ata_read_multi(uint32_t lba, uint32_t count, uint8_t* buf);
 int ata_write_sector(uint32_t lba, const uint8_t* buf);
 uint32_t ata_total_sectors(void);
 void ata_stats(uint32_t *reads, uint32_t *writes);

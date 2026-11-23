@@ -155,10 +155,23 @@
 #define SLE_SYS_FS_REMOVE   24u  /* (path)         0 成功，-1 失败 */
 #define SLE_SYS_FS_MKDIR    25u  /* (path)         0 成功，-1 失败 */
 #define SLE_SYS_FS_ENTRIES  26u  /* (path)         [[name, type, size], ...] */
+#define SLE_SYS_FS_RMDIR    27u  /* (path)         0 成功，-1 失败（仅空目录） */
+#define SLE_SYS_FS_COPY     28u  /* (src, dst)     -> 字节数 / -1 */
+#define SLE_SYS_FS_MOVE     29u  /* (src, dst)     同卷 O(1) 改名，0 / -1 */
+#define SLE_SYS_FS_MOVE     29u  /* (src, dst)     同卷 O(1) 改名，0 / -1 */
 
 #define SLE_SYS_CFG_GET     30u  /* (key)          etc\system.cfg 的值 */
 #define SLE_SYS_CFG_SET     31u  /* (key, value)   写回配置，0 成功 */
 #define SLE_SYS_CFG_KEYS    32u  /* ()             全部键名数组 */
+
+/* 分区与盘符管理（SlyzFS 管理工具使用）。drive: 0=C 1=R 2=D。
+ * list 返回 [[drive, start_lba, sectors, mounted, label], ...]。 */
+#define SLE_SYS_PART_LIST    33u /* ()             -> 分区数组 */
+#define SLE_SYS_PART_ADD     34u /* (drive, sectors, label) 建卷+格式化+挂载 */
+#define SLE_SYS_PART_DELETE  35u /* (drive)        删除分区表条目 */
+#define SLE_SYS_PART_FORMAT  36u /* (drive, label) 重新格式化 */
+#define SLE_SYS_PART_MOUNT   37u /* (drive)        挂载 */
+#define SLE_SYS_PART_UNMOUNT 38u /* (drive)        卸载 */
 
 #define SLE_SYS_TIME_NOW    40u  /* ()             Unix 秒 */
 #define SLE_SYS_TIME_MS     41u  /* ()             开机毫秒 */
@@ -193,6 +206,31 @@
 #define SLE_SYS_WIN_SIZE    62u  /* (handle)       宽，高度另取 */
 #define SLE_SYS_WIN_HEIGHT  63u  /* (handle) */
 #define SLE_SYS_WIN_TITLE   64u  /* (handle, title) */
+
+/* 主题调色板：ui.theme(slot) 返回 0xRRGGBB。
+ * 应用应从这里取色，而不是写死颜色，才能跟随 设置 → 主题 切换。
+ * 注意：宿主调用号必须小于 100，100 起是虚拟机内置函数（SLE_BIF_*），
+ * 两者编号空间重叠会让调用被当成 len/str 之类的内置函数。 */
+#define SLE_SYS_THEME_GET   65u
+#define SLE_THEME_BG        0
+#define SLE_THEME_BG2       1
+#define SLE_THEME_PANEL     2
+#define SLE_THEME_PANEL2    3
+#define SLE_THEME_PANEL3    4
+#define SLE_THEME_BORDER    5
+#define SLE_THEME_TEXT      6
+#define SLE_THEME_DIM       7
+#define SLE_THEME_ACCENT    8
+#define SLE_THEME_ACCENT2   9
+#define SLE_THEME_ACCENT3   10
+#define SLE_THEME_OK        11
+#define SLE_THEME_ERR       12
+#define SLE_THEME_WARN      13
+#define SLE_THEME_HOVER     14
+#define SLE_THEME_SEL       15
+#define SLE_THEME_WIN_BG    16
+#define SLE_THEME_TITLE     17
+#define SLE_THEME_MENU_BG   18
 
 #define SLE_SYS_GFX_CLEAR   70u  /* (color) */
 #define SLE_SYS_GFX_RECT    71u  /* (x, y, w, h, color) */

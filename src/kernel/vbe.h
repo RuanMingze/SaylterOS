@@ -53,6 +53,11 @@ uint32_t vbe_get_pixel(uint16_t x, uint16_t y);
 void vbe_blend_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
                     uint32_t color, uint8_t alpha);
 
+/* 把一块 32 位像素缓冲按行拷进 backbuffer（遵守全局裁剪）。
+ * 桌面壁纸缓存用它按脏矩形上屏，避免每帧重新做整屏缩放。 */
+void vbe_blit_argb(const uint32_t *src, int src_stride,
+                   int x, int y, int w, int h);
+
 /* 用 8 位覆盖率掩码绘制字形。
  * mask 每字节是一个像素的覆盖率（0..255），stride 是掩码行字节数；
  * buf 版本写 backbuffer 并遵守全局裁剪，fb 版本直接写 LFB 且以 bg

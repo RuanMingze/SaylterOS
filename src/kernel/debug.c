@@ -53,6 +53,130 @@ static int      g_fs_ready;
 static int      g_log_started;
 static int      g_log_retry;
 
+/* ============================================================
+ * 启动盘裸写日志（dbg 阶段）
+ * ------------------------------------------------------------
+ * 真机没有串口、VBE 也可能黑屏，因此把控制台/串口字节直接写进
+ * 启动盘的固定预留区，不经过任何文件系统。只写 BIOS 暴露的启动盘
+ * （blk_init 已按 USB 优先选择），固定 LBA 区间不会碰到内核/模块/FS。
+ * ============================================================ */
+
+#define DBG_RAW_LBA     7296u      /* 预留区起始 LBA（内核/模块之后、FS 之前） */
+#define DBG_RAW_SECTORS 128u       /* 64 KB */
+#define DBG_RAW_SYNC    8u         /* 每 8 个扇区刷一次设备缓存 */
+
+static int      g_raw_on;
+static int      g_raw_ready;
+static int      g_raw_busy;
+static uint32_t g_raw_cursor;
+static uint32_t g_raw_used;
+static uint32_t g_raw_since;
+static uint8_t  g_raw_sector[512];
+
+/* 把当前扇区补零后写到启动盘；遇到换行即落盘，保证黑屏/掉电后
+ * 盘上仍有最后一行日志。写入过程中触发的 printk 会被 g_raw_busy
+ * 挡住，避免递归。 */
+static void raw_flush_sector(void) {
+    if (!g_raw_ready || g_raw_busy) return;
+    if (g_raw_cursor >= DBG_RAW_LBA + DBG_RAW_SECTORS) {
+        g_raw_on = 0;
+        g_raw_ready = 0;
+        return;
+    }
+
+    for (uint32_t i = g_raw_used; i < 512u; i++) {
+        g_raw_sector[i] = 0;
+    }
+
+    g_raw_busy = 1;
+    int ok = blk_write(g_raw_cursor, g_raw_sector);
+    g_raw_busy = 0;
+    if (!ok) {
+        g_raw_on = 0;
+        g_raw_ready = 0;
+        return;
+    }
+
+    g_raw_cursor++;
+    g_raw_used = 0;
+    if (++g_raw_since >= DBG_RAW_SYNC) {
+        g_raw_since = 0;
+        blk_flush();
+    }
+}
+
+static void raw_push(char c) {
+    if (!g_raw_ready || g_raw_busy) return;
+    g_raw_sector[g_raw_used++] = (uint8_t)c;
+    if (c == '\n' || g_raw_used >= 512u) {
+        raw_flush_sector();
+    }
+}
+
+void debug_rawlog_begin(void) {
+    if (g_raw_on) return;
+
+    /* 只探测 USB：绝不能回退到内置 SATA/ATA 盘。
+     * U 盘启动时若 USB 探测失败，回退会把裸日志写进系统盘，
+     * 这是不可接受的数据破坏，因此宁可不记录。 */
+    if (!blk_try_usb()) return;
+    if (!blk_present()) return;
+    if (blk_total_sectors() < DBG_RAW_LBA + DBG_RAW_SECTORS) return;
+
+    g_raw_cursor = DBG_RAW_LBA;
+    g_raw_used = 0;
+    g_raw_since = 0;
+
+    /* 头扇区：magic + 后端名，便于取出 U 盘后确认这是调试日志。 */
+    for (uint32_t i = 0; i < 512u; i++) g_raw_sector[i] = 0;
+    const char *magic = "SLYDBG01 raw console log on boot disk\n";
+    uint32_t n = 0;
+    while (magic[n] && n < 400u) {
+        g_raw_sector[n] = (uint8_t)magic[n];
+        n++;
+    }
+    const char *be = blk_backend();
+    while (*be && n < 500u) {
+        g_raw_sector[n++] = (uint8_t)*be++;
+    }
+    g_raw_sector[n++] = '\n';
+
+    g_raw_busy = 1;
+    int ok = blk_write(g_raw_cursor, g_raw_sector);
+    g_raw_busy = 0;
+    if (!ok) return;
+    g_raw_cursor++;
+    g_raw_used = 0;
+
+    g_raw_ready = 1;
+    g_raw_on = 1;
+}
+
+/* clear=1：把本次用到的槽位清零（next 进入正常启动前调用）。 */
+void debug_rawlog_end(int clear) {
+    if (!g_raw_ready) {
+        g_raw_on = 0;
+        return;
+    }
+    g_raw_on = 0;
+
+    if (g_raw_used) {
+        raw_flush_sector();
+    }
+    blk_flush();
+
+    if (clear) {
+        static const uint8_t zero[512];
+        for (uint32_t lba = DBG_RAW_LBA; lba < g_raw_cursor; lba++) {
+            (void)blk_write(lba, zero);
+        }
+        blk_flush();
+    }
+
+    g_raw_ready = 0;
+}
+
+
 extern int   slyzfs_mkdir(const char *path);
 extern int   slyzfs_stat(const char *path, void *out);
 extern void *slyzfs_open(const char *path, const char *mode);
@@ -111,10 +235,62 @@ static void dbg_terminate(char *p) {
 }
 
 /* ============================================================
+ * 屏幕进度条
+ * ------------------------------------------------------------
+ * 主板没有蜂鸣器，串口也未必有。直接在 VBE 帧缓冲左下角画一排
+ * 彩色小方块：第 N 步点亮 N+1 个格子。绕开 tty 后端，tty 还没
+ * 初始化或整屏清空后都能立即看到进度。
+ * ============================================================ */
+#define DBG_PROGRESS_BOX   24
+#define DBG_PROGRESS_GAP   6
+#define DBG_PROGRESS_STEPS 6
+
+void debug_progress(int step) {
+    if (!vbe_is_enabled()) return;
+    if (vbe_current.bpp != 32) return;
+    if (vbe_current.width == 0 || vbe_current.height == 0) return;
+
+    static const uint32_t colors[DBG_PROGRESS_STEPS] = {
+        0x0033CC00u,  /* 0 绿：C 内核 + vbe_init */
+        0x000099FFu,  /* 1 蓝：gpu_init */
+        0x00FFCC00u,  /* 2 黄：tty_init */
+        0x00FF00CCu,  /* 3 品红：调试控制台开始 */
+        0x0000CCCCu,  /* 4 青：raw log 探测结束 */
+        0x00FFFFFFu   /* 5 白：dbg 控制台就绪 */
+    };
+
+    int n = step + 1;
+    if (n > DBG_PROGRESS_STEPS) n = DBG_PROGRESS_STEPS;
+    if (n < 0) n = 0;
+
+    volatile uint8_t *fb = (volatile uint8_t *)(uintptr_t)vbe_current.framebuffer;
+    uint32_t pitch = vbe_current.pitch;
+    int y0 = (int)vbe_current.height - DBG_PROGRESS_BOX - 8;
+    if (y0 < 0) y0 = 0;
+
+    for (int i = 0; i < n; i++) {
+        int x0 = 8 + i * (DBG_PROGRESS_BOX + DBG_PROGRESS_GAP);
+        if (x0 >= (int)vbe_current.width) break;
+        uint32_t color = colors[i];
+        for (int y = y0; y < y0 + DBG_PROGRESS_BOX && y < (int)vbe_current.height; y++) {
+            uint32_t *row = (uint32_t *)(fb + (uint32_t)y * pitch);
+            for (int x = x0; x < x0 + DBG_PROGRESS_BOX && x < (int)vbe_current.width; x++) {
+                row[x] = color;
+            }
+        }
+    }
+}
+
+/* ============================================================
  * 串口镜像与落盘
  * ============================================================ */
 
 void debug_serial_byte(char c) {
+    /* dbg 阶段：串口字节同时裸写到启动盘，真机黑屏后可直接读盘。 */
+    if (g_raw_on) {
+        raw_push(c);
+    }
+
     if (!g_serial_on) return;
 
     uint32_t head = g_log_head;
@@ -399,6 +575,7 @@ static void con_header(void) {
 
 static void con_settings(void) {
     printk(" seriallog : %s\n", g_serial_on ? "ON  -> system\\logs\\debug-serial.log" : "OFF");
+    printk(" rawlog    : %s\n", g_raw_on ? "ON  -> boot disk raw LBA 7296+" : "OFF");
     printk(" hud       : %s\n", g_hud_on ? "ON  -> top-right overlay" : "OFF");
     printk(" safeformat: %s\n", g_safe_format ? "ON  (never auto-format)" : "OFF (mount failure may format)");
 }
@@ -407,6 +584,7 @@ static void cmd_help(void) {
     printk(" next                 continue normal kernel boot\n");
     printk(" settings             show debug settings\n");
     printk(" seriallog on|off     mirror serial output to current boot disk\n");
+    printk(" rawlog on|off|clear  raw-write console bytes to boot disk (no FS)\n");
     printk(" hud on|off           persistent memory/CPU/disk overlay\n");
     printk(" safeformat on|off    disable/enable auto-format after mount failure\n");
     printk(" disk                 probe block backend and read LBA0 (read-only)\n");
@@ -502,6 +680,8 @@ static int handle_command(const char *line) {
 
     if (dbg_streq(cmd, "next") || dbg_streq(cmd, "boot") ||
         dbg_streq(cmd, "continue")) {
+        printk(" clearing raw log on boot disk...\n");
+        debug_rawlog_end(1);
         printk(" continuing normal boot...\n");
         return 1;
     }
@@ -522,6 +702,21 @@ static int handle_command(const char *line) {
             printk(" seriallog OFF\n");
         } else {
             printk(" usage: seriallog on|off\n");
+        }
+        return 0;
+    }
+    if (dbg_streq(cmd, "rawlog")) {
+        if (dbg_streq(arg, "on")) {
+            debug_rawlog_begin();
+            printk(" rawlog ON: %s\n", g_raw_on ? "boot disk LBA 7296+" : "unavailable");
+        } else if (dbg_streq(arg, "off")) {
+            debug_rawlog_end(0);
+            printk(" rawlog OFF\n");
+        } else if (dbg_streq(arg, "clear")) {
+            debug_rawlog_end(1);
+            printk(" rawlog cleared\n");
+        } else {
+            printk(" usage: rawlog on|off|clear\n");
         }
         return 0;
     }
@@ -579,6 +774,20 @@ static int handle_command(const char *line) {
 void debug_early_console(void) {
     /* 内嵌字体让调试控制台也使用平滑字形；此阶段不访问 SlyzFS。 */
     (void)slyertype_init_early();
+    debug_progress(3);
+
+    /* 先把最小标题画到屏幕，再探测启动盘。
+     * blk_try_usb() 可能在某些主板的 USB 控制器上卡住；即使卡住，
+     * 屏幕也不会是纯黑，能确认已经进到调试控制台阶段。 */
+    tty_clear();
+    debug_progress(3);
+    printk("SAYLTEROS DEBUG CONSOLE  (pre-SlyzFS)\n");
+    printk("probing boot disk for raw log...\n");
+    debug_progress(3);
+
+    /* 打开启动盘裸写日志：之后的控制台/串口字节都会直接落到启动盘。 */
+    debug_rawlog_begin();
+    debug_progress(4);
 
     tty_clear();
     con_header();
@@ -589,6 +798,7 @@ void debug_early_console(void) {
     int len = 0;
     int boot = 0;
 
+    debug_progress(5);
     tty_set_color(0x0A);
     printk("dbg> ");
     tty_set_color(0x0F);

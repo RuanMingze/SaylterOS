@@ -24,11 +24,11 @@ jmp_buf g_parse_jmp;
 
 void parse_fail(int line, int col, const char *fmt, ...) {
     va_list ap;
+    char msg[SLYZ_DIAG_MSG_MAX];
     va_start(ap, fmt);
-    fprintf(stderr, "%s:%d:%d: error: ", g_cc.path ? g_cc.path : "<source>", line, col);
-    vfprintf(stderr, fmt, ap);
-    fprintf(stderr, "\n");
+    vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
+    slyz_diag_record(0, line, col, msg);
     g_cc.error_count++;
     longjmp(g_parse_jmp, 1);
 }

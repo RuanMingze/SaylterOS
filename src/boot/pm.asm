@@ -38,6 +38,26 @@ STACK_TOP      equ 0x3FF000    ; 内核初始栈顶（< 内核堆基址 0x400000
 %define KERNEL_SECTORS 900
 %endif
 
+; 裸日志：VBE 初始化阶段直接写启动盘（不依赖文件系统）。
+; 每个槽固定占 1 个扇区，写入即覆盖旧内容，用作"阶段进度表"。
+; 槽 0..127 位于内核载荷之后、模块(6144)与 SlyzFS(8192)之前。
+; 只要定义了 SAYLTER_DEBUG（无论 C 侧还是构建脚本传入），
+; 就同时启用 pm 阶段的落盘与蜂鸣，避免两个宏不一致导致静默失效。
+%ifdef SAYLTER_DEBUG
+%ifndef SAYLTER_DEBUG_BOOT
+%define SAYLTER_DEBUG_BOOT
+%endif
+%endif
+RAW_LOG_LBA    equ 7168
+RAW_LOG_SLOTS  equ 128
+
+; 蜂鸣器音型：不同阶段用不同次数/音高，黑屏时也能听出卡在哪一步。
+BEEP_DIV_LOW   equ 0x1000      ; ~291 Hz
+BEEP_DIV_MID   equ 1193        ; ~1 kHz
+BEEP_DIV_HIGH  equ 596         ; ~2 kHz
+BEEP_LEN       equ 0x280
+BEEP_LEN_LONG  equ 0x700
+
 IDT_BASE       equ 0x60000
 idt_entries    equ IDT_BASE     ; 256 x 16B，运行时由 build_idt64 填充
 PML4_BASE      equ 0x70000
@@ -95,6 +115,12 @@ pm_start:
     mov dword [PF_LAST_RIP], 0
     mov dword [PF_LAST_RIP + 4], 0
 
+    ; 引导器提供的 ACPI RSDP 地址（UEFI 路径专用，BIOS 下保持 0）
+    mov dword [0x7DC0], 0
+    mov dword [0x7DC4], 0
+    ; 引导器类型标志：0 = BIOS/legacy，1 = UEFI（UEFI 下不启用 AP）
+    mov dword [0x7DBC], 0
+
     ; 键盘环形缓冲头尾清零（ISR 在进入长模式后才会写）
     mov word [0xA000], 0
     mov word [0xA002], 0
@@ -102,11 +128,42 @@ pm_start:
     ; A20 必须打开：内核镜像搬到 1MB 以上，ATA PIO 直接写高地址
     call enable_a20_16
 
+    ; --- 阶段 0：已进入 pm.bin（实模式） ---
+    ; 先落盘再鸣叫：即使随后 VBE 切模式黑屏，盘上也能看到进度。
+    ; 只有调试镜像（-DSAYLTER_DEBUG_BOOT=1）才写盘/鸣叫。
+%ifdef SAYLTER_DEBUG_BOOT
+    mov dx, 0
+    call raw_slot_start
+    mov si, msg_raw_enter
+    call raw_append
+    mov dx, 0
+    call raw_commit
+    mov si, 1
+    mov ax, BEEP_DIV_MID
+    mov cx, BEEP_LEN
+    call beep_times
+%endif
+
     ; --- VBE BIOS 模式设置：终端统一走图形模式 ---
     ; 失败时 magic = 0，C 层自动回退到 80x25 文本终端。
     ; BIOS 的 VBE 调用可能改写 UART 的 LCR/DLAB，导致后续串口日志丢失，
     ; 因此调用前后各重初始化一次 COM1。
     call serial_init16
+
+    ; 阶段 1 预标记：4F00 若卡死/黑屏，盘上至少能看到已进入 VBE 初始化
+%ifdef SAYLTER_DEBUG_BOOT
+    mov dx, 1
+    call raw_slot_start
+    mov si, msg_raw_vbe_start
+    call raw_append
+    mov dx, 1
+    call raw_commit
+    mov si, 1
+    mov ax, BEEP_DIV_MID
+    mov cx, BEEP_LEN
+    call beep_times
+%endif
+
     call vbe_init
     call serial_init16
 
@@ -136,6 +193,20 @@ pm_start:
     hlt
     jmp .halt_kernel
 .kernel_done:
+
+    ; 阶段 5：即将切保护模式（之后 BIOS 不可用，只能靠蜂鸣器）
+%ifdef SAYLTER_DEBUG_BOOT
+    mov dx, 5
+    call raw_slot_start
+    mov si, msg_raw_pmode
+    call raw_append
+    mov dx, 5
+    call raw_commit
+    mov si, 2
+    mov ax, BEEP_DIV_HIGH
+    mov cx, BEEP_LEN
+    call beep_times
+%endif
 
     ; --- 进入 32 位保护模式 ---
     lgdt [gdt_descriptor]
@@ -245,6 +316,18 @@ load_kernel_bios:
     mov ds, ax
     mov es, ax
 
+    ; 阶段 4：开始用 BIOS 读内核
+%ifdef SAYLTER_DEBUG_BOOT
+    mov dx, 4
+    call raw_slot_start
+    mov si, msg_raw_load
+    call raw_append
+    mov ax, KERNEL_SECTORS
+    call raw_hex16
+    mov dx, 4
+    call raw_commit
+%endif
+
     pusha
 
     mov si, msg_drv
@@ -310,6 +393,19 @@ load_kernel_bios:
     jmp .next_chunk
 
 .done:
+    ; 阶段 4：内核读取成功
+%ifdef SAYLTER_DEBUG_BOOT
+    mov dx, 4
+    call raw_slot_start
+    mov si, msg_raw_load_ok
+    call raw_append
+    mov dx, 4
+    call raw_commit
+    mov si, 2
+    mov ax, BEEP_DIV_MID
+    mov cx, BEEP_LEN
+    call beep_times
+%endif
     popa
     clc
     ret
@@ -320,6 +416,24 @@ load_kernel_bios:
     call serial_hex8_16
     mov si, msg_crlf
     call serial_puts16
+
+    ; 阶段 4：内核读取失败（err = BIOS AH）
+%ifdef SAYLTER_DEBUG_BOOT
+    mov dx, 4
+    call raw_slot_start
+    mov si, msg_raw_load_fail
+    call raw_append
+    mov al, [bios_err]
+    movzx ax, al
+    call raw_hex16
+    mov dx, 4
+    call raw_commit
+    mov si, 1
+    mov ax, BEEP_DIV_LOW
+    mov cx, BEEP_LEN_LONG
+    call beep_times
+%endif
+
     popa
     stc
     ret
@@ -402,9 +516,20 @@ pm_entry:
     mov esi, msg_paging
     call serial_puts32
 
-    ; ---------- 打开 PAE + 装入 PML4 ----------
+    ; ---------- 打开 PAE + SSE/SSE2 支持 + 装入 PML4 ----------
+    ; CR4.OSFXSR / OSXMMEXCPT 未置位时，任何 SSE 指令（movaps、pxor、
+    ; movdqa…）都会触发 #UD。x86-64 System V ABI 要求用 XMM 传递和
+    ; 保存浮点参数，libc（musl -O2）一定会生成 SSE2 指令，所以必须在
+    ; 进入长模式前打开。内核自身仍以 -mno-sse 编译，不受影响。
+    ; 同时清 CR0.EM/TS 并置 MP，保证 x87 与 SSE 状态切换合法。
+    mov eax, cr0
+    and eax, 0xFFFFFFF3        ; 清 EM(bit2)、TS(bit3)
+    or  eax, 0x2               ; MP(bit1) = 1
+    mov cr0, eax
+
     mov eax, cr4
-    or eax, 0x20
+    or eax, 0x600              ; OSFXSR | OSXMMEXCPT
+    or eax, 0x20               ; PAE
     mov cr4, eax
 
     mov eax, PML4_BASE
@@ -532,6 +657,20 @@ long_mode_entry:
     mov rsp, STACK_TOP
     cld
 
+    ; 两短高音：已进入 64 位长模式（BIOS 已不可用，只能靠声音）
+%ifdef SAYLTER_DEBUG_BOOT
+    mov ax, 0x255
+    mov ecx, 0x200
+    call beep64
+    mov rdx, 0x80000
+.bgap:
+    dec rdx
+    jnz .bgap
+    mov ax, 0x255
+    mov ecx, 0x200
+    call beep64
+%endif
+
     mov rsi, msg_long
     call serial_puts64
 
@@ -590,6 +729,46 @@ serial_puts64:
     pop rsi
     pop rax
     ret
+
+; ============================================================
+; 64 位蜂鸣器：AX = 分频值，RCX = 持续时间
+; 长模式下 PIT 与 0x61 端口仍然可用，用于指示已进入内核。
+; ============================================================
+%ifdef SAYLTER_DEBUG_BOOT
+beep64:
+    ; 与 16 位蜂鸣一致：默认关闭
+%ifndef SAYLTER_BEEP_ENABLE
+    ret
+%endif
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    mov bx, ax
+    mov al, 0xB6
+    out 0x43, al
+    mov ax, bx
+    out 0x42, al
+    mov al, ah
+    out 0x42, al
+    in al, 0x61
+    or al, 0x03
+    out 0x61, al
+.wait:
+    mov rdx, 0x10000
+.inner:
+    dec rdx
+    jnz .inner
+    loop .wait
+    in al, 0x61
+    and al, 0xFC
+    out 0x61, al
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+%endif
 
 ; ============================================================
 ; 构建 256 项 64 位 IDT（16B/项，位于 0x60000）
@@ -735,7 +914,11 @@ isr_exc%1:
 %assign exc_index exc_index + 1
 %endrep
 
-; 异常统一出口：串口打印向量号后停机（不做恢复，异常即内核 bug）
+; 异常统一出口：串口打印向量号与现场 RIP 后停机（不做恢复，异常即内核 bug）
+; 进入时栈顶布局（由 EXC_STUB 压入向量号后）：
+;   [rsp+0] 向量号  [rsp+8] rip  [rsp+16] cs  [rsp+24] rflags
+; 只打印 RIP：定位"哪条指令非法"最短路径就是它，CS/RFLAGS 在 ring0 恒为
+; 0x18/固定值，没有诊断增量。
 exc_common:
     pop rdi
     mov rsi, msg_exc
@@ -746,6 +929,29 @@ exc_common:
     mov al, dil
     and al, 0x0F
     call hex_nibble64
+
+    mov rsi, msg_exc_rip
+    call serial_puts64
+    ; 硬件帧（同一特权级）从栈顶依次是：错误码（仅部分异常）、RIP、
+    ; CS、RFLAGS。这里把 4 个 qword 原样打出来，避免因为"有没有错误码"
+    ; 判断失误而把错误码当成 RIP 解释，误导定位。
+    mov rbx, rsp
+    mov rbp, 4
+.frame_q:
+    mov rdx, [rbx]
+    mov ecx, 16
+.q_hex:
+    rol rdx, 4
+    mov al, dl
+    and al, 0x0F
+    call hex_nibble64
+    loop .q_hex
+    mov al, ' '
+    call serial_putc64
+    add rbx, 8
+    dec rbp
+    jnz .frame_q
+
     mov al, 10
     call serial_putc64
 .halt:
@@ -1067,10 +1273,42 @@ vbe_init:
     call serial_hex_ax16
     mov si, msg_crlf
     call serial_puts16
+
+    ; 阶段 1：VBE 4F00 失败（AX 为 BIOS 返回码）
+%ifdef SAYLTER_DEBUG_BOOT
+    push ax
+    mov dx, 1
+    call raw_slot_start
+    mov si, msg_raw_4f_fail
+    call raw_append
+    pop ax
+    call raw_hex16
+    mov dx, 1
+    call raw_commit
+    mov si, 1
+    mov ax, BEEP_DIV_LOW
+    mov cx, BEEP_LEN_LONG
+    call beep_times
+%endif
+
     jmp .vbe_fail
 .vbe_4f_ok:
     mov si, msg_vbe_4f_ok
     call serial_puts16
+
+    ; 阶段 1：VBE 4F00 成功
+%ifdef SAYLTER_DEBUG_BOOT
+    mov dx, 1
+    call raw_slot_start
+    mov si, msg_raw_4f_ok
+    call raw_append
+    mov dx, 1
+    call raw_commit
+    mov si, 2
+    mov ax, BEEP_DIV_MID
+    mov cx, BEEP_LEN
+    call beep_times
+%endif
 
     mov si, vbe_prefer
 .prefer_loop:
@@ -1115,6 +1353,25 @@ vbe_init:
     jne .next_mode
 
     ; ---------- 命中：设置模式（置 LFB bit），再查一次模式信息 ----------
+    ; 先把"即将设置的模式号"落盘：4F02 内部若卡死，也能知道选了哪个模式
+%ifdef SAYLTER_DEBUG_BOOT
+    push dx
+    mov dx, 2
+    call raw_slot_start
+    mov si, msg_raw_setting_mode
+    call raw_append
+    pop ax
+    call raw_hex16
+    mov bx, ax                    ; 暂存模式号（raw_commit 会保护 BX）
+    mov dx, 2
+    call raw_commit
+    mov si, 1
+    mov ax, BEEP_DIV_MID
+    mov cx, BEEP_LEN
+    call beep_times
+    mov dx, bx                    ; 恢复模式号，后续 4F02 必须用它
+%endif
+
     push dx                       ; 保住原始模式号（不带 0x4000）
     mov bx, dx
     or bx, 0x4000
@@ -1132,6 +1389,23 @@ vbe_init:
     jne .next_pref
 
     ; ---------- 存结果到 0x7DF0（C 层直接读） ----------
+    ; 阶段 2：模式设置成功（DX = 模式号）
+%ifdef SAYLTER_DEBUG_BOOT
+    push dx
+    mov dx, 2
+    call raw_slot_start
+    mov si, msg_raw_mode_set
+    call raw_append
+    pop ax
+    call raw_hex16
+    mov dx, 2
+    call raw_commit
+    mov si, 3
+    mov ax, BEEP_DIV_HIGH
+    mov cx, BEEP_LEN
+    call beep_times
+%endif
+
     mov word [VBE_RESULT], 0xA1B2          ; magic = OK
     mov eax, [VBE_MODE_BUF + 0x28]         ; FrameBufferBase (phys) @ 0x28
     mov [VBE_RESULT + 2], eax
@@ -1143,6 +1417,36 @@ vbe_init:
     mov [VBE_RESULT + 10], al
     mov ax, [VBE_MODE_BUF + 0x10]          ; BytesPerScanLine @ 0x10
     mov [VBE_RESULT + 11], ax
+
+    ; 阶段 3：VBE 结果已写入 0x7DF0，落盘供真机黑屏后排查
+%ifdef SAYLTER_DEBUG_BOOT
+    pusha
+    mov dx, 3
+    call raw_slot_start
+    mov si, msg_raw_result
+    call raw_append
+    mov eax, [VBE_RESULT + 2]
+    call raw_hex32
+    mov si, msg_raw_size
+    call raw_append
+    movzx ax, word [VBE_RESULT + 6]
+    call raw_hex16
+    mov si, msg_raw_x
+    call raw_append
+    movzx ax, word [VBE_RESULT + 8]
+    call raw_hex16
+    mov si, msg_raw_bpp
+    call raw_append
+    movzx ax, byte [VBE_RESULT + 10]
+    call raw_hex16
+    mov dx, 3
+    call raw_commit
+    mov si, 1
+    mov ax, BEEP_DIV_HIGH
+    mov cx, BEEP_LEN_LONG
+    call beep_times
+    popa
+%endif
     ret
 
 .next_mode:
@@ -1208,6 +1512,25 @@ vbe_init:
     jmp .vbe_fail
 .fb_set:
 
+    ; 先把"即将设置的兜底模式号"落盘，4F02 卡死时也能定位
+%ifdef SAYLTER_DEBUG_BOOT
+    push dx
+    mov dx, 2
+    call raw_slot_start
+    mov si, msg_raw_setting_fb
+    call raw_append
+    pop ax
+    call raw_hex16
+    mov bx, ax                    ; 暂存模式号
+    mov dx, 2
+    call raw_commit
+    mov si, 1
+    mov ax, BEEP_DIV_MID
+    mov cx, BEEP_LEN
+    call beep_times
+    mov dx, bx                    ; 恢复模式号，后续 4F02 必须用它
+%endif
+
     push dx
     mov bx, dx
     or bx, 0x4000
@@ -1224,6 +1547,23 @@ vbe_init:
     cmp ax, 0x004F
     jne .vbe_fail
 
+    ; 阶段 2：兜底模式设置成功（DX = 模式号）
+%ifdef SAYLTER_DEBUG_BOOT
+    push dx
+    mov dx, 2
+    call raw_slot_start
+    mov si, msg_raw_mode_fb
+    call raw_append
+    pop ax
+    call raw_hex16
+    mov dx, 2
+    call raw_commit
+    mov si, 3
+    mov ax, BEEP_DIV_HIGH
+    mov cx, BEEP_LEN
+    call beep_times
+%endif
+
     mov word [VBE_RESULT], 0xA1B2
     mov eax, [VBE_MODE_BUF + 0x28]
     mov [VBE_RESULT + 2], eax
@@ -1235,10 +1575,54 @@ vbe_init:
     mov [VBE_RESULT + 10], al
     mov ax, [VBE_MODE_BUF + 0x10]
     mov [VBE_RESULT + 11], ax
+
+    ; 阶段 3：结果落盘
+%ifdef SAYLTER_DEBUG_BOOT
+    pusha
+    mov dx, 3
+    call raw_slot_start
+    mov si, msg_raw_result
+    call raw_append
+    mov eax, [VBE_RESULT + 2]
+    call raw_hex32
+    mov si, msg_raw_size
+    call raw_append
+    movzx ax, word [VBE_RESULT + 6]
+    call raw_hex16
+    mov si, msg_raw_x
+    call raw_append
+    movzx ax, word [VBE_RESULT + 8]
+    call raw_hex16
+    mov si, msg_raw_bpp
+    call raw_append
+    movzx ax, byte [VBE_RESULT + 10]
+    call raw_hex16
+    mov dx, 3
+    call raw_commit
+    mov si, 1
+    mov ax, BEEP_DIV_HIGH
+    mov cx, BEEP_LEN_LONG
+    call beep_times
+    popa
+%endif
     ret
 
 .vbe_fail:
     mov word [VBE_RESULT], 0x0000          ; magic = fail
+
+    ; 阶段 3：VBE 完全失败（回退文本模式）
+%ifdef SAYLTER_DEBUG_BOOT
+    mov dx, 3
+    call raw_slot_start
+    mov si, msg_raw_vbe_fail
+    call raw_append
+    mov dx, 3
+    call raw_commit
+    mov si, 1
+    mov ax, BEEP_DIV_LOW
+    mov cx, BEEP_LEN_LONG
+    call beep_times
+%endif
     ret
 
 ; 期望模式表：宽, 高（按优先级，0,0 结束）
@@ -1393,6 +1777,7 @@ msg_long:     db '[PM] 64-bit long mode', 13, 10, 0
 msg_idt:      db '[PM] 64-bit IDT loaded', 13, 10, 0
 msg_irq:      db '[PM] IRQ0/IRQ1/IRQ9 enabled', 13, 10, 0
 msg_exc:      db '[PM] EXCEPTION vector=0x', 0
+msg_exc_rip:  db ' rip=', 0
 msg_pf:       db '[PM] PAGE FAULT cr2=', 0
 
 ; ============================================================
@@ -1415,3 +1800,258 @@ bios_err:   db 0
 msg_pf_cr2:   db '0x', 0
 msg_pf_err:   db ' error=', 0
 msg_pf_rip:   db ' rip=', 0
+
+; ============================================================
+; 裸日志消息
+; ============================================================
+%ifdef SAYLTER_DEBUG_BOOT
+msg_raw_enter:     db '[PM] enter (real mode)', 0
+msg_raw_vbe_start: db '[PM] VBE init start (call 4F00)', 0
+msg_raw_setting_mode: db '[PM] VBE setting mode 0x', 0
+msg_raw_setting_fb:   db '[PM] VBE setting fallback 0x', 0
+msg_raw_4f_ok:     db '[PM] VBE 4F00 ok', 0
+msg_raw_4f_fail:   db '[PM] VBE 4F00 FAIL ax=', 0
+msg_raw_mode_set:  db '[PM] VBE mode set 0x', 0
+msg_raw_mode_fb:   db '[PM] VBE fallback mode 0x', 0
+msg_raw_result:    db '[PM] VBE RESULT fb=0x', 0
+msg_raw_size:      db ' size=', 0
+msg_raw_x:         db 'x', 0
+msg_raw_bpp:       db ' bpp=0x', 0
+msg_raw_vbe_fail:  db '[PM] VBE FAILED, text fallback', 0
+msg_raw_load:      db '[PM] kernel load start sectors=0x', 0
+msg_raw_load_ok:   db '[PM] kernel load OK', 0
+msg_raw_load_fail: db '[PM] kernel load FAIL err=0x', 0
+msg_raw_pmode:     db '[PM] entering protected mode', 0
+raw_prefix:        db 'SLYPM ', 0
+raw_sep:           db ': ', 0
+
+; ============================================================
+; 启动盘裸日志（BIOS INT 13h AH=43h，固定槽位）
+; ------------------------------------------------------------
+; 只写 [0x500] 保存的 BIOS 启动盘号，绝不枚举/写入其它磁盘。
+; 每个槽 = 1 个扇区，内容先清空再写，写失败静默跳过。
+; ============================================================
+raw_clear:
+    pusha
+    push ds
+    push es
+    xor ax, ax
+    mov ds, ax
+    mov es, ax
+    mov di, raw_buf
+    xor ax, ax
+    mov cx, 256
+    rep stosw
+    mov word [raw_pos], 0
+    pop es
+    pop ds
+    popa
+    ret
+
+; SI = 0 结尾字符串
+raw_append:
+    pusha
+    push ds
+    xor ax, ax
+    mov ds, ax
+    mov bx, [raw_pos]
+.loop:
+    lodsb
+    test al, al
+    jz .done
+    cmp bx, 510
+    jae .done
+    mov [raw_buf + bx], al
+    inc bx
+    jmp .loop
+.done:
+    mov [raw_pos], bx
+    pop ds
+    popa
+    ret
+
+; AL = 0..15
+raw_hex_nibble:
+    pusha
+    push ds
+    mov bl, al
+    xor ax, ax
+    mov ds, ax
+    mov al, bl
+    cmp al, 10
+    jb .digit
+    add al, 'A' - 10
+    jmp .put
+.digit:
+    add al, '0'
+.put:
+    mov bx, [raw_pos]
+    cmp bx, 510
+    jae .out
+    mov [raw_buf + bx], al
+    inc bx
+    mov [raw_pos], bx
+.out:
+    pop ds
+    popa
+    ret
+
+; AL = 字节
+raw_hex8:
+    push ax
+    mov bl, al
+    shr al, 4
+    call raw_hex_nibble
+    mov al, bl
+    and al, 0x0F
+    call raw_hex_nibble
+    pop ax
+    ret
+
+; AX = 字
+raw_hex16:
+    push ax
+    mov al, ah
+    call raw_hex8
+    pop ax
+    call raw_hex8
+    ret
+
+; EAX = 双字
+raw_hex32:
+    push eax
+    shr eax, 16
+    call raw_hex16
+    pop eax
+    call raw_hex16
+    ret
+
+; DX = 槽号：清空缓冲并写入 "SLYPM <槽号>: "
+raw_slot_start:
+    push dx
+    call raw_clear
+    mov si, raw_prefix
+    call raw_append
+    pop ax
+    call raw_hex16
+    mov si, raw_sep
+    call raw_append
+    ret
+
+; DX = 槽号：补零到 512B 并写到启动盘 RAW_LOG_LBA + DX
+raw_commit:
+    pusha
+    push ds
+    push es
+    xor ax, ax
+    mov ds, ax
+    mov es, ax
+
+    mov bx, [raw_pos]
+    cmp bx, 512
+    jae .filled
+    mov di, raw_buf
+    add di, bx
+    mov cx, 512
+    sub cx, bx
+    xor ax, ax
+    rep stosb
+
+.filled:
+    mov word [raw_dap + 2], 1
+    mov word [raw_dap + 4], raw_buf
+    mov word [raw_dap + 6], 0
+    mov ax, RAW_LOG_LBA
+    add ax, dx
+    mov [raw_dap + 8], ax
+    mov word [raw_dap + 10], 0
+    mov word [raw_dap + 12], 0
+    mov word [raw_dap + 14], 0
+
+    mov bp, 3
+.retry:
+    xor ax, ax
+    mov ds, ax
+    mov es, ax
+    mov ah, 0x43          ; extended write
+    mov al, 0x00          ; no verify
+    mov dl, [0x0500]      ; BIOS 启动盘号（0x500 由 MBR 保存）
+    mov si, raw_dap
+    int 0x13
+    jnc .ok
+    xor ah, ah
+    mov dl, [0x0500]
+    int 0x13              ; reset disk
+    dec bp
+    jnz .retry
+.ok:
+    pop es
+    pop ds
+    popa
+    ret
+
+; ============================================================
+; PC 蜂鸣器（PIT 通道 2 + 0x61）
+; 入参：AX = 分频值，CX = 持续时间
+; ============================================================
+beep_once:
+    ; 主板无蜂鸣器时直接跳过（默认关闭，避免无谓的启动延迟）
+%ifndef SAYLTER_BEEP_ENABLE
+    ret
+%endif
+    pusha
+    mov bx, ax
+    mov al, 0xB6
+    out 0x43, al
+    mov ax, bx
+    out 0x42, al
+    mov al, ah
+    out 0x42, al
+    in al, 0x61
+    or al, 0x03
+    out 0x61, al
+.wait:
+    mov dx, 0x100
+.inner:
+    dec dx
+    jnz .inner
+    loop .wait
+    in al, 0x61
+    and al, 0xFC
+    out 0x61, al
+    popa
+    ret
+
+; 入参：SI = 次数，AX = 分频值，CX = 每次持续
+beep_times:
+    push si
+    push ax
+    push cx
+.next:
+    push cx
+    call beep_once
+    pop cx
+    push cx
+    mov dx, 0x600
+.gap:
+    dec dx
+    jnz .gap
+    pop cx
+    dec si
+    jnz .next
+    pop cx
+    pop ax
+    pop si
+    ret
+
+ALIGN 16
+raw_pos:  dw 0
+raw_dap:
+    db 0x10
+    db 0x00
+    dw 1
+    dw 0
+    dw 0
+    dq 0
+raw_buf:  times 512 db 0
+%endif

@@ -547,7 +547,17 @@ static Expr *parse_postfix(void) {
         }
         if (tok_is(".")) {
             tok_next();
-            char *m = expect_ident();
+            /* 成员名允许与关键字同名：audio.state()、time.text() 这类
+             * 宿主 API 不该因为语言保留字而不可用。 */
+            char *m;
+            if (g_tok.kind == TK_IDENT || g_tok.kind == TK_KW) {
+                m = xstrdup(g_tok.text);
+                tok_next();
+            } else {
+                die_at(g_tok.line, g_tok.col, "expected member name, got '%s'",
+                       g_tok.text);
+                m = 0;
+            }
             Expr *mem = new_expr(E_MEMBER, e->line, e->col);
             mem->a = e;
             mem->member = m;
@@ -751,6 +761,11 @@ static Expr *parse_expr(void) {
 
 static Stmt *parse_block(void);
 
+/* 定义在调用表之后：判断名字是否已被内置函数/宿主调用占用。
+ * 用户函数若与内置名重名，调用点会被编译成内置调用，表现为
+ * “函数返回空值且没有任何报错”，极难排查，因此在定义处直接拒绝。 */
+static int is_reserved_call(const char *name);
+
 static Stmt *parse_stmt(void) {
     int line = g_tok.line, col = g_tok.col;
 
@@ -923,6 +938,10 @@ static void parse_program(void) {
             int line = g_tok.line, col = g_tok.col;
             tok_next();
             char *name = expect_ident();
+            if (is_reserved_call(name)) {
+                die_at(line, col,
+                       "function '%s' shadows a built-in call; rename it", name);
+            }
             expect("(");
             char **params = 0;
             int argc = 0;
@@ -1032,7 +1051,9 @@ static void parse_program(void) {
                 }
             }
             g_cc.handlers[g_cc.handler_count++] = h;
-            g_cc.uses_gui = 1;
+            /* 只有屏幕事件才需要图形宿主；`on start` 是普通入口，
+             * 终端程序（文件系统工具等）也能使用。 */
+            if (h.kind != 0) g_cc.uses_gui = 1;
             continue;
         }
 
@@ -1190,10 +1211,21 @@ static const CallDef g_calls[] = {
     { "fs.remove", SLE_SYS_FS_REMOVE, 1 },
     { "fs.mkdir", SLE_SYS_FS_MKDIR, 1 },
     { "fs.entries", SLE_SYS_FS_ENTRIES, 1 },
+    { "fs.rmdir", SLE_SYS_FS_RMDIR, 1 },
+    { "fs.copy", SLE_SYS_FS_COPY, 2 },
+    { "fs.move", SLE_SYS_FS_MOVE, 2 },
 
     { "cfg.get", SLE_SYS_CFG_GET, 1 },
     { "cfg.set", SLE_SYS_CFG_SET, 2 },
     { "cfg.keys", SLE_SYS_CFG_KEYS, 0 },
+    { "ui.theme", SLE_SYS_THEME_GET, 1 },
+
+    { "part.list", SLE_SYS_PART_LIST, 0 },
+    { "part.add", SLE_SYS_PART_ADD, 3 },
+    { "part.delete", SLE_SYS_PART_DELETE, 1 },
+    { "part.format", SLE_SYS_PART_FORMAT, 2 },
+    { "part.mount", SLE_SYS_PART_MOUNT, 1 },
+    { "part.unmount", SLE_SYS_PART_UNMOUNT, 1 },
 
     { "time.now", SLE_SYS_TIME_NOW, 0 },
     { "time.ms", SLE_SYS_TIME_MS, 0 },
@@ -1296,6 +1328,10 @@ static const CallDef *find_call(const char *name) {
         if (strcmp(g_calls[i].name, name) == 0) return &g_calls[i];
     }
     return 0;
+}
+
+static int is_reserved_call(const char *name) {
+    return find_call(name) != 0;
 }
 
 /* ---------------- 表达式生成 ---------------- */
@@ -1610,6 +1646,9 @@ static int gen_call(Expr *e, Expr *callee) {
             }
             int base = g_gen.next_reg;
             for (int i = 0; i < e->count; i++) alloc_reg();
+            /* 无参调用也要占住返回值寄存器：S3_SYS 把结果写回 base，
+             * 没有分配时会被后续表达式复用覆盖（time.ms() 等）。 */
+            if (e->count == 0) alloc_reg();
             for (int i = 0; i < e->count; i++) {
                 int r = gen_expr(e->list[i]);
                 emit(S3_MOVE, (uint8_t)(base + i), (uint8_t)r, 0, 0);
@@ -1619,9 +1658,17 @@ static int gen_call(Expr *e, Expr *callee) {
             uint32_t imm = ((uint32_t)cd->id << 16) | (uint32_t)e->count;
             emit(S3_SYS, (uint8_t)base, (uint8_t)base, 0, imm);
             free_to(base + 1);
-            if (cd->id == SLE_SYS_UI_PRESENT || cd->id == SLE_SYS_UI_MARKUP ||
-                cd->id == SLE_SYS_UI_STYLE || cd->id == SLE_SYS_UI_SET ||
-                cd->id == SLE_SYS_UI_GET) {
+            /* 窗口、绘图、事件、图片与媒体接口需要图形宿主；
+             * 终端工具只用到 print/input/fs/cfg/time/os/fault，
+             * 不会被误判为 GUI 程序。 */
+            if (cd->id == SLE_SYS_UI_MARKUP || cd->id == SLE_SYS_UI_STYLE ||
+                cd->id == SLE_SYS_UI_PRESENT || cd->id == SLE_SYS_UI_SET ||
+                cd->id == SLE_SYS_UI_GET ||
+                (cd->id >= (int)SLE_SYS_WIN_OPEN && cd->id <= (int)SLE_SYS_WIN_TITLE) ||
+                (cd->id >= (int)SLE_SYS_GFX_CLEAR && cd->id <= (int)SLE_SYS_GFX_FLUSH) ||
+                (cd->id >= (int)SLE_SYS_EVT_POLL && cd->id <= (int)SLE_SYS_EVT_WAIT) ||
+                (cd->id >= (int)SLE_SYS_IMG_LOAD && cd->id <= (int)SLE_SYS_IMG_FREE) ||
+                cd->id == SLE_SYS_MEDIA_REQ || cd->id == SLE_SYS_OPEN_UI) {
                 g_cc.uses_gui = 1;
             }
             return base;
@@ -1635,6 +1682,7 @@ static int gen_call(Expr *e, Expr *callee) {
             }
             int base = g_gen.next_reg;
             for (int i = 0; i < e->count; i++) alloc_reg();
+            if (e->count == 0) alloc_reg();
             for (int i = 0; i < e->count; i++) {
                 int r = gen_expr(e->list[i]);
                 emit(S3_MOVE, (uint8_t)(base + i), (uint8_t)r, 0, 0);

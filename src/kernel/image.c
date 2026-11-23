@@ -1,26 +1,41 @@
 /* ============================================================
- * image.c - BMP 解码与图片绘制
+ * image.c - 图片解码（BMP / PNG / JPEG / SVG）与绘制
  * ------------------------------------------------------------
- * 解码器只依赖 SlyzFS 的顺序读接口：BMP 的头部、调色板、位图
- * 数据在文件里本来就是顺序排列的，用一次打开 + 顺序读即可完成，
- * 不需要 seek 支持。
+ * BMP 走 SlyzFS 顺序读：头部、调色板、位图数据在文件里本来就是
+ * 顺序排列的，一次打开 + 顺序读即可，不需要 seek。
+ *
+ * PNG / JPEG / SVG 需要整块缓冲才能解码（zlib 回溯、DCT 行缓存、
+ * 路径扫描），因此整文件读入内存后交给 imgcodec 的解码器。
+ * 解码器实现分别在 png_dec.c / jpeg_dec.c / svg_dec.c / inflate.c。
+ *
+ * 内存：
+ *   图片像素动辄几 MB，远超 6MB 内核堆，因此统一走 img_alloc：
+ *   优先向 vm 的物理帧池申请连续页（恒等映射，可直接当指针），
+ *   帧池不可用时退回内核堆。每块缓冲前面带 16 字节头，用于记录
+ *   长度与来源，img_free 据此决定归还帧池还是堆。
  *
  * 缓存策略：
- *   桌面每一帧都会请求同一张壁纸，如果每次都解码，800×450 的
- *   图片会吃掉整帧预算。因此按路径缓存解码结果，命中时只做一次
- *   线性比较。缓存总预算 3.5MB，超出时淘汰最久未使用的图片；
- *   单张图片超过预算直接拒绝，避免把内核堆打满。
+ *   桌面每一帧都会请求同一张壁纸，如果每次都解码，整帧预算会被
+ *   吃光。因此按路径缓存解码结果，命中时只做一次线性比较。总预算
+ *   24MB，超出时淘汰最久未使用的图片。
  *
  * 像素格式：
  *   统一为 0xAARRGGBB。BMP 的 32 位图经常把 alpha 全写成 0，
- *   这种文件按不透明处理；真正带 alpha 的图仍然按 alpha 混合。
+ *   这种文件按不透明处理；PNG/SVG 的 alpha 正常保留。
  * ============================================================ */
 
 #include <stdint.h>
 
 #include "image.h"
+#include "imgcodec.h"
 #include "vbe.h"
 #include "mem.h"
+#include "vm.h"
+#include "net.h"
+
+/* 串口诊断（仅首次加载时输出） */
+extern void kserial_puts(const char *s);
+extern void kserial_dec32(uint32_t v);
 
 /* ============================================================
  * SlyzFS 接口
@@ -54,10 +69,11 @@ extern void  slyzfs_close(void *fh);
  * 缓存
  * ============================================================ */
 
-#define IMAGE_CACHE_MAX     6
-#define IMAGE_CACHE_BUDGET  (3u * 1024u * 1024u + 512u * 1024u)
+#define IMAGE_CACHE_MAX     8
+#define IMAGE_CACHE_BUDGET  (24u * 1024u * 1024u)
 #define IMAGE_PATH_MAX      160
-#define IMAGE_MAX_DIM       4096
+#define IMAGE_MAX_DIM       8192
+#define IMAGE_FILE_MAX      IMG_MAX_BYTES
 
 struct ImageEntry {
     int       used;
@@ -183,12 +199,69 @@ static int img_isqrt(int v) {
 }
 
 /* ============================================================
+ * 图片缓冲分配器（imgcodec.h 的实现）
+ * ------------------------------------------------------------
+ * 帧池优先：像素缓冲通常几 MB，内核堆只有 6MB，直接 kmalloc
+ * 会把堆打满导致后续 ACPICA/GUI 分配失败。帧池是恒等映射的
+ * 物理内存，返回地址可直接解引用。
+ *
+ * 每块缓冲前有 16 字节头，记录长度与来源。img_free 只看头部，
+ * 不依赖调用方重复传长度。
+ * ============================================================ */
+
+struct ImgHdr {
+    uint32_t magic;
+    uint32_t bytes;
+    uint32_t raw;
+    uint32_t from_pool;
+};
+
+#define IMG_HDR_MAGIC 0x494D4753u   /* "IMGS" */
+#define IMG_HDR_SIZE  16u
+
+void *img_alloc(uint32_t bytes) {
+    if (bytes == 0 || bytes > 0xFFFFFFF0u - IMG_HDR_SIZE) return 0;
+
+    uint32_t raw = bytes + IMG_HDR_SIZE;
+    uint32_t phys = vm_alloc_phys_bytes(raw);
+    if (phys) {
+        struct ImgHdr *h = (struct ImgHdr *)(uintptr_t)phys;
+        h->magic = IMG_HDR_MAGIC;
+        h->bytes = bytes;
+        h->raw = raw;
+        h->from_pool = 1;
+        return (void *)(uintptr_t)(phys + IMG_HDR_SIZE);
+    }
+
+    struct ImgHdr *h = (struct ImgHdr *)kmalloc(raw);
+    if (!h) return 0;
+    h->magic = IMG_HDR_MAGIC;
+    h->bytes = bytes;
+    h->raw = raw;
+    h->from_pool = 0;
+    return (void *)((uint8_t *)h + IMG_HDR_SIZE);
+}
+
+void img_free(void *ptr) {
+    if (!ptr) return;
+    struct ImgHdr *h = (struct ImgHdr *)((uint8_t *)ptr - IMG_HDR_SIZE);
+    if (h->magic != IMG_HDR_MAGIC) return;
+
+    h->magic = 0;
+    if (h->from_pool) {
+        vm_free_phys_bytes((uint32_t)(uintptr_t)h, h->raw);
+    } else {
+        kfree(h);
+    }
+}
+
+/* ============================================================
  * BMP 解码
  * ============================================================ */
 
 static void img_free_pixels(struct ImageEntry *e) {
     if (e->px) {
-        kfree(e->px);
+        img_free(e->px);
         e->px = 0;
     }
     if (e->bytes <= g_image_total) {
@@ -390,28 +463,44 @@ static int bmp_decode(const char *path, struct ImageEntry *out) {
     }
 
     uint32_t need = pixels * 4u;
-    uint32_t *px = (uint32_t *)kmalloc(need);
+    uint32_t *px = (uint32_t *)img_alloc(need);
     if (!px) {
         slyzfs_close(fh);
         return 0;
     }
 
-    uint8_t *row = (uint8_t *)kmalloc(row_bytes);
-    if (!row) {
-        kfree(px);
+    /* 一次性读入全部像素数据，而不是逐行/逐块调用 SlyzFS。
+     * 每次 slyzfs_read 都会重新读文件的 MFT 记录：分块读取会让
+     * "MFT 区"和"像素数据区"交替访问，预读缓存反复失效，读取量
+     * 放大数倍。整块读只有一次模块调用，顺序 I/O 一次完成。 */
+    uint32_t data_bytes = row_bytes * (uint32_t)h;
+    if ((uint64_t)data_off + data_bytes > (uint64_t)ent.size) {
+        img_free(px);
+        slyzfs_close(fh);
+        return 0;
+    }
+
+    uint8_t *raw = (uint8_t *)img_alloc(data_bytes);
+    if (!raw) {
+        img_free(px);
         slyzfs_close(fh);
         return 0;
     }
 
     int alpha_seen = 0;
     int ok = 1;
+    uint32_t read_us = 0;
+    uint32_t conv_us = 0;
+
+    uint32_t rt0 = net_now_us();
+    if (img_read_full(fh, raw, (int)data_bytes) != (int)data_bytes) {
+        ok = 0;
+    }
+    uint32_t rt1 = net_now_us();
+    read_us = rt1 - rt0;
 
     for (int r = 0; r < h && ok; r++) {
-        if (img_read_full(fh, row, (int)row_bytes) != (int)row_bytes) {
-            ok = 0;
-            break;
-        }
-
+        const uint8_t *row = raw + (uint32_t)r * row_bytes;
         int y = top_down ? r : (h - 1 - r);
         uint32_t *dst = px + (uint32_t)y * (uint32_t)w;
 
@@ -456,12 +545,31 @@ static int bmp_decode(const char *path, struct ImageEntry *out) {
             dst[x] = color;
         }
     }
+    conv_us = net_now_us() - rt1;
 
-    kfree(row);
+    img_free(raw);
     slyzfs_close(fh);
 
+    kserial_puts("[IMG] bmp read=");
+    kserial_dec32(read_us);
+    kserial_puts("us convert=");
+    kserial_dec32(conv_us);
+    kserial_puts("us rows=");
+    kserial_dec32((uint32_t)h);
+    {
+        extern void slyzfs_cache_stats(uint32_t *hits, uint32_t *misses);
+        uint32_t hits = 0;
+        uint32_t misses = 0;
+        slyzfs_cache_stats(&hits, &misses);
+        kserial_puts(" rc_hit=");
+        kserial_dec32(hits);
+        kserial_puts(" rc_miss=");
+        kserial_dec32(misses);
+    }
+    kserial_puts("\r\n");
+
     if (!ok) {
-        kfree(px);
+        img_free(px);
         return 0;
     }
 
@@ -515,6 +623,102 @@ static int image_evict_one(uint32_t need_bytes) {
     return 1;
 }
 
+/* ============================================================
+ * 整文件解码（PNG / JPEG / SVG）
+ * ------------------------------------------------------------
+ * 这三种格式都必须先拿到完整字节流。文件最大 24MB，走帧池而不是
+ * 内核堆；读入后按魔数分派，解码器输出统一的 0xAARRGGBB。
+ * ============================================================ */
+
+#define IMG_KIND_BMP   1
+#define IMG_KIND_PNG   2
+#define IMG_KIND_JPEG  3
+#define IMG_KIND_SVG   4
+
+static int image_kind(const uint8_t *p, int n) {
+    if (n >= 8 && p[0] == 0x89 && p[1] == 'P' && p[2] == 'N' && p[3] == 'G' &&
+        p[4] == 0x0D && p[5] == 0x0A && p[6] == 0x1A && p[7] == 0x0A) {
+        return IMG_KIND_PNG;
+    }
+    if (n >= 3 && p[0] == 0xFF && p[1] == 0xD8 && p[2] == 0xFF) {
+        return IMG_KIND_JPEG;
+    }
+
+    /* SVG：允许 BOM / XML 声明 / 注释，在前 1KB 内找 <svg */
+    int limit = n < 1024 ? n : 1024;
+    for (int i = 0; i + 3 < limit; i++) {
+        if (p[i] == '<' && p[i + 1] == 's' && p[i + 2] == 'v' && p[i + 3] == 'g') {
+            return IMG_KIND_SVG;
+        }
+    }
+
+    if (n >= 2 && p[0] == 'B' && p[1] == 'M') return IMG_KIND_BMP;
+    return 0;
+}
+
+static int image_decode_memory(const char *path, int kind, struct ImageEntry *out) {
+    struct ImageDirEntry ent;
+    if (!slyzfs_stat(path, &ent)) return 0;
+    if (ent.type == 0x02) return 0;
+    if (ent.size < 8 || ent.size > IMAGE_FILE_MAX) return 0;
+
+    int size = (int)ent.size;
+    uint8_t *data = (uint8_t *)img_alloc((uint32_t)size);
+    if (!data) return 0;
+
+    void *fh = slyzfs_open(path, "r");
+    if (!fh) {
+        img_free(data);
+        return 0;
+    }
+    int got = img_read_full(fh, data, size);
+    slyzfs_close(fh);
+    if (got != size) {
+        img_free(data);
+        return 0;
+    }
+
+    /* 魔数可能与扩展名不一致：以实际字节为准重新判定。 */
+    int real = image_kind(data, size);
+    if (real != kind) kind = real;
+
+    ImgBitmap bmp;
+    bmp.px = 0;
+    bmp.w = 0;
+    bmp.h = 0;
+
+    int ok = 0;
+    if (kind == IMG_KIND_PNG) {
+        ok = img_png_decode(data, size, &bmp);
+    } else if (kind == IMG_KIND_JPEG) {
+        ok = img_jpeg_decode(data, size, &bmp);
+    } else if (kind == IMG_KIND_SVG) {
+        /* 头像/图标类 SVG 用白色 currentColor 渲染；
+         * 512 足够桌面壁纸缩放，又不会让掩码缓冲过大。 */
+        ok = img_svg_decode(data, size, 512, 0xFFFFFFFFu, &bmp);
+    }
+
+    img_free(data);
+    if (!ok || !bmp.px) return 0;
+
+    if (bmp.w <= 0 || bmp.h <= 0 || bmp.w > IMAGE_MAX_DIM || bmp.h > IMAGE_MAX_DIM) {
+        img_free(bmp.px);
+        return 0;
+    }
+
+    uint32_t bytes = (uint32_t)bmp.w * (uint32_t)bmp.h * 4u;
+    if (bytes == 0 || bytes > IMAGE_CACHE_BUDGET) {
+        img_free(bmp.px);
+        return 0;
+    }
+
+    out->w = bmp.w;
+    out->h = bmp.h;
+    out->px = bmp.px;
+    out->bytes = bytes;
+    return 1;
+}
+
 int image_load(const char *path) {
     if (!path || !path[0]) return IMAGE_NONE;
 
@@ -523,6 +727,12 @@ int image_load(const char *path) {
         g_images[found].stamp = g_image_stamp++;
         return found;
     }
+
+    /* 串口诊断：首次加载每张图时分段输出探测/解码耗时，
+     * 用来区分"磁盘 I/O 慢"和"解码慢"。 */
+    extern void kserial_puts(const char *s);
+    extern void kserial_dec32(uint32_t v);
+    uint32_t t_probe0 = net_now_us();
 
     struct ImageEntry tmp;
     tmp.used = 0;
@@ -533,12 +743,40 @@ int image_load(const char *path) {
     tmp.bytes = 0;
     tmp.stamp = 0;
 
-    if (!bmp_decode(path, &tmp)) return IMAGE_NONE;
+    /* 先读文件头判定格式：BMP 走顺序读，其余整文件解码。 */
+    static uint8_t probe[1024];
+    int probe_len = 0;
+    void *pfh = slyzfs_open(path, "r");
+    if (!pfh) return IMAGE_NONE;
+    probe_len = img_read_full(pfh, probe, (int)sizeof(probe));
+    slyzfs_close(pfh);
+    if (probe_len < 8) return IMAGE_NONE;
+
+    int kind = image_kind(probe, probe_len);
+    if (kind == 0) return IMAGE_NONE;
+
+    uint32_t t_dec0 = net_now_us();
+    if (kind == IMG_KIND_BMP) {
+        if (!bmp_decode(path, &tmp)) return IMAGE_NONE;
+    } else {
+        if (!image_decode_memory(path, kind, &tmp)) return IMAGE_NONE;
+    }
+    uint32_t t_dec1 = net_now_us();
+
+    kserial_puts("[IMG] ");
+    kserial_puts(path);
+    kserial_puts(" probe=");
+    kserial_dec32(t_dec0 - t_probe0);
+    kserial_puts("us decode=");
+    kserial_dec32(t_dec1 - t_dec0);
+    kserial_puts("us bytes=");
+    kserial_dec32(tmp.bytes);
+    kserial_puts("\r\n");
 
     /* 缓存预算不够就按最久未使用顺序淘汰，直到放得下 */
     while (g_image_total + tmp.bytes > IMAGE_CACHE_BUDGET) {
         if (!image_evict_one(tmp.bytes)) {
-            kfree(tmp.px);
+            img_free(tmp.px);
             return IMAGE_NONE;
         }
     }
@@ -552,7 +790,7 @@ int image_load(const char *path) {
     }
     if (slot < 0) {
         if (!image_evict_one(tmp.bytes)) {
-            kfree(tmp.px);
+            img_free(tmp.px);
             return IMAGE_NONE;
         }
         for (int i = 0; i < IMAGE_CACHE_MAX; i++) {
@@ -563,7 +801,7 @@ int image_load(const char *path) {
         }
     }
     if (slot < 0) {
-        kfree(tmp.px);
+        img_free(tmp.px);
         return IMAGE_NONE;
     }
 
@@ -718,6 +956,64 @@ void image_draw_scaled(int handle, int x, int y, int w, int h) {
             }
         }
     }
+}
+
+int image_scale_to_buffer(int handle, uint32_t *dst, int dw, int dh, uint32_t bg) {
+    if (handle < 0 || handle >= IMAGE_CACHE_MAX || !dst || dw <= 0 || dh <= 0) return 0;
+
+    struct ImageEntry *e = &g_images[handle];
+    if (!e->used || !e->px) return 0;
+
+    int iw = e->w;
+    int ih = e->h;
+    if (iw <= 0 || ih <= 0) return 0;
+
+    uint32_t br = (bg >> 16) & 0xFFu;
+    uint32_t bgc = (bg >> 8) & 0xFFu;
+    uint32_t bb = bg & 0xFFu;
+
+    for (int dy = 0; dy < dh; dy++) {
+        int sy = (int)(((int64_t)dy * ih) / dh);
+        if (sy >= ih) sy = ih - 1;
+
+        const uint32_t *src = e->px + (uint32_t)sy * (uint32_t)iw;
+        uint32_t *line = dst + (uint32_t)dy * (uint32_t)dw;
+
+        int sx = 0;
+        int acc = 0;
+        for (int dx = 0; dx < dw; dx++) {
+            if (sx >= iw) sx = iw - 1;
+            uint32_t s = src[sx];
+            uint32_t a = s >> 24;
+
+            if (a >= 255) {
+                line[dx] = s & 0x00FFFFFFu;
+            } else if (a == 0) {
+                line[dx] = bg & 0x00FFFFFFu;
+            } else {
+                uint32_t ia = 255u - a;
+                uint32_t r = (((s >> 16) & 0xFFu) * a + br * ia) / 255u;
+                uint32_t g = (((s >> 8) & 0xFFu) * a + bgc * ia) / 255u;
+                uint32_t b = ((s & 0xFFu) * a + bb * ia) / 255u;
+                line[dx] = (r << 16) | (g << 8) | b;
+            }
+
+            acc += iw;
+            while (acc >= dw) {
+                acc -= dw;
+                sx++;
+            }
+        }
+    }
+    return 1;
+}
+
+void *image_alloc_buffer(uint32_t bytes) {
+    return img_alloc(bytes);
+}
+
+void image_free_buffer(void *ptr) {
+    if (ptr) img_free(ptr);
 }
 
 void image_draw_circle(int handle, int cx, int cy, int radius) {

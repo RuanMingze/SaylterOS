@@ -1,0 +1,259 @@
+# ============================================================
+# slyzfs3.slyz3 - SlyzFS 分区 / 盘符管理工具（SLYZ v3）
+# ------------------------------------------------------------
+# 在终端里 `run slyzfs` 启动。它管理的是启动盘的 SPT 分区表
+# （LBA8192/8193）与卷：
+#   list            列出分区、盘符、容量、挂载状态
+#   add C 64 NAME   在空闲空间新建分区，格式化并挂载
+#   format D NAME   重新格式化（销毁数据，需输入 YES）
+#   delete D        删除分区表条目（C: 受保护，需输入 YES）
+#   mount D         挂载
+#   umount D        卸载（先提交日志）
+#
+# 盘符参数接受 C/R/D 或 0/1/2。
+# ============================================================
+
+fn drive_code(s) {
+    let v = lower(trim(s))
+    if v == "c" or v == "c:" or v == "0" {
+        return 0
+    }
+    if v == "r" or v == "r:" or v == "1" {
+        return 1
+    }
+    if v == "d" or v == "d:" or v == "2" {
+        return 2
+    }
+    return -1
+}
+
+fn drive_name(d) {
+    if d == 0 {
+        return "C:"
+    }
+    if d == 1 {
+        return "R:"
+    }
+    if d == 2 {
+        return "D:"
+    }
+    return "?:"
+}
+
+fn pad(s, n) {
+    while len(s) < n {
+        s = s + " "
+    }
+    return s
+}
+
+fn mb_of(sectors) {
+    return sectors / 2048
+}
+
+fn show_help() {
+    println("SlyzFS partition manager (SLYZ v3)")
+    println("Commands:")
+    println("  list                     show partitions and mount state")
+    println("  add <C|R|D> [MB] [name]  create + format + mount in free space")
+    println("  format <C|R|D> [name]    reformat a partition (destroys data)")
+    println("  delete <C|R|D>           remove a partition entry")
+    println("  mount <C|R|D>            mount a partition")
+    println("  umount <C|R|D>           unmount a partition")
+    println("  help                     this help")
+    println("  exit                     leave")
+}
+
+fn cmd_list() {
+    let parts = part.list()
+    if parts == nil {
+        println("list: partition table is unreadable")
+        return 0
+    }
+    println(pad("DRIVE", 7) + pad("START", 12) + pad("SIZE(MB)", 12) +
+            pad("MOUNT", 8) + "LABEL")
+    let i = 0
+    while i < parts.length {
+        let p = parts.at(i)
+        let d = p.at(0)
+        let st = "offline"
+        if p.at(3) != 0 {
+            st = "mounted"
+        }
+        println(pad(drive_name(d), 7) + pad(str(p.at(1)), 12) +
+                pad(str(mb_of(p.at(2))), 12) + pad(st, 8) + p.at(4))
+        i = i + 1
+    }
+    println(str(parts.length) + " partition(s)")
+    return 0
+}
+
+fn cmd_add(arg1, arg2, arg3) {
+    let d = drive_code(arg1)
+    if d < 0 {
+        println("add: drive must be C, R or D")
+        return 0
+    }
+
+    let sectors = 0
+    if len(arg2) > 0 {
+        sectors = int(arg2) * 2048
+        if sectors < 4096 {
+            println("add: size must be at least 2 MB")
+            return 0
+        }
+    }
+
+    let label = ""
+    if len(arg3) > 0 {
+        label = arg3
+    }
+
+    if len(label) > 0 {
+        println("Creating " + drive_name(d) + " (" + str(mb_of(sectors)) +
+                " MB, label " + label + ") ...")
+    } else {
+        println("Creating " + drive_name(d) + " in free space ...")
+    }
+
+    let rc = part.add(d, sectors, label)
+    if rc == 0 {
+        println("Partition " + drive_name(d) + " is ready and mounted.")
+    } else {
+        println("add: failed (no free space, letter in use, or format error)")
+    }
+    return 0
+}
+
+fn cmd_format(arg1, arg2) {
+    let d = drive_code(arg1)
+    if d < 0 {
+        println("format: drive must be C, R or D")
+        return 0
+    }
+
+    if d == 0 {
+        println("WARNING: C: is the running system volume.")
+    }
+    let yes = input("This destroys all data on " + drive_name(d) + ". Type YES: ")
+    if trim(yes) != "YES" {
+        println("format cancelled.")
+        return 0
+    }
+
+    let rc = part.format(d, arg2)
+    if rc == 0 {
+        println("Partition " + drive_name(d) + " formatted and mounted.")
+    } else {
+        println("format: failed (partition missing or volume error)")
+    }
+    return 0
+}
+
+fn cmd_delete(arg1) {
+    let d = drive_code(arg1)
+    if d < 0 {
+        println("delete: drive must be C, R or D")
+        return 0
+    }
+    if d == 0 {
+        println("delete: C: is protected (running system volume)")
+        return 0
+    }
+
+    let yes = input("Delete partition " + drive_name(d) + "? Type YES: ")
+    if trim(yes) != "YES" {
+        println("delete cancelled.")
+        return 0
+    }
+
+    if part.delete(d) == 0 {
+        println("Partition " + drive_name(d) + " removed from the table.")
+    } else {
+        println("delete: failed")
+    }
+    return 0
+}
+
+fn cmd_mount(arg1) {
+    let d = drive_code(arg1)
+    if d < 0 {
+        println("mount: drive must be C, R or D")
+        return 0
+    }
+    if part.mount(d) == 0 {
+        println("Mounted " + drive_name(d))
+    } else {
+        println("mount: failed (partition missing or volume damaged)")
+    }
+    return 0
+}
+
+fn cmd_umount(arg1) {
+    let d = drive_code(arg1)
+    if d < 0 {
+        println("umount: drive must be C, R or D")
+        return 0
+    }
+    if d == 0 {
+        println("umount: C: is the running system volume")
+        return 0
+    }
+    if part.unmount(d) == 0 {
+        println("Unmounted " + drive_name(d))
+    } else {
+        println("umount: failed")
+    }
+    return 0
+}
+
+on start {
+    println("SlyzFS partition manager - SLYZ v3")
+    println("Type 'help' for commands.")
+
+    let alive = 1
+    while alive == 1 {
+        let line = trim(input("slyzfs> "))
+        if len(line) == 0 {
+            continue
+        }
+
+        let parts = split(line, " ")
+        let cmd = lower(parts.at(0))
+        let a1 = ""
+        let a2 = ""
+        let a3 = ""
+        if parts.length > 1 {
+            a1 = parts.at(1)
+        }
+        if parts.length > 2 {
+            a2 = parts.at(2)
+        }
+        if parts.length > 3 {
+            a3 = parts.at(3)
+        }
+
+        if cmd == "exit" or cmd == "quit" {
+            alive = 0
+        } else if cmd == "help" or cmd == "?" {
+            show_help()
+        } else if cmd == "list" or cmd == "ls" {
+            cmd_list()
+        } else if cmd == "add" or cmd == "create" {
+            cmd_add(a1, a2, a3)
+        } else if cmd == "format" {
+            cmd_format(a1, a2)
+        } else if cmd == "delete" or cmd == "del" or cmd == "rm" {
+            cmd_delete(a1)
+        } else if cmd == "mount" {
+            cmd_mount(a1)
+        } else if cmd == "umount" or cmd == "unmount" {
+            cmd_umount(a1)
+        } else {
+            println("unknown command: " + cmd + " (try 'help')")
+        }
+    }
+
+    println("bye.")
+    os.exit(0)
+}

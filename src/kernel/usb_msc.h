@@ -36,6 +36,14 @@ void usb_msc_stats(uint32_t *reads, uint32_t *writes);
 /* 设备型号（INQUIRY 的 vendor + product，静态缓冲） */
 const char *usb_msc_name(void);
 
+/* ---- USB HID 启动键盘（2.4G 无线键盘接收器 / USB 键盘） ----
+ * 复用同一个 xHCI 控制器，使用独立槽位与中断 IN 端点。
+ * usb_kbd_poll_report() 非阻塞：有新报告返回 1，并把 8 字节启动
+ * 协议报告写入 out8（修饰键 + 保留 + 6 个 HID 键码）。 */
+int  usb_kbd_init(void);
+int  usb_kbd_poll_report(uint8_t *out8);
+int  usb_kbd_present(void);
+
 #ifdef __cplusplus
 }
 #endif

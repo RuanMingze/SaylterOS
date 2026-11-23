@@ -1,0 +1,561 @@
+# ============================================================
+# files3.slyz3 - 文件管理器（SLYZ v3）
+# ------------------------------------------------------------
+# 浏览 SlyzFS、此电脑（盘符）、进入目录、返回上级、
+# 新建目录/文件、删除、复制、剪切、粘贴、双击打开。
+# ------------------------------------------------------------
+
+state ROW_H = 36
+state ROWS = 12
+state LIST_Y = 96
+state LIST_X = 16
+state LIST_W = 848
+
+state path = ""
+state offset = 0
+state sel = -1
+state msg = ""
+state msg_until = 0
+state last_open_idx = -1
+state last_open_ms = 0
+state clip_path = ""
+state clip_cut = 0
+
+# 目录项缓存：列目录要跨模块调用并分配对象，每帧重读会让单帧指令数
+# 暴涨（渲染 100ms 级）。用整数版本号判断失效，避免反复比较字符串。
+state items = []
+state items_rev = -1
+state path_rev = 0
+
+# ---- 主题色：跟随 设置 -> 主题 切换 ----
+state c_bg = 0x0B1017
+state c_card = 0x101722
+state c_field = 0x1B2532
+state c_border = 0x2B3949
+state c_text = 0xE9EFF7
+state c_dim = 0x8EA0B4
+state c_accent = 0x2F6FE0
+state c_accent3 = 0x7FB2FF
+state c_hover = 0x16202C
+state c_sel = 0x1B3150
+state c_ok = 0x34D399
+state c_warn = 0xF59E0B
+
+fn load_theme() {
+    c_bg = ui.theme(0)
+    c_card = ui.theme(3)
+    c_field = ui.theme(3)
+    c_border = ui.theme(5)
+    c_text = ui.theme(6)
+    c_dim = ui.theme(7)
+    c_accent = ui.theme(9)
+    c_accent3 = ui.theme(10)
+    c_hover = ui.theme(14)
+    c_sel = ui.theme(15)
+    c_ok = ui.theme(11)
+}
+
+fn say(text) {
+    msg = text
+    msg_until = time.ms() + 4000
+}
+
+# 保证 items 与 path 一致；未变化时零开销。
+fn want_path() {
+    if items_rev != path_rev {
+        items = fs.entries(path)
+        items_rev = path_rev
+    }
+}
+
+fn pjoin(base, name) {
+    if base == "" {
+        return name
+    }
+    return base + "\\" + name
+}
+
+fn parent_of(p) {
+    let i = len(p) - 1
+    while i >= 0 && str_at(p, i) != "\\" {
+        i = i - 1
+    }
+    if i <= 0 {
+        return ""
+    }
+    return substr(p, 0, i)
+}
+
+fn base_of(p) {
+    let i = len(p) - 1
+    while i >= 0 && str_at(p, i) != "\\" {
+        i = i - 1
+    }
+    if i < 0 {
+        return p
+    }
+    return substr(p, i + 1, len(p) - i - 1)
+}
+
+fn fmt_size(v) {
+    if v >= 1048576 {
+        return str(v / 1048576) + " MB"
+    }
+    if v >= 1024 {
+        return str(v / 1024) + " KB"
+    }
+    return str(v) + " B"
+}
+
+fn drive_letter(d) {
+    if d == 1 {
+        return "R:"
+    }
+    if d == 2 {
+        return "D:"
+    }
+    return "C:"
+}
+
+fn draw_tool(x, y, w, h, label) {
+    gfx.rect(x, y, w, h, c_field)
+    gfx.frame(x, y, w, h, c_border, 1)
+    let lw = gfx.text_width(label)
+    gfx.text(x + (w - lw) / 2, y + 2, label, c_text)
+}
+
+fn draw_drives() {
+    gfx.rect(LIST_X, LIST_Y - 4, LIST_W, 30, c_field)
+    gfx.text(LIST_X + 12, LIST_Y - 2, "DRIVE", c_dim)
+    gfx.text(LIST_X + 560, LIST_Y - 2, "LABEL", c_dim)
+    gfx.text(LIST_X + 700, LIST_Y - 2, "STATUS", c_dim)
+
+    let k = 0
+    while k < 3 {
+        let letter = "C:"
+        let label = "SYSTEM"
+        if k == 1 {
+            letter = "R:"
+            label = "RECOVERY"
+        }
+        if k == 2 {
+            letter = "D:"
+            label = "DATA"
+        }
+
+        let y = LIST_Y + 28 + k * ROW_H
+        let bg = c_card
+        if k == sel {
+            bg = c_sel
+        }
+        gfx.rect(LIST_X, y - 4, LIST_W, ROW_H - 2, bg)
+
+        gfx.text(LIST_X + 12, y, letter, c_accent3)
+        gfx.text(LIST_X + 560, y, label, c_dim)
+        if fs.exists(letter) == 1 {
+            gfx.text(LIST_X + 700, y, "mounted", c_ok)
+        } else {
+            gfx.text(LIST_X + 700, y, "unmounted", c_warn)
+        }
+        k = k + 1
+    }
+
+    gfx.text(16, 524, "3 drive(s)", c_dim)
+}
+
+fn draw() {
+    gfx.clear(c_bg)
+
+    let shown = path
+    if shown == "" {
+        shown = "This PC"
+    }
+    gfx.rect(16, 8, 848, 36, c_field)
+    gfx.frame(16, 8, 848, 36, c_border, 1)
+    gfx.text(28, 12, shown, c_text)
+
+    # 第一行工具：导航
+    draw_tool(16, 52, 76, 34, "Up")
+    draw_tool(100, 52, 116, 34, "This PC")
+    draw_tool(224, 52, 84, 34, "Mkdir")
+    draw_tool(316, 52, 92, 34, "Touch")
+
+    # 第二行工具（同一行右侧）：剪贴板
+    draw_tool(416, 52, 76, 34, "Copy")
+    draw_tool(500, 52, 64, 34, "Cut")
+    draw_tool(572, 52, 84, 34, "Paste")
+    draw_tool(664, 52, 96, 34, "Delete")
+
+    if path == "" {
+        draw_drives()
+        if msg != "" && time.ms() < msg_until {
+            gfx.text(200, 524, msg, c_ok)
+        }
+        gfx.flush()
+        return
+    }
+
+    want_path()
+
+    gfx.rect(LIST_X, LIST_Y - 4, LIST_W, 30, c_field)
+    gfx.text(LIST_X + 12, LIST_Y - 2, "NAME", c_dim)
+    gfx.text(LIST_X + 560, LIST_Y - 2, "TYPE", c_dim)
+    gfx.text(LIST_X + 700, LIST_Y - 2, "SIZE", c_dim)
+
+    let i = 0
+    while i < ROWS {
+        let idx = offset + i
+        if idx < items.length {
+            let row = items.at(idx)
+            let name = row.at(0)
+            let kind = row.at(1)
+            let size = row.at(2)
+            let y = LIST_Y + 28 + i * ROW_H
+
+            let bg = c_card
+            if idx == sel {
+                bg = c_sel
+            }
+            gfx.rect(LIST_X, y - 4, LIST_W, ROW_H - 2, bg)
+
+            let fg = c_text
+            let type_text = "file"
+            if kind == 2 {
+                fg = c_accent3
+                type_text = "dir"
+            }
+            gfx.text(LIST_X + 12, y, name, fg)
+            gfx.text(LIST_X + 560, y, type_text, c_dim)
+            if kind != 2 {
+                gfx.text(LIST_X + 700, y, fmt_size(size), c_dim)
+            }
+        }
+        i = i + 1
+    }
+
+    let foot = str(items.length) + " item(s)"
+    if offset > 0 {
+        foot = foot + "   scroll " + str(offset)
+    }
+    if clip_path != "" {
+        if clip_cut == 1 {
+            foot = foot + "   [cut] " + base_of(clip_path)
+        } else {
+            foot = foot + "   [copy] " + base_of(clip_path)
+        }
+    }
+    if msg != "" && time.ms() < msg_until {
+        foot = foot + "   " + msg
+    }
+    gfx.text(16, 524, foot, c_dim)
+
+    gfx.flush()
+}
+
+fn activate(idx, items) {
+    if idx < 0 || idx >= items.length {
+        return
+    }
+    let row = items.at(idx)
+    let name = row.at(0)
+    let kind = row.at(1)
+
+    if kind == 2 {
+        path = pjoin(path, name)
+                    path_rev = path_rev + 1
+        offset = 0
+        sel = -1
+        last_open_idx = -1
+    } else {
+        sel = idx
+        say(name + "  " + fmt_size(row.at(2)))
+
+        let now = time.ms()
+        if idx == last_open_idx && now - last_open_ms < 450 {
+            os.open(pjoin(path, name))
+            last_open_idx = -1
+        } else {
+            last_open_idx = idx
+            last_open_ms = now
+        }
+    }
+}
+
+fn handle_click(px, py) {
+    # ---- 工具行 ----
+    if py >= 52 && py <= 86 {
+        if px >= 16 && px < 92 {
+            go_up()
+            return
+        }
+        if px >= 100 && px < 216 {
+            path = ""
+                        path_rev = path_rev + 1
+            offset = 0
+            sel = -1
+            return
+        }
+        if px >= 224 && px < 308 {
+            if path == "" {
+                say("open a drive first")
+                return
+            }
+            let n = 1
+            let name = "NewFolder"
+            while fs.exists(pjoin(path, name)) && n < 99 {
+                n = n + 1
+                name = "NewFolder" + str(n)
+            }
+            if fs.mkdir(pjoin(path, name)) == 0 {
+                            path_rev = path_rev + 1
+                say("created " + name)
+            } else {
+                say("cannot create folder")
+            }
+            return
+        }
+        if px >= 316 && px < 408 {
+            if path == "" {
+                say("open a drive first")
+                return
+            }
+            let n = 1
+            let name = "NewFile.txt"
+            while fs.exists(pjoin(path, name)) && n < 99 {
+                n = n + 1
+                name = "NewFile" + str(n) + ".txt"
+            }
+            if fs.write(pjoin(path, name), "") >= 0 {
+                            path_rev = path_rev + 1
+                say("created " + name)
+            } else {
+                say("cannot create file")
+            }
+            return
+        }
+        if px >= 416 && px < 492 {
+            if select_item() == 0 {
+                return
+            }
+            clip_path = pjoin(path, selected_name())
+            clip_cut = 0
+            say("copied " + base_of(clip_path))
+            return
+        }
+        if px >= 500 && px < 564 {
+            if select_item() == 0 {
+                return
+            }
+            clip_path = pjoin(path, selected_name())
+            clip_cut = 1
+            say("cut " + base_of(clip_path))
+            return
+        }
+        if px >= 572 && px < 656 {
+            do_paste()
+            return
+        }
+        if px >= 664 && px < 760 {
+            if select_item() == 0 {
+                return
+            }
+            let name = selected_name()
+            if fs.remove(pjoin(path, name)) == 0 {
+                            path_rev = path_rev + 1
+                say("removed " + name)
+                sel = -1
+            } else {
+                say("cannot remove " + name)
+            }
+            return
+        }
+    }
+
+    # ---- 此电脑：点击盘符 ----
+    if path == "" {
+        if py >= LIST_Y + 28 && py < LIST_Y + 28 + 3 * ROW_H {
+            if px >= LIST_X && px < LIST_X + LIST_W {
+                let idx = (py - LIST_Y - 28) / ROW_H
+                let letter = "C:"
+                if idx == 1 {
+                    letter = "R:"
+                }
+                if idx == 2 {
+                    letter = "D:"
+                }
+                if idx >= 0 && idx < 3 && fs.exists(letter) == 1 {
+                    path = letter
+                                path_rev = path_rev + 1
+                    offset = 0
+                    sel = -1
+                } else {
+                    say("drive is not mounted")
+                }
+            }
+        }
+        return
+    }
+
+    if py >= LIST_Y + 28 && py < LIST_Y + 28 + ROWS * ROW_H {
+        if px >= LIST_X && px < LIST_X + LIST_W {
+            want_path()
+            let idx = offset + (py - LIST_Y - 28) / ROW_H
+            activate(idx, items)
+        }
+    }
+}
+
+fn select_item() {
+    if path == "" {
+        say("open a drive first")
+        return 0
+    }
+    want_path()
+    if sel < 0 {
+        say("select an item first")
+        return 0
+    }
+    if sel >= items.length {
+        say("item is gone")
+        return 0
+    }
+    return 1
+}
+
+fn selected_name() {
+    want_path()
+    if sel < 0 || sel >= items.length {
+        return ""
+    }
+    let row = items.at(sel)
+    return row.at(0)
+}
+
+fn do_paste() {
+    if path == "" {
+        say("open a drive first")
+        return
+    }
+    if clip_path == "" {
+        say("clipboard is empty")
+        return
+    }
+
+    let name = base_of(clip_path)
+    let dst = pjoin(path, name)
+    # 同目录或目标已存在时生成副本名，而不是拒绝粘贴。
+    if dst == clip_path || fs.exists(dst) == 1 {
+        let k = 1
+        dst = pjoin(path, name + ".copy")
+        while fs.exists(dst) == 1 && k < 99 {
+            k = k + 1
+            dst = pjoin(path, name + ".copy" + str(k))
+        }
+    }
+
+    let t0 = time.ms()
+    if clip_cut == 1 {
+        let n = fs.copy(clip_path, dst)
+        if n >= 0 {
+            fs.remove(clip_path)
+            let dt = time.ms() - t0
+            if dt < 1 {
+                dt = 1
+            }
+            path_rev = path_rev + 1
+            say("moved " + str(n) + " B in " + str(dt) + " ms")
+            clip_path = ""
+        } else {
+            say("move failed")
+        }
+        return
+    }
+
+    let n = fs.copy(clip_path, dst)
+    let dt = time.ms() - t0
+    if dt < 1 {
+        dt = 1
+    }
+    if n >= 0 {
+                    path_rev = path_rev + 1
+        if dt < 20 {
+            say("copied instantly")
+        } else {
+            say("copied " + str(n / dt) + " KB/s")
+        }
+    } else {
+        say("copy failed")
+    }
+}
+
+fn go_up() {
+    if path == "" {
+        return
+    }
+    if len(path) <= 2 && str_at(path, 1) == ":" {
+        path = ""
+                    path_rev = path_rev + 1
+        offset = 0
+        sel = -1
+        return
+    }
+    let up = parent_of(path)
+    if up == path || up == "" || (len(up) == 2 && str_at(up, 1) == ":") {
+        if len(path) > 2 && str_at(path, 1) == ":" {
+            path = substr(path, 0, 2)
+        } else {
+            path = ""
+        }
+    } else {
+        path = up
+    }
+                path_rev = path_rev + 1
+    offset = 0
+    sel = -1
+}
+
+fn scroll(delta) {
+    want_path()
+    let max_offset = items.length - ROWS
+    if max_offset < 0 {
+        max_offset = 0
+    }
+    offset = offset - delta
+    if offset < 0 {
+        offset = 0
+    }
+    if offset > max_offset {
+        offset = max_offset
+    }
+}
+
+fn main() {
+    let handle = win.open("Files", 900, 600)
+    if handle < 0 {
+        return
+    }
+    load_theme()
+
+    let running = 1
+    while running == 1 {
+        draw()
+
+        let ev = event.poll()
+        if ev != nil {
+            let kind = ev.at(0)
+            if kind == 3 {
+                handle_click(ev.at(1), ev.at(2))
+            }
+            if kind == 4 {
+                scroll(ev.at(1))
+            }
+            if kind == 5 {
+                running = 0
+            }
+        }
+    }
+}
+
+on start {
+    main()
+}

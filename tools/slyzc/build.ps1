@@ -1,4 +1,4 @@
-# ============================================================
+﻿# ============================================================
 # tools/slyzc/build.ps1 - 编译 Windows 端 SLYZ 工具链
 # ------------------------------------------------------------
 # 产出 tools/slyzc/build/slyzc.exe，它同时包含：
@@ -35,6 +35,7 @@ $sources = @(
     (Join-Path $here 'slyzc_parse.c'),
     (Join-Path $here 'slyzc_gen.c'),
     (Join-Path $here 'slyzc_util.c'),
+    (Join-Path $here 'slyzc_serve.c'),
     (Join-Path $here 'slyzrt_host.c'),
     (Join-Path $root 'src\kernel\slyzvm.c')
 )

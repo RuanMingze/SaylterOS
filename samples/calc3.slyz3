@@ -1,0 +1,304 @@
+# ============================================================
+# calc3.slyz3 - 桌面计算器（SLYZ v3）
+# ------------------------------------------------------------
+# 由 v2 版逐行移植：布局与状态机保持不变，循环改为 while。
+# 64 位整数运算；除零进入 Error 态，下一次输入数字自动恢复。
+# ============================================================
+
+state BW = 88
+state BH = 56
+state GAP = 8
+state BX = 12
+state BY = 140
+
+state labels = [
+    "C", "+/-", "%", "/",
+    "7", "8", "9", "*",
+    "4", "5", "6", "-",
+    "1", "2", "3", "+",
+    "0", ".", "<", "="
+]
+
+state acc = 0
+state cur = "0"
+state op = 0
+state fresh = 1
+state err = 0
+
+# ---- 主题色 ----
+state c_bg = 0x0B1017
+state c_field = 0x0C141E
+state c_border = 0x2B3949
+state c_text = 0xE9EFF7
+state c_btn = 0x1B2532
+state c_accent = 0x2F6FE0
+state c_err = 0x7F1D1D
+
+fn load_theme() {
+    c_bg = ui.theme(0)
+    c_field = ui.theme(2)
+    c_border = ui.theme(5)
+    c_text = ui.theme(6)
+    c_btn = ui.theme(3)
+    c_accent = ui.theme(9)
+    c_err = ui.theme(12)
+}
+
+fn reset_all() {
+    acc = 0
+    cur = "0"
+    op = 0
+    fresh = 1
+    err = 0
+}
+
+fn input_text(s) {
+    if err != 0 {
+        reset_all()
+    }
+    if fresh != 0 {
+        cur = ""
+        fresh = 0
+    }
+    if len(cur) < 16 {
+        cur = cur + s
+    }
+}
+
+fn apply() {
+    if err != 0 {
+        return
+    }
+
+    let v = int(cur)
+    if op == 1 {
+        acc = acc + v
+    } else if op == 2 {
+        acc = acc - v
+    } else if op == 3 {
+        acc = acc * v
+    } else if op == 4 {
+        if v == 0 {
+            err = 1
+            cur = "Error"
+            op = 0
+            fresh = 1
+            return
+        }
+        acc = acc / v
+    } else {
+        acc = v
+    }
+
+    op = 0
+    cur = str(acc)
+    fresh = 1
+}
+
+fn press(idx) {
+    if idx < 0 {
+        return
+    }
+
+    let lab = labels.at(idx)
+
+    if lab == "C" {
+        reset_all()
+        return
+    }
+    if lab == "+/-" {
+        cur = str(-int(cur))
+        fresh = 0
+        return
+    }
+    if lab == "%" {
+        cur = str(int(cur) / 100)
+        fresh = 0
+        return
+    }
+    if lab == "/" {
+        apply()
+        op = 4
+        fresh = 1
+        return
+    }
+    if lab == "*" {
+        apply()
+        op = 3
+        fresh = 1
+        return
+    }
+    if lab == "-" {
+        apply()
+        op = 2
+        fresh = 1
+        return
+    }
+    if lab == "+" {
+        apply()
+        op = 1
+        fresh = 1
+        return
+    }
+    if lab == "=" {
+        apply()
+        return
+    }
+    if lab == "<" {
+        if len(cur) > 1 {
+            cur = substr(cur, 0, len(cur) - 1)
+        } else {
+            cur = "0"
+        }
+        fresh = 0
+        return
+    }
+    if lab == "." {
+        return
+    }
+
+    input_text(lab)
+}
+
+fn press_key(ch) {
+    if ch >= 48 && ch <= 57 {
+        input_text(chr(ch))
+        return
+    }
+    if ch == 43 {
+        apply()
+        op = 1
+        fresh = 1
+        return
+    }
+    if ch == 45 {
+        apply()
+        op = 2
+        fresh = 1
+        return
+    }
+    if ch == 42 {
+        apply()
+        op = 3
+        fresh = 1
+        return
+    }
+    if ch == 47 {
+        apply()
+        op = 4
+        fresh = 1
+        return
+    }
+    if ch == 13 || ch == 61 {
+        apply()
+        return
+    }
+    if ch == 8 || ch == 127 {
+        if len(cur) > 1 {
+            cur = substr(cur, 0, len(cur) - 1)
+        } else {
+            cur = "0"
+        }
+        fresh = 0
+        return
+    }
+    if ch == 99 || ch == 67 {
+        reset_all()
+        return
+    }
+    if ch == 27 {
+        win.close(0)
+    }
+}
+
+fn hit(px, py) {
+    if px < BX || py < BY {
+        return -1
+    }
+
+    let step_x = BW + GAP
+    let step_y = BH + GAP
+    let lx = px - BX
+    let ly = py - BY
+    let col = lx / step_x
+    let row = ly / step_y
+
+    if col > 3 || row > 4 {
+        return -1
+    }
+    if lx % step_x >= BW || ly % step_y >= BH {
+        return -1
+    }
+
+    return row * 4 + col
+}
+
+fn draw() {
+    gfx.clear(c_bg)
+
+    gfx.rect(12, 12, 376, 100, c_field)
+    gfx.frame(12, 12, 376, 100, c_border, 1)
+
+    let dw = gfx.text_width(cur)
+    gfx.text(376 - dw, 46, cur, c_text)
+
+    let i = 0
+    while i < 20 {
+        let col = i % 4
+        let row = i / 4
+        let x = BX + col * (BW + GAP)
+        let y = BY + row * (BH + GAP)
+
+        let bg = c_btn
+        if col == 3 {
+            bg = c_accent
+        }
+        if i == 0 {
+            bg = c_err
+        }
+
+        gfx.rect(x, y, BW, BH, bg)
+
+        let lab = labels.at(i)
+        let lw = gfx.text_width(lab)
+        let fg = c_text
+        if col == 3 {
+            fg = 0xFFFFFF
+        }
+        gfx.text(x + (BW - lw) / 2, y + 16, lab, fg)
+        i = i + 1
+    }
+
+    gfx.flush()
+}
+
+fn main() {
+    let handle = win.open("Calculator", 420, 560)
+    if handle < 0 {
+        return
+    }
+    load_theme()
+
+    let running = 1
+    while running == 1 {
+        draw()
+
+        let ev = event.poll()
+        if ev != nil {
+            let kind = ev.at(0)
+            if kind == 3 {
+                press(hit(ev.at(1), ev.at(2)))
+            }
+            if kind == 1 {
+                press_key(ev.at(1))
+            }
+            if kind == 5 {
+                running = 0
+            }
+        }
+    }
+}
+
+on start {
+    main()
+}

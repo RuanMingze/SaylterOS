@@ -1,4 +1,4 @@
-# ============================================================
+﻿# ============================================================
 # mkusb.ps1 - 把 SaylterOS 磁盘镜像原样写入 U 盘
 # ------------------------------------------------------------
 # 安全约束（针对"误写数据盘"）：
@@ -21,8 +21,10 @@ param(
 $ErrorActionPreference = 'Stop'
 
 function Fail([string]$message) {
+    # 用 throw 而不是 exit：显式 exit 会终止整个 PowerShell 会话，
+    # 即使启动时加了 -NoExit，窗口也会立刻消失，看不到错误原因。
     Write-Host $message -ForegroundColor Red
-    exit 1
+    throw $message
 }
 
 # ---- 管理员检查 ----
@@ -64,7 +66,7 @@ Write-Host ''
 $raw = Read-Host '输入要写入的 USB 磁盘号（例如 2；直接回车取消）'
 if ($raw -notmatch '^\d+$') {
     Write-Host '已取消。'
-    exit 0
+    return
 }
 $diskNumber = [int]$raw
 
@@ -94,20 +96,46 @@ Write-Host '警告：U 盘分区表和前 32MB 内容将被覆盖，原有数据
 $confirm = Read-Host '确认请输入 WRITE（全大写），其他输入取消'
 if ($confirm -ne 'WRITE') {
     Write-Host '已取消。'
-    exit 0
+    return
 }
 
-# ---- 下线目标盘，解除卷挂载 ----
-$wasOffline = $target.IsOffline
-if (-not $wasOffline) {
-    Set-Disk -Number $diskNumber -IsOffline $true
+# ---- 解除占用 ----
+# 可移动介质不支持 Set-Disk -IsOffline（会报 "Removable media cannot be
+# set to offline"）。正确做法是清掉分区表，让 Windows 解除卷挂载，
+# 之后才能用 FileShare.None 独占打开 \\.\PhysicalDriveN。
+try {
+    Set-Disk -Number $diskNumber -IsReadOnly $false -ErrorAction Stop
+} catch {
+    Write-Host ("  解除只读失败（继续）：{0}" -f $_.Exception.Message) -ForegroundColor Yellow
 }
+if ($target.IsOffline) {
+    try {
+        Set-Disk -Number $diskNumber -IsOffline $false -ErrorAction Stop
+    } catch {
+        Write-Host ("  切换在线失败（继续）：{0}" -f $_.Exception.Message) -ForegroundColor Yellow
+    }
+}
+
+Write-Host '  清除分区表并释放卷占用...' -ForegroundColor DarkGray
+try {
+    Clear-Disk -Number $diskNumber -RemoveData -RemoveOEM -Confirm:$false -ErrorAction Stop
+} catch {
+    Write-Host ("  Clear-Disk 未完成（继续尝试写入）：{0}" -f $_.Exception.Message) -ForegroundColor Yellow
+}
+Update-HostStorageCache -ErrorAction SilentlyContinue
+Start-Sleep -Milliseconds 800
 
 $src = $null
 $dst = $null
 try {
     $src = [System.IO.File]::OpenRead($imageItem.FullName)
-    $dst = [System.IO.File]::OpenWrite("\\.\PhysicalDrive$diskNumber")
+    # 物理磁盘必须以 FileShare.None 独占打开；File.OpenWrite 默认是
+    # FileShare.Read，会被 Windows 拒绝为 ERROR_INVALID_PARAMETER。
+    $dst = New-Object System.IO.FileStream(
+        ("\\.\PhysicalDrive{0}" -f $diskNumber),
+        [System.IO.FileMode]::Open,
+        [System.IO.FileAccess]::Write,
+        [System.IO.FileShare]::None)
 
     $buffer = New-Object byte[] (1024 * 1024)
     $written = 0
@@ -134,7 +162,4 @@ try {
 finally {
     if ($dst) { $dst.Dispose() }
     if ($src) { $src.Dispose() }
-    if (-not $wasOffline) {
-        Set-Disk -Number $diskNumber -IsOffline $false -ErrorAction SilentlyContinue
-    }
 }

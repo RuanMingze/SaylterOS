@@ -69,6 +69,11 @@ int net_init(void);
 /* 网卡是否可用（已找到且链路已就绪） */
 int net_ready(void);
 
+/* 飞行模式：开启后所有网络收发与"已连接"判定都视为关闭。
+ * 控制中心面板提供开关；不影响已配置的静态地址。 */
+int  net_flight(void);
+void net_set_flight(int on);
+
 struct NetInfo *net_info(void);
 
 /* 修改静态 IPv4 配置（主机字节序）。参数为 0 表示保持原值。 */
@@ -76,6 +81,10 @@ void net_set_config(uint32_t ip, uint32_t netmask, uint32_t gateway, uint32_t dn
 
 /* 毫秒级单调时钟（TSC 校准，PIT 提供基准） */
 uint32_t net_now_ms(void);
+
+/* 微秒级单调时钟：用于呈现阶段的分段耗时统计。
+ * 32 位微秒约 71 分钟回绕，图形会话内的差值计算不受影响。 */
+uint32_t net_now_us(void);
 
 /* 点分十进制转换。成功返回 1。 */
 int net_parse_ipv4(const char *text, uint32_t *out);

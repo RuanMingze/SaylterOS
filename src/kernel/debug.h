@@ -27,6 +27,14 @@ void debug_early_console(void);
 
 /* 串口字节镜像：tty_putchar 对每个输出字符调用。 */
 void debug_serial_byte(char c);
+/* 屏幕进度条：直接写 VBE LFB（不经过 tty 后端），用于真机黑屏时
+ * 判断内核初始化走到哪一步。step 越大，点亮的小方块越多。 */
+void debug_progress(int step);
+/* 启动盘裸写日志：dbg 阶段把控制台/串口字节直接写到启动盘预留扇区，
+ * 不经过文件系统。begin 在早期控制台入口调用；end(clear=1) 在 next
+ * 进入正常启动前清空本次写入的区域。 */
+void debug_rawlog_begin(void);
+void debug_rawlog_end(int clear);
 /* SlyzFS 挂载成功后调用，开始把缓冲写入当前启动盘。 */
 void debug_serial_fs_ready(void);
 /* 手动刷新一次日志文件。 */
@@ -50,6 +58,9 @@ int debug_auto_format_allowed(void);
 
 static inline void debug_early_console(void) {}
 static inline void debug_serial_byte(char c) { (void)c; }
+static inline void debug_progress(int step) { (void)step; }
+static inline void debug_rawlog_begin(void) {}
+static inline void debug_rawlog_end(int clear) { (void)clear; }
 static inline void debug_serial_fs_ready(void) {}
 static inline void debug_serial_flush(void) {}
 static inline void debug_tick(void) {}

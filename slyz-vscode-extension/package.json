@@ -1,8 +1,8 @@
 {
   "name": "saylter-slyz",
   "displayName": "Saylter SLYZ",
-  "description": "Syntax highlighting, GUI DSL snippets and validation for SaylterOS SLYZ scripts (#gui declarative UI and classic text scripts).",
-  "version": "0.2.0",
+  "description": "SLYZ v2 语言支持：语法高亮、代码片段，以及由 slyzc 提供的实时语法检查。",
+  "version": "0.3.0",
   "publisher": "saylter-os",
   "repository": {
     "type": "git",
@@ -25,7 +25,7 @@
       {
         "id": "slyz",
         "aliases": ["SLYZ", "slyz"],
-        "extensions": [".slyz"],
+        "extensions": [".slyzcode"],
         "configuration": "./language-configuration.json"
       }
     ],
@@ -41,7 +41,24 @@
         "language": "slyz",
         "path": "./snippets/slyz.json"
       }
-    ]
+    ],
+    "configuration": {
+      "title": "SLYZ",
+      "properties": {
+        "slyz.compilerPath": {
+          "type": "string",
+          "default": "",
+          "description": "slyzc.exe 的路径。留空时依次查找工作区的 build\\slyzc.exe、tools\\slyzc\\build\\slyzc.exe 与扩展自带的 bin\\slyzc.exe。"
+        },
+        "slyz.checkDebounceMs": {
+          "type": "number",
+          "default": 250,
+          "minimum": 0,
+          "maximum": 5000,
+          "description": "编辑后延迟多少毫秒再请求语法检查（0 表示每次输入都检查）。"
+        }
+      }
+    }
   },
   "scripts": {
     "compile": "tsc -p ./",

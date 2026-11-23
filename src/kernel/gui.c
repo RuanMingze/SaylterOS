@@ -45,10 +45,31 @@
 #include "image.h"
 #include "audio.h"
 #include "blk.h"
+#include "gui_internal.h"
 
 /* 界面文案统一走语言包：LTR("Files") 在当前语言为中文时返回"文件"，
  * 未收录的条目自动回退英文，新增语言不需要改任何调用点。 */
 #define LTR(s) lang_tr(s)
+
+/* 串口实时诊断：桌面主循环与启动阶段把耗时写到 serial，
+ * 方便在 QEMU 侧定位是绘制、上屏还是某个初始化步骤拖慢。 */
+extern void kserial_puts(const char *s);
+extern void kserial_dec32(uint32_t v);
+
+static uint32_t g_perf_stage_us;
+
+/* 打一个启动阶段点：输出距上一点的耗时与启动后的绝对毫秒数。 */
+static void perf_boot_stage(const char *name) {
+    uint32_t now = net_now_us();
+    kserial_puts("[PERF] boot ");
+    kserial_puts(name);
+    kserial_puts(" +");
+    kserial_dec32((now - g_perf_stage_us) / 1000u);
+    kserial_puts("ms t=");
+    kserial_dec32(now / 1000u);
+    kserial_puts("ms\r\n");
+    g_perf_stage_us = now;
+}
 
 /* 磁盘统计由 blk.c 提供（USB 或 ATA） */
 
@@ -89,1094 +110,6 @@ extern int   slyzfs_read(void *fh, uint8_t *buf, int n);
 extern int   slyzfs_write(void *fh, const uint8_t *buf, int n);
 extern void  slyzfs_close(void *fh);
 extern void  slyzfs_set_quiet(int quiet);
-
-/* ============================================================
- * 基础常量
- * ============================================================ */
-
-#define GUI_TASKBAR_W 88
-#define GUI_WIN_MAX   10
-#define GUI_APP_COUNT 8
-#define GUI_FM_MAX    128
-#define GUI_ED_MAX    65536
-#define GUI_CURSOR_W  16
-#define GUI_CURSOR_H  24
-
-enum {
-    WIN_FILES = 0,
-    WIN_EDITOR = 1,
-    WIN_SETTINGS = 2,
-    WIN_TERM = 3,
-    WIN_BROWSER = 4,
-    WIN_SLYZ = 5,
-    WIN_TASKMGR = 6,
-    WIN_CALC = 7,
-    WIN_MEDIA = 8,
-    /* 原生预装应用窗口：由 GuiExternalHost 驱动（如 VizCormin）。 */
-    WIN_EXTERNAL = 9
-};
-
-enum {
-    ACT_NONE = -1,
-    ACT_LOGOUT = 0,
-    ACT_REBOOT = 1,
-    ACT_SHUTDOWN = 2,
-    ACT_TTY = 3
-};
-
-#define C_BG       0x090D13
-#define C_BG2      0x101722
-#define C_PANEL    0x141C27
-#define C_PANEL2   0x1B2532
-#define C_PANEL3   0x223041
-#define C_BORDER   0x2B3949
-#define C_TEXT     0xE9EFF7
-#define C_DIM      0x8EA0B4
-#define C_ACCENT   0x4F8EF7
-#define C_ACCENT2  0x2F6FE0
-#define C_ACCENT3  0x7FB2FF
-#define C_OK       0x34D399
-#define C_ERR      0xF87171
-#define C_WARN     0xFBBF24
-
-#define C_AVATAR_A 0x3B82F6
-#define C_AVATAR_B 0x8B5CF6
-#define C_AVATAR_C 0x10B981
-#define C_AVATAR_D 0xF59E0B
-
-static int gW = 0;
-static int gH = 0;
-static ui_theme g_theme;
-
-static int g_mx = 0;
-static int g_my = 0;
-static int g_mdown = 0;
-static int g_mdown_r = 0;
-static int g_mclicked = 0;
-static int g_rclicked = 0;
-static int g_mwheel = 0;
-static int g_mreleased = 0;
-static int g_mmoved = 0;
-
-/* ============================================================
- * 字符串与数值工具（内核没有 libc）
- * ============================================================ */
-
-static int g_strlen(const char *s) {
-    int n = 0;
-    while (s && s[n]) n++;
-    return n;
-}
-
-static int g_strcmp(const char *a, const char *b) {
-    while (*a && *b && *a == *b) {
-        a++;
-        b++;
-    }
-    return (int)(unsigned char)*a - (int)(unsigned char)*b;
-}
-
-static int g_lower(int c) {
-    if (c >= 'A' && c <= 'Z') return c + ('a' - 'A');
-    return c;
-}
-
-static int g_strcasecmp(const char *a, const char *b) {
-    while (*a && *b) {
-        if (g_lower((unsigned char)*a) != g_lower((unsigned char)*b)) {
-            return g_lower((unsigned char)*a) - g_lower((unsigned char)*b);
-        }
-        a++;
-        b++;
-    }
-    return g_lower((unsigned char)*a) - g_lower((unsigned char)*b);
-}
-
-static void g_copy(char *dst, const char *src, int cap) {
-    int i = 0;
-    if (cap <= 0) return;
-    while (src && src[i] && i < cap - 1) {
-        dst[i] = src[i];
-        i++;
-    }
-    dst[i] = '\0';
-}
-
-/* 无符号整数转十进制；返回写入长度 */
-static int g_utoa(uint32_t v, char *out) {
-    char tmp[12];
-    int n = 0;
-    int i = 0;
-
-    if (v == 0) tmp[n++] = '0';
-    while (v > 0) {
-        tmp[n++] = (char)('0' + (v % 10u));
-        v /= 10u;
-    }
-    while (n > 0) out[i++] = tmp[--n];
-    out[i] = '\0';
-    return i;
-}
-
-static void g_itoa_pad(uint32_t v, char *out, int width) {
-    char tmp[12];
-    int n = g_utoa(v, tmp);
-    int pad = width - n;
-    int p = 0;
-    while (pad-- > 0) out[p++] = ' ';
-    for (int i = 0; i < n; i++) out[p++] = tmp[i];
-    out[p] = '\0';
-}
-
-static int g_contains_nocase(const char *haystack, const char *needle) {
-    int nl = g_strlen(needle);
-    if (nl == 0) return 1;
-    for (int i = 0; haystack[i]; i++) {
-        int k = 0;
-        while (k < nl && haystack[i + k] &&
-               g_lower((unsigned char)haystack[i + k]) ==
-               g_lower((unsigned char)needle[k])) {
-            k++;
-        }
-        if (k == nl) return 1;
-    }
-    return 0;
-}
-
-static int g_point_in(const ui_rect *r, int x, int y) {
-    return x >= r->x && x < r->x + r->w && y >= r->y && y < r->y + r->h;
-}
-
-static void gui_delay_ms(uint32_t ms) {
-    uint32_t start = net_now_ms();
-    while (net_now_ms() - start < ms) {
-        __asm__ volatile ("pause");
-    }
-}
-
-/* ============================================================
- * 鼠标光标
- * ============================================================ */
-
-static const char *gui_cursor_img[GUI_CURSOR_H] = {
-    "X...............",
-    "XX..............",
-    "XWX.............",
-    "XWWX............",
-    "XWWWX...........",
-    "XWWWWX..........",
-    "XWWWWWX.........",
-    "XWWWWWWX........",
-    "XWWWWWWWX.......",
-    "XWWWWWWWWX......",
-    "XWWWWWWWWWX.....",
-    "XWWWWWWWWWWX....",
-    "XWWWWWWWWWWWX...",
-    "XWWWWWWWWWWWWX..",
-    "XWWWWWXXXXXXXX..",
-    "XWWXWWX.........",
-    "XWX.XWWX........",
-    "XX..XWWX........",
-    "X....XWWX.......",
-    ".....XWWX.......",
-    "......XWWX......",
-    "......XWWX......",
-    ".......XX.......",
-    "................"
-};
-
-static uint32_t g_cursor_save[GUI_CURSOR_W * GUI_CURSOR_H];
-static int g_cursor_x = -1;
-static int g_cursor_y = -1;
-
-static void gui_cursor_draw(int x, int y) {
-    if (x + GUI_CURSOR_W > gW) x = gW - GUI_CURSOR_W;
-    if (y + GUI_CURSOR_H > gH) y = gH - GUI_CURSOR_H;
-    if (x < 0) x = 0;
-    if (y < 0) y = 0;
-
-    vbe_save_rect((uint16_t)x, (uint16_t)y, GUI_CURSOR_W, GUI_CURSOR_H, g_cursor_save);
-
-    for (int row = 0; row < GUI_CURSOR_H; row++) {
-        const char *line = gui_cursor_img[row];
-        for (int col = 0; col < GUI_CURSOR_W; col++) {
-            char c = line[col];
-            if (c == 'X') {
-                vbe_put_pixel((uint16_t)(x + col), (uint16_t)(y + row), 0x000000);
-            } else if (c == 'W') {
-                vbe_put_pixel((uint16_t)(x + col), (uint16_t)(y + row), 0xFFFFFF);
-            }
-        }
-    }
-
-    g_cursor_x = x;
-    g_cursor_y = y;
-}
-
-static void gui_cursor_erase(void) {
-    if (g_cursor_x < 0) return;
-    vbe_restore_rect((uint16_t)g_cursor_x, (uint16_t)g_cursor_y,
-                     GUI_CURSOR_W, GUI_CURSOR_H, g_cursor_save);
-    g_cursor_x = -1;
-}
-
-static void gui_mouse_update(void) {
-    int8_t dx = 0;
-    int8_t dy = 0;
-    int8_t wheel = 0;
-    uint8_t buttons = 0;
-
-    g_mclicked = 0;
-    g_rclicked = 0;
-    g_mreleased = 0;
-    g_mmoved = 0;
-    g_mwheel = 0;
-
-    if (g_mx == 0 && g_my == 0) {
-        g_mx = gW / 2;
-        g_my = gH / 2;
-    }
-
-    while (ps2_mouse_poll_ex(&dx, &dy, &buttons, &wheel)) {
-        if (dx != 0 || dy != 0) {
-            g_mx += dx;
-            g_my += dy;
-            g_mmoved = 1;
-
-            if (g_mx < 0) g_mx = 0;
-            if (g_my < 0) g_my = 0;
-            if (g_mx > gW - GUI_CURSOR_W) g_mx = gW - GUI_CURSOR_W;
-            if (g_my > gH - GUI_CURSOR_H) g_my = gH - GUI_CURSOR_H;
-        }
-
-        if (wheel != 0) {
-            g_mwheel += wheel;
-        }
-
-        int was_down = g_mdown;
-        g_mdown = (buttons & 1u) ? 1 : 0;
-        if (g_mdown && !was_down) g_mclicked = 1;
-
-        /* 右键是独立的上升沿：桌面菜单由它触发，左键不再代替 */
-        int was_r = g_mdown_r;
-        g_mdown_r = (buttons & 2u) ? 1 : 0;
-        if (g_mdown_r && !was_r) g_rclicked = 1;
-
-        if (!g_mdown && was_down) g_mreleased = 1;
-    }
-}
-
-/* ============================================================
- * GUI 键盘：禁用 IRQ1，改为单一读者轮询
- * ------------------------------------------------------------
- * 8042 的输出缓冲只有一个字节，键盘中断和鼠标轮询同时在读会
- * 互相抢数据（鼠标 dx/dy 被当成扫描码写进键盘环形缓冲，表现为
- * 按一个键冒出完全无关的字符）。TTY 不轮询鼠标所以看不到这个
- * 问题；GUI 需要鼠标，因此这里把键盘也改成轮询，保证：
- *   - AUX=0 的字节只由 gui_kb_read 读
- *   - AUX=1 的字节只由 ps2_mouse_poll 读
- * 进入 GUI 时屏蔽 IRQ1，退出时恢复原 IMR 并清空残留。
- * ============================================================ */
-
-static uint8_t g_kb_saved_imr = 0;
-/* GUI 独占键盘期间 IRQ1 被屏蔽，按键只能由 gui_kb_read 轮询 8042
- * 取得；预装应用（如 VizCormin）通过 SlysKernelApi 读键盘时必须
- * 走同一条路径，否则在图形会话里一个键都收不到。 */
-static int g_kb_owned = 0;
-
-static void gui_kb_begin(void) {
-    g_kb_saved_imr = inb(0x21);
-    outb(0x21, (uint8_t)(g_kb_saved_imr | 0x02));   /* mask IRQ1 */
-    g_kb_owned = 1;
-
-    /* 丢掉 8042 输出缓冲里残留的键盘字节 */
-    for (int i = 0; i < 64; i++) {
-        uint8_t status = inb(0x64);
-        if ((status & 0x01) == 0) break;
-        (void)inb(0x60);
-    }
-
-    kb_flush();
-}
-
-static void gui_kb_end(void) {
-    /* 退出 GUI 前关掉鼠标数据上报。TTY 没有任何鼠标消费者，鼠标包会
-     * 持续占满 8042 唯一的输出缓冲，键盘中断随即读不到数据，表现为
-     * "从 GUI 退出到终端后键盘完全没反应"。ISR 里也补了丢弃鼠标字节
-     * 的兜底，这里主动关闭是为了从源头上不再产生包。 */
-    ps2_mouse_disable();
-    kb_flush();
-    outb(0x21, g_kb_saved_imr);
-    g_kb_owned = 0;
-}
-
-static char gui_kb_read(void) {
-    for (int i = 0; i < 16; i++) {
-        uint8_t status = inb(0x64);
-        if ((status & 0x21) != 0x01) break;   /* 没有键盘数据 */
-
-        uint8_t sc = inb(0x60);
-        char c = scancode_to_char(sc);
-        if (c != 0) return c;
-    }
-    return 0;
-}
-
-int gui_keyboard_owned(void) {
-    return g_kb_owned;
-}
-
-char gui_keyboard_poll(void) {
-    if (!g_kb_owned) return 0;
-    /* 鼠标上报没有中断、完全靠 GUI 主循环轮询。预装应用独占屏幕时
-     * 主循环停摆，鼠标包会持续占满 8042 唯一的数据缓冲。
-     *
-     * 这里不能直接 inb 丢弃 AUX 字节：鼠标驱动用跨调用的相位状态
-     * （g_mouse_phase）组包，绕过它丢字节会让相位永久错位，模块退出
-     * 后 GUI 的鼠标就再也不动。必须交给 ps2_mouse_poll_ex 消费，
-     * 同时把位移累加进桌面光标，保证状态机与坐标都保持连续。 */
-    for (int i = 0; i < 32; i++) {
-        uint8_t status = inb(0x64);
-        if ((status & 0x01) == 0) break;
-
-        if ((status & 0x20) != 0) {
-            int8_t mdx = 0;
-            int8_t mdy = 0;
-            int8_t mw = 0;
-            uint8_t mb = 0;
-            if (ps2_mouse_poll_ex(&mdx, &mdy, &mb, &mw) != 0) {
-                g_mx += mdx;
-                g_my += mdy;
-                if (g_mx < 0) g_mx = 0;
-                if (g_my < 0) g_my = 0;
-                if (g_mx > gW - GUI_CURSOR_W) g_mx = gW - GUI_CURSOR_W;
-                if (g_my > gH - GUI_CURSOR_H) g_my = gH - GUI_CURSOR_H;
-                g_mmoved = 1;
-            }
-            continue;
-        }
-
-        char c = scancode_to_char(inb(0x60));
-        if (c != 0) return c;
-    }
-    return 0;
-}
-
-/* ============================================================
- * 基础绘制辅助
- * ============================================================ */
-
-static void gui_text_center(const char *s, int cx, int y, uint32_t color) {
-    int w = vbe_utf8_width_px(s);
-    vbe_draw_utf8_transparent((uint16_t)(cx - w / 2), (uint16_t)y, s, color);
-}
-
-/* 截断绘制的文本：max_chars 是"16px 字符格"数。
- * 中文占两格，按显示宽度截断，不会把汉字劈成半个序列。 */
-static void gui_text_n(int x, int y, const char *s, int max_chars, uint32_t color) {
-    if (max_chars < 1) return;
-    int max_px = max_chars * 16;
-    int cx = x;
-    int i = 0;
-
-    while (s[i]) {
-        uint32_t cp = 0;
-        int used = utf8_decode((const uint8_t *)s + i, 4, &cp);
-        if (used <= 0) { i++; continue; }
-
-        int w = utf32_width(cp);
-        if (w == 0) { i += used; continue; }
-        if ((cx - x) + w * 16 > max_px) break;
-
-        if (w == 2) {
-            vbe_draw_cjk_transparent((uint16_t)cx, (uint16_t)y,
-                                     cp, color);
-        } else {
-            char one[2];
-            one[0] = (char)cp;
-            one[1] = '\0';
-            ui_text_transparent(cx, y, one, color);
-        }
-        cx += w * 16;
-        i += used;
-    }
-}
-
-/* ============================================================
- * 输入法候选窗（GUI）
- * ------------------------------------------------------------
- * 与终端里的行内候选栏不同，这里是浮在窗口之上的独立面板：
- * 深色圆角 + 阴影感边框 + 首选高亮，位置跟随文本光标。
- * 锚点由各窗口在渲染时写入（编辑器的插入点、终端的输入位置），
- * 面板在脏矩形重绘的最后一层绘制，所以永远不会被窗口盖住。
- * ============================================================ */
-static int g_ime_ax = 240;
-static int g_ime_ay = 220;
-
-/* 布局缓存：每次重绘前按候选文字的实际像素宽度算一遍。
- * 1 个字和 2 个字的候选块宽度不同，后面的块必须跟着顺延，
- * 否则左边的 72px 固定框会把"世界"这种双字词挤出去。 */
-static int  g_ime_block_x[IME_PAGE_SIZE];
-static int  g_ime_block_w[IME_PAGE_SIZE];
-static char g_ime_block_text[IME_PAGE_SIZE][16];
-static int  g_ime_block_count;
-static int  g_ime_panel_w;
-
-static int gui_ime_active(void) {
-    return ime_chinese_enabled() && ime_composing()[0] != '\0';
-}
-
-static void gui_ime_layout(void) {
-    int n = ime_candidate_count();
-    if (n > IME_PAGE_SIZE) n = IME_PAGE_SIZE;
-
-    g_ime_block_count = 0;
-    int x = 10;
-    for (int i = 0; i < n; i++) {
-        int len = ime_candidate_text(i, g_ime_block_text[i],
-                                     (int)sizeof(g_ime_block_text[i]));
-        if (len <= 0) break;
-        int tw = vbe_utf8_width_px(g_ime_block_text[i]);
-        /* 左右内边距 + 序号一字符 + 序号与文字之间的间距 */
-        int w = 10 + 16 + 6 + tw + 10;
-        g_ime_block_x[i] = x;
-        g_ime_block_w[i] = w;
-        x += w + 6;
-        g_ime_block_count++;
-    }
-
-    int panel = (g_ime_block_count > 0) ? (x - 6 + 10) : 0;
-
-    /* 拼音串可能比候选还长，面板不能比它窄，否则页码会压住拼音 */
-    const char *comp = ime_composing();
-    int comp_w = vbe_utf8_width_px(comp) + 90;
-    if (panel < comp_w) panel = comp_w;
-    if (panel < 184) panel = 184;
-
-    g_ime_panel_w = panel;
-}
-
-static ui_rect gui_ime_rect(void) {
-    gui_ime_layout();
-
-    int w = g_ime_panel_w;
-    int h = 86;
-    if (w > gW - 20) w = gW - 20;
-
-    int x = g_ime_ax;
-    int y = g_ime_ay;
-    if (x + w > gW - 10) x = gW - 10 - w;
-    if (x < 10) x = 10;
-    if (y + h > gH - 12) y = g_ime_ay - h - 52;
-    if (y < 10) y = 10;
-    return (ui_rect){ x, y, w, h };
-}
-
-static void gui_ime_render(void) {
-    if (!gui_ime_active()) return;
-    ui_rect p = gui_ime_rect();
-
-    /* 用两层圆角叠出边框，不额外依赖描边接口 */
-    ui_round_fill((ui_rect){ p.x - 2, p.y - 2, p.w + 4, p.h + 4 }, 15, C_BORDER);
-    ui_round_fill(p, 13, 0x121A26);
-
-    /* 拼音编辑串 */
-    ui_text_transparent(p.x + 15, p.y + 7, ime_composing(), C_DIM);
-
-    /* 页码：页数很少，单位数拼接足够 */
-    if (ime_candidate_pages() > 1) {
-        char pg[8];
-        int q = 0;
-        pg[q++] = (char)('0' + ime_candidate_page() + 1);
-        pg[q++] = '/';
-        pg[q++] = (char)('0' + ime_candidate_pages());
-        pg[q] = '\0';
-        ui_text_transparent(p.x + p.w - 52, p.y + 7, pg, C_DIM);
-    }
-
-    for (int i = 0; i < g_ime_block_count; i++) {
-        int bx = p.x + g_ime_block_x[i];
-        int by = p.y + 33;
-        int bw = g_ime_block_w[i];
-        int sel = (i == 0);
-        uint32_t bg = sel ? C_ACCENT2 : C_PANEL3;
-
-        ui_round_fill((ui_rect){ bx, by, bw, 44 }, 9, bg);
-
-        char idx[2];
-        idx[0] = (char)('1' + i);
-        idx[1] = '\0';
-        ui_text_transparent(bx + 10, by + 6, idx, sel ? C_TEXT : C_DIM);
-        vbe_draw_utf8_px((uint16_t)(bx + 32), (uint16_t)(by + 6),
-                         g_ime_block_text[i], C_TEXT, bg);
-    }
-}
-
-
-/* 自动换行文本（行高 34）：宽度不够时按空格断行，返回占用行数。
- * 界面里的提示/消息统一走这里，避免每处单独估算字符宽度。 */
-static int gui_text_wrap(int x, int y, int max_w, const char *s,
-                         uint32_t color, int max_lines) {
-    return ui_text_wrap(x, y, max_w, 34, s, color, max_lines);
-}
-
-static void gui_ring(int cx, int cy, int radius, int thickness, uint32_t color) {
-    if (radius <= 0) return;
-    int inner = radius - thickness;
-    if (inner < 0) inner = 0;
-    int r2 = radius * radius;
-    int i2 = inner * inner;
-
-    for (int y = -radius; y <= radius; y++) {
-        for (int x = -radius; x <= radius; x++) {
-            int d2 = x * x + y * y;
-            if (d2 <= r2 && d2 >= i2) {
-                vbe_put_pixel((uint16_t)(cx + x), (uint16_t)(cy + y), color);
-            }
-        }
-    }
-}
-
-static void gui_avatar(int cx, int cy, int radius, const char *name, uint32_t c1, uint32_t c2) {
-    /* 配置了头像图片就优先使用：整屏重绘时会命中图片缓存，
-     * 不会每帧重新解码。图片缺失或格式不支持时回退到首字母。 */
-    const char *avatar = system_cfg_avatar();
-    if (avatar && avatar[0]) {
-        int handle = image_load(avatar);
-        if (handle >= 0 && radius > 3) {
-            gui_ring(cx, cy, radius, 2, C_ACCENT);
-            image_draw_circle(handle, cx, cy, radius - 2);
-            return;
-        }
-    }
-
-    ui_rect r;
-    r.x = cx - radius;
-    r.y = cy - radius;
-    r.w = radius * 2;
-    r.h = radius * 2;
-
-    ui_round_fill(r, radius, c2);
-    ui_rect inner;
-    inner.x = r.x + 3;
-    inner.y = r.y + 3;
-    inner.w = r.w - 6;
-    inner.h = r.h - 6;
-    ui_round_gradient(inner, radius - 3, c1, c2);
-
-    char initial[2];
-    initial[0] = (name && name[0]) ? name[0] : '?';
-    if (initial[0] >= 'a' && initial[0] <= 'z') {
-        initial[0] = (char)(initial[0] - 'a' + 'A');
-    }
-    initial[1] = '\0';
-    ui_text_transparent(cx - 8, cy - 16, initial, 0xFFFFFF);
-}
-
-/* ---------- hover 控件追踪 ----------
- * 局部重绘需要知道"鼠标移到某个控件上"到底影响哪些像素。渲染每个
- * 可交互控件时把它的矩形登记进来，下一帧鼠标移动就只重绘"旧位置
- * 命中的控件 + 新位置命中的控件"，而不是整个窗口或整个屏幕。
- * 重复登记（同一控件被多个脏矩形各渲一次）会被去重。 */
-
-#define GUI_HUNT_MAX 192
-
-static ui_rect g_hunt[GUI_HUNT_MAX];
-static int g_hunt_count = 0;
-static ui_rect g_hunt_prev[GUI_HUNT_MAX];
-static int g_hunt_prev_count = 0;
-
-static void hunt_reset(void) {
-    g_hunt_count = 0;
-}
-
-static void hunt_add(ui_rect r) {
-    if (r.w <= 0 || r.h <= 0) return;
-
-    for (int i = 0; i < g_hunt_count; i++) {
-        const ui_rect *e = &g_hunt[i];
-        if (e->x == r.x && e->y == r.y && e->w == r.w && e->h == r.h) return;
-    }
-    if (g_hunt_count >= GUI_HUNT_MAX) return;
-
-    g_hunt[g_hunt_count++] = r;
-}
-
-static void hunt_snapshot(void) {
-    g_hunt_prev_count = g_hunt_count;
-    for (int i = 0; i < g_hunt_count; i++) {
-        g_hunt_prev[i] = g_hunt[i];
-    }
-}
-
-static void gui_button(ui_rect r, const char *label, int hover, int primary) {
-    hunt_add(r);
-
-    if (primary) {
-        ui_round_gradient(r, 12,
-                          hover ? 0x6AA4FF : C_ACCENT,
-                          hover ? 0x3B7BE8 : C_ACCENT2);
-    } else {
-        ui_round_panel(r, 12, hover ? C_ACCENT : C_BORDER,
-                       hover ? 0x1B2836 : C_PANEL2);
-    }
-
-    int tw = vbe_utf8_width_px(label);
-    vbe_draw_utf8_transparent((uint16_t)(r.x + (r.w - tw) / 2),
-                              (uint16_t)(r.y + (r.h - 32) / 2),
-                              label, primary ? 0xFFFFFF : C_TEXT);
-}
-
-/* ---------- 图标（全部几何绘制，不依赖图片资源） ---------- */
-
-static void icon_folder(int x, int y, int s, uint32_t color) {
-    int tab_w = s / 2;
-    int tab_h = s / 5;
-    ui_round_fill((ui_rect){ x, y + 2, tab_w, tab_h + 4 }, 3, color);
-    ui_round_fill((ui_rect){ x, y + tab_h, s, s - tab_h - 2 }, 4, color);
-    ui_hline(x + 4, y + tab_h + 4, s - 8, 0xFFFFFF);
-}
-
-static void icon_file(int x, int y, int s, uint32_t color) {
-    int fold = s / 4;
-    ui_round_fill((ui_rect){ x + 2, y + 2, s - 4, s - 4 }, 4, color);
-    /* 折角 */
-    for (int i = 0; i < fold; i++) {
-        ui_hline(x + s - 2 - fold + i, y + 2 + i, fold - i, 0x0E1620);
-    }
-    for (int k = 0; k < 3; k++) {
-        ui_hline(x + 6, y + s / 2 + k * 4, s - 14, 0x0E1620);
-    }
-}
-
-static void icon_editor(int x, int y, int s, uint32_t color) {
-    /* 文档 + 一支笔 */
-    ui_round_fill((ui_rect){ x + 2, y + 2, s - 8, s - 4 }, 4, color);
-    for (int k = 0; k < 3; k++) {
-        ui_hline(x + 7, y + 7 + k * 5, s - 16, 0x0E1620);
-    }
-    int px = x + s - 9;
-    int py = y + s - 10;
-    for (int k = 0; k < 7; k++) {
-        ui_line(px + k, py - k, px + k + 3, py - k + 3, 0xFBBF24);
-    }
-}
-
-static void icon_search(int cx, int cy, int radius, uint32_t color) {
-    gui_ring(cx, cy, radius, 3, color);
-    for (int k = 0; k < radius; k++) {
-        ui_line(cx + radius - 2 + k / 2, cy + radius - 2 + k / 2,
-                cx + radius + 2 + k / 2, cy + radius + 2 + k / 2, color);
-    }
-}
-
-static void icon_settings(int x, int y, int s, uint32_t color) {
-    int cx = x + s / 2;
-    int cy = y + s / 2;
-    int r = s / 3;
-    gui_ring(cx, cy, r, 3, color);
-    for (int k = 0; k < 8; k++) {
-        int dx = 0;
-        int dy = 0;
-        int d = k % 4;
-        if (d == 0) dy = -1;
-        else if (d == 1) { dx = 1; }
-        else if (d == 2) dy = 1;
-        else dx = -1;
-
-        int bx = cx + dx * r - 2;
-        int by = cy + dy * r - 2;
-        ui_round_fill((ui_rect){ bx + dx * 3, by + dy * 3, 6, 6 }, 2, color);
-    }
-    ui_round_fill((ui_rect){ cx - 2, cy - 2, 4, 4 }, 2, color);
-}
-
-static void icon_power(int cx, int cy, int radius, uint32_t color) {
-    gui_ring(cx, cy, radius, 3, color);
-    /* 经典电源符号：圆环 + 从顶部伸入圆心的竖线 */
-    vbe_fill_rect((uint16_t)(cx - 1), (uint16_t)(cy - radius - 3),
-                  3, (uint16_t)(radius / 2 + 3), color);
-}
-
-static void icon_terminal(int x, int y, int s, uint32_t color) {
-    ui_round_panel((ui_rect){ x, y, s, s }, 5, color, 0x0E1620);
-    ui_line(x + 6, y + 8, x + 11, y + s / 2, color);
-    ui_line(x + 11, y + s / 2, x + 6, y + s - 8, color);
-    ui_hline(x + 14, y + s - 9, s - 20, color);
-}
-
-static void icon_globe(int x, int y, int s, uint32_t color) {
-    /* 浏览器：圆环 + 赤道 + 一条经线 */
-    int cx = x + s / 2;
-    int cy = y + s / 2;
-    int r = s / 2 - 2;
-    gui_ring(cx, cy, r, 2, color);
-    ui_hline(cx - r, cy, r * 2 + 1, color);
-    ui_vline(cx, cy - r, r * 2 + 1, color);
-    ui_line(cx - r / 2, cy - r + 2, cx - r / 2, cy + r - 2, color);
-    ui_line(cx + r / 2, cy - r + 2, cx + r / 2, cy + r - 2, color);
-}
-
-static void icon_chart(int x, int y, int s, uint32_t color) {
-    /* 任务管理器：面板 + 三根递增的柱状条 */
-    int base = y + s - 5;
-    ui_round_panel((ui_rect){ x + 2, y + 2, s - 4, s - 4 }, 4, color, 0x0E1620);
-
-    int bw = (s - 14) / 4;
-    if (bw < 2) bw = 2;
-    int heights[3];
-    heights[0] = s / 3;
-    heights[1] = s / 2;
-    heights[2] = (s * 2) / 3;
-
-    for (int i = 0; i < 3; i++) {
-        int bx = x + 5 + i * (bw + 2);
-        vbe_fill_rect((uint16_t)bx, (uint16_t)(base - heights[i]),
-                      (uint16_t)bw, (uint16_t)heights[i], color);
-    }
-    ui_hline(x + 4, base, s - 8, color);
-}
-
-static void icon_fault(int x, int y, int s, uint32_t color) {
-    /* SylFault：警示三角 + 感叹号，和普通应用的图标明显区分 */
-    int cx = x + s / 2;
-    int top = y + 3;
-    int bot = y + s - 5;
-    int left = x + 3;
-    int right = x + s - 4;
-
-    ui_line(cx, top, left, bot, color);
-    ui_line(cx, top, right, bot, color);
-    ui_line(left, bot, right, bot, color);
-
-    int bar_h = (s * 2) / 5;
-    ui_vline(cx, top + s / 4, bar_h, color);
-    ui_round_fill((ui_rect){ cx - 2, bot - 7, 4, 4 }, 2, color);
-}
-
-static void icon_calc(int x, int y, int s, uint32_t color) {
-    /* 计算器：外框 + 顶部显示屏 + 2x2 按键 */
-    ui_round_panel((ui_rect){ x, y, s, s }, 4, color, 0x0E1620);
-
-    int pad = s / 8;
-    if (pad < 2) pad = 2;
-    int screen_h = s / 5;
-
-    vbe_fill_rect((uint16_t)(x + pad), (uint16_t)(y + pad),
-                  (uint16_t)(s - pad * 2), (uint16_t)screen_h, color);
-
-    int bw = (s - pad * 3) / 2;
-    int bh = (s - pad * 3 - screen_h) / 2;
-    for (int r = 0; r < 2; r++) {
-        for (int c = 0; c < 2; c++) {
-            vbe_fill_rect((uint16_t)(x + pad + c * (bw + pad)),
-                          (uint16_t)(y + pad * 2 + screen_h + r * (bh + pad)),
-                          (uint16_t)bw, (uint16_t)bh, color);
-        }
-    }
-}
-
-static void icon_net(int x, int y, int s, uint32_t color) {
-    /* 控制中心：三条滑杆 + 旋钮 */
-    for (int i = 0; i < 3; i++) {
-        int cy = y + 6 + i * ((s - 12) / 2);
-        ui_hline(x + 4, cy, s - 8, color);
-        int kx = x + 5 + ((i * 11 + 7) % (s - 12));
-        ui_round_fill((ui_rect){ kx - 3, cy - 3, 7, 7 }, 3, color);
-    }
-}
-
-static void icon_close(int x, int y, int s, uint32_t color) {
-    for (int k = 0; k < 2; k++) {
-        ui_line(x + 5 + k, y + 5, x + s - 5 + k, y + s - 5, color);
-        ui_line(x + s - 5 + k, y + 5, x + 5 + k, y + s - 5, color);
-    }
-}
-
-static void icon_minimize(int x, int y, int s, uint32_t color) {
-    vbe_fill_rect((uint16_t)(x + 4), (uint16_t)(y + s - 8),
-                  (uint16_t)(s - 8), 2, color);
-}
-
-static void icon_maximize(int x, int y, int s, uint32_t color) {
-    ui_hline(x + 4, y + 4, s - 8, color);
-    ui_hline(x + 4, y + s - 5, s - 8, color);
-    ui_vline(x + 4, y + 4, s - 8, color);
-    ui_vline(x + s - 5, y + 4, s - 8, color);
-}
-
-static void icon_restore(int x, int y, int s, uint32_t color) {
-    /* 两个错位方框，表示"还原" */
-    ui_hline(x + 7, y + 4, s - 10, color);
-    ui_hline(x + 7, y + s - 7, s - 10, color);
-    ui_vline(x + 7, y + 4, s - 10, color);
-    ui_vline(x + s - 3, y + 4, s - 10, color);
-
-    ui_hline(x + 4, y + 8, s - 11, color);
-    ui_hline(x + 4, y + s - 4, s - 10, color);
-    ui_vline(x + 4, y + 8, s - 11, color);
-}
-
-/* ============================================================
- * 背景与时钟
- * ============================================================ */
-
-/* 背景纯色填充的并行分片：BSP 与 AP 各写自己的行区间。
- * 目标区域已经与裁剪矩形求交，vbe_fill_rect_rows 内部还会再夹一次，
- * 保证局部重绘时不会把脏矩形之外的桌面涂掉。 */
-static volatile int g_bg_x0 = 0;
-static volatile int g_bg_x1 = 0;
-static volatile int g_bg_y0 = 0;
-static volatile int g_bg_y1 = 0;
-
-static void gui_bg_fill_slice(uint32_t index, uint32_t slices) {
-    if (slices == 0) return;
-
-    int y0 = g_bg_y0;
-    int y1 = g_bg_y1;
-    int h = y1 - y0;
-    if (h <= 0) return;
-
-    int a = y0 + (h * (int)index) / (int)slices;
-    int b = y0 + (h * (int)(index + 1)) / (int)slices;
-    if (b <= a) return;
-
-    vbe_fill_rect_rows((uint16_t)g_bg_x0, (uint16_t)(g_bg_x1 - g_bg_x0),
-                       (uint16_t)a, (uint16_t)b, C_BG);
-}
-
-static void gui_background(void) {
-    /* 配置了壁纸就直接拉伸铺满屏幕；绘制遵守当前裁剪矩形，
-     * 因此局部重绘只解码一次缓存并只写脏矩形覆盖的像素。 */
-    const char *wallpaper = system_cfg_wallpaper();
-    if (wallpaper && wallpaper[0]) {
-        int handle = image_load(wallpaper);
-        if (handle >= 0) {
-            image_draw_scaled(handle, 0, 0, gW, gH);
-
-            ui_rect strip = { 0, gH - 3, gW, 3 };
-            ui_gradient_v(strip, 0x1B3550, 0x0C1420);
-            return;
-        }
-    }
-
-    int grad_h = gH / 3;
-
-    /* 上 1/3：垂直渐变，逐行颜色不同，保留串行实现 */
-    ui_rect top = { 0, 0, gW, grad_h };
-    ui_gradient_v(top, 0x0D1622, C_BG);
-
-    /* 下 2/3：纯色背景。按行切片交给所有核并行填充；面积太小
-     * （小脏矩形）时直接单核完成，避免为几行像素付一次 IPI 往返。 */
-    int fx0 = 0;
-    int fy0 = grad_h;
-    int fx1 = gW;
-    int fy1 = gH;
-    if (vbe_clip_active()) {
-        int cx = 0, cy = 0, cw = 0, ch = 0;
-        vbe_get_clip(&cx, &cy, &cw, &ch);
-        if (cx > fx0) fx0 = cx;
-        if (cy > fy0) fy0 = cy;
-        if (cx + cw < fx1) fx1 = cx + cw;
-        if (cy + ch < fy1) fy1 = cy + ch;
-    }
-
-    if (fx1 > fx0 && fy1 > fy0) {
-        g_bg_x0 = fx0;
-        g_bg_x1 = fx1;
-        g_bg_y0 = fy0;
-        g_bg_y1 = fy1;
-
-        int area = (fx1 - fx0) * (fy1 - fy0);
-
-        /* 只有"全屏重绘 + 面积足够大"才并行。
-         * 局部脏矩形（拖动窗口、悬停高亮、任务管理器每秒刷新）走串行：
-         * 每次并行都要发 0xF0 IPI 并自旋等 AP 唤醒，在 QEMU TCG 下这段
-         * 同步延迟远大于几万像素的填充时间，每帧多次并行会把 GUI 拖卡。 */
-        if (!vbe_clip_active() && area >= 400000 && smp_parallel_available()) {
-            uint32_t slices = 12u;
-            smp_parallel_for(slices, gui_bg_fill_slice, slices);
-        } else {
-            gui_bg_fill_slice(0, 1);
-        }
-    }
-
-    /* 裁剪生效时（局部重绘）跳过落在裁剪外的网格线，
-     * 否则每条线都要逐像素走一遍再被裁掉。 */
-    int cx = 0;
-    int cy = 0;
-    int cw = 0;
-    int ch = 0;
-    int clipped = vbe_clip_active();
-    if (clipped) vbe_get_clip(&cx, &cy, &cw, &ch);
-
-    for (int x = GUI_TASKBAR_W; x < gW; x += 64) {
-        if (clipped && (x < cx || x >= cx + cw)) continue;
-        ui_vline(x, 0, gH, 0x111A26);
-    }
-    for (int y = 0; y < gH; y += 64) {
-        if (clipped && (y < cy || y >= cy + ch)) continue;
-        ui_hline(GUI_TASKBAR_W, y, gW - GUI_TASKBAR_W, 0x111A26);
-    }
-
-    /* 底部一条很淡的强调色光带，避免大面积纯色显得空 */
-    ui_rect strip = { 0, gH - 3, gW, 3 };
-    ui_gradient_v(strip, 0x1B3550, 0x0C1420);
-}
-
-/* ============================================================
- * CMOS RTC
- * ------------------------------------------------------------
- * 系统把 CMOS 时间当作 UTC 存储，桌面时钟显示 UTC + 时区偏移。
- * 设置页允许直接调整小时/分钟，写回前必须置 0x0B 的 SET 位冻结
- * 计时，否则写入过程中可能跨秒进位，写进去的值会莫名其妙差一。
- * BCD/二进制、12/24 小时由 0x0B 决定，两条路径都要处理。
- * ============================================================ */
-
-static uint8_t rtc_reg_read(uint8_t reg) {
-    outb(0x70, reg);
-    return inb(0x71);
-}
-
-static void rtc_reg_write(uint8_t reg, uint8_t value) {
-    outb(0x70, reg);
-    outb(0x71, value);
-}
-
-static int rtc_wait_ready(void) {
-    for (int guard = 0; guard < 100000; guard++) {
-        if ((rtc_reg_read(0x0A) & 0x80) == 0) return 1;
-    }
-    return 0;
-}
-
-static int rtc_bcd_to_bin(uint8_t v) {
-    return ((v >> 4) & 0x0F) * 10 + (v & 0x0F);
-}
-
-static uint8_t rtc_bin_to_bcd(int v) {
-    return (uint8_t)(((v / 10) << 4) | (v % 10));
-}
-
-/* 读取 UTC 时分秒。任一项可为 NULL。返回 1 成功。 */
-static int rtc_get_utc(int *hour, int *minute, int *second) {
-    if (!rtc_wait_ready()) return 0;
-
-    uint8_t reg_b = rtc_reg_read(0x0B);
-    int bcd = !(reg_b & 0x04);
-    int h24 = (reg_b & 0x02) != 0;
-
-    uint8_t s = rtc_reg_read(0x00);
-    uint8_t m = rtc_reg_read(0x02);
-    uint8_t h = rtc_reg_read(0x04);
-
-    int pm = 0;
-    if (!h24) {
-        pm = (h & 0x80) != 0;
-        h = (uint8_t)(h & 0x7F);
-    }
-    if (bcd) {
-        s = (uint8_t)rtc_bcd_to_bin(s);
-        m = (uint8_t)rtc_bcd_to_bin(m);
-        h = (uint8_t)rtc_bcd_to_bin(h);
-    }
-    if (!h24) {
-        h = (uint8_t)(h % 12);
-        if (pm) h = (uint8_t)(h + 12);
-    }
-
-    if (hour) *hour = h % 24;
-    if (minute) *minute = m % 60;
-    if (second) *second = s % 60;
-    return 1;
-}
-
-/* 写入 UTC 时分（秒保持不变）。返回 1 成功。 */
-static int rtc_set_utc(int hour, int minute) {
-    if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return 0;
-    if (!rtc_wait_ready()) return 0;
-
-    uint8_t reg_b = rtc_reg_read(0x0B);
-    int bcd = !(reg_b & 0x04);
-    int h24 = (reg_b & 0x02) != 0;
-
-    rtc_reg_write(0x0B, (uint8_t)(reg_b | 0x80));   /* SET = 1，停止更新 */
-
-    uint8_t hour_value;
-    if (h24) {
-        hour_value = bcd ? rtc_bin_to_bcd(hour) : (uint8_t)hour;
-    } else {
-        int pm = hour >= 12;
-        int h12 = hour % 12;
-        if (h12 == 0) h12 = 12;
-        hour_value = bcd ? rtc_bin_to_bcd(h12) : (uint8_t)h12;
-        if (pm) hour_value = (uint8_t)(hour_value | 0x80);
-    }
-
-    rtc_reg_write(0x04, hour_value);
-    rtc_reg_write(0x02, bcd ? rtc_bin_to_bcd(minute) : (uint8_t)minute);
-    rtc_reg_write(0x0B, reg_b);                      /* SET = 0，恢复更新 */
-    return 1;
-}
-
-/* 本地时间 = RTC(UTC) + 配置时区 */
-static void gui_clock_local(int *hour, int *minute) {
-    int h = 0;
-    int m = 0;
-
-    if (!rtc_get_utc(&h, &m, 0)) {
-        *hour = 0;
-        *minute = 0;
-        return;
-    }
-
-    int total = h * 60 + m + system_cfg_timezone() * 60;
-    total %= 24 * 60;
-    if (total < 0) total += 24 * 60;
-
-    *hour = total / 60;
-    *minute = total % 60;
-}
-
-static void gui_clock_text(char out[6]) {
-    int hour = 0;
-    int minute = 0;
-    gui_clock_local(&hour, &minute);
-
-    out[0] = (char)('0' + (hour / 10) % 10);
-    out[1] = (char)('0' + hour % 10);
-    out[2] = ':';
-    out[3] = (char)('0' + (minute / 10) % 10);
-    out[4] = (char)('0' + minute % 10);
-    out[5] = '\0';
-}
-
-/* "UTC+08:00" / "UTC-05:00"，cap 至少 10 字节 */
-static void gui_tz_text(char *out, int cap) {
-    int tz = system_cfg_timezone();
-    int n = 0;
-
-    if (cap < 10) {
-        if (cap > 0) out[0] = '\0';
-        return;
-    }
-
-    out[n++] = 'U';
-    out[n++] = 'T';
-    out[n++] = 'C';
-    if (tz < 0) {
-        out[n++] = '-';
-        tz = -tz;
-    } else {
-        out[n++] = '+';
-    }
-    out[n++] = (char)('0' + (tz / 10) % 10);
-    out[n++] = (char)('0' + tz % 10);
-    out[n++] = ':';
-    out[n++] = '0';
-    out[n++] = '0';
-    out[n] = '\0';
-}
 
 /* ============================================================
  * 账户视图与登录页
@@ -1241,13 +174,13 @@ struct GuiLoginState {
     int  blink;
 };
 
-/* 动态脏矩形（实现见文件后半部分）。
- * 登录页也要局部重绘，所以在使用点之前先声明。 */
-static void dirty_reset(void);
-static void dirty_add_padded(const ui_rect *r, int pad);
-static int  dirty_rect_count(void);
-static void dirty_rect_get(int index, ui_rect *out);
-static void dirty_swap_all(int old_cx, int old_cy);
+/* 文件管理器/桌面在定义之前就会用到的打开入口 */
+static int  gui_slyz_is_program(const char *path);
+static int  gui_app_open_path(const char *path);
+static int  gui_ext_is(const char *path, const char *ext);
+static int  gui_open_media(const char *path);
+
+/* 动态脏矩形由 gui_dwm.c 提供，登录页也要局部重绘。 */
 
 static ui_rect login_card_rect(void) {
     ui_rect r;
@@ -1287,8 +220,8 @@ static void gui_login_render(const struct GuiLoginState *st) {
 
     ui_rect card = login_card_rect();
     ui_shadow(card, 22, 12);
-    ui_round_gradient(card, 22, 0x18222F, 0x101720);
-    ui_round_panel(card, 22, 0x2E3D50, 0x0F1621);
+    ui_round_gradient(card, 22, C_PANEL2, C_PANEL);
+    ui_round_panel(card, 22, C_BORDER, C_WIN_BG);
 
     ui_rect accent_line = { card.x + 180, card.y - 2, 260, 4 };
     ui_round_fill(accent_line, 2, C_ACCENT);
@@ -1307,7 +240,7 @@ static void gui_login_render(const struct GuiLoginState *st) {
 
     /* 密码框 */
     ui_rect pw = login_pw_rect(&card);
-    ui_round_panel(pw, 12, C_ACCENT, 0x0C141E);
+    ui_round_panel(pw, 12, C_ACCENT, C_PANEL);
 
     char stars[65];
     for (int i = 0; i < st->pw_len; i++) stars[i] = '*';
@@ -1339,13 +272,15 @@ static void gui_login_render(const struct GuiLoginState *st) {
         gui_button(sw, "SWITCH USER", sw_hover, 0);
     }
 
-    gui_text_center("SaylterOS v0.3 Beta1", gW / 2, gH - 44, C_DIM);
+    gui_text_center("SaylterOS v0.3 Beta2", gW / 2, gH - 44, C_DIM);
 }
 
 static void login_try(struct GuiLoginState *st, int *logged_in) {
     const struct GuiUserView *u = &g_users[st->sel];
     int uid = auth_login_as(u->name, st->password);
     if (uid >= 0) {
+        /* 输入法词频按用户隔离：登录成功后再加载，避免沿用上一个用户。 */
+        ime_reload_user();
         *logged_in = 1;
         return;
     }
@@ -1361,7 +296,11 @@ static int gui_login_screen(void) {
     int logged_in = 0;
     int last_hover = -1;
 
+    g_perf_stage_us = net_now_us();
+    kserial_puts("[PERF] login enter\r\n");
+
     gui_load_users();
+    perf_boot_stage("users");
 
     st.sel = 0;
     st.pw_len = 0;
@@ -1373,8 +312,10 @@ static int gui_login_screen(void) {
     gui_mouse_update();
     gui_cursor_erase();
     gui_login_render(&st);
+    perf_boot_stage("login_render");
     gui_cursor_draw(g_mx, g_my);
     ui_swap();
+    perf_boot_stage("login_swap");
 
     while (!logged_in) {
         int need_full = 0;
@@ -1526,14 +467,14 @@ static void gui_startup_stage(const char *text, int value) {
 
     /* 轨道 + 渐变填充 + 右侧高光，不使用 ui_progress_draw：
      * 后者会在轨道右侧再打印一遍百分比，和下面的大号百分比重复。 */
-    ui_round_fill(bar, 9, 0x1B2634);
+    ui_round_fill(bar, 9, C_PANEL3);
     int fill_w = bar.w * value / 100;
     if (fill_w > 0) {
         ui_rect fill = { bar.x, bar.y, fill_w, bar.h };
         ui_round_fill(fill, 9, C_ACCENT2);
         if (fill_w > 8) {
             ui_round_fill((ui_rect){ bar.x + 3, bar.y + 3, fill_w - 6, bar.h / 2 }, 4,
-                          0x7FB2FF);
+                          C_ACCENT3);
         }
     }
 
@@ -1559,1528 +500,6 @@ static void gui_startup_screen(void) {
 }
 
 /* ============================================================
- * 桌面状态、窗口与任务栏
- * ============================================================ */
-
-struct GuiWindow {
-    int     open;
-    ui_rect r;
-    int     z;
-    int     maximized;
-    int     minimized;
-    ui_rect restore;      /* 最大化前的位置，用于还原 */
-};
-
-static struct GuiWindow g_wins[GUI_WIN_MAX];
-static int g_z_counter = 0;
-
-/* ---- 原生应用窗口状态 ---- */
-static const GuiExternalHost *g_ext_host = 0;
-static int    g_ext_space_w = 960;
-static int    g_ext_space_h = 620;
-static char   g_ext_title[32] = "App";
-static ui_rect g_ext_content;
-static int    g_ext_content_valid = 0;
-
-static void dirty_all(void);
-static void dirty_add(int x, int y, int w, int h);
-static int g_focus = -1;
-static int g_dragging = -1;
-static int g_drag_dx = 0;
-static int g_drag_dy = 0;
-
-/* 调整窗口大小：edge 用位标记，bit0 = 右边缘，bit1 = 下边缘，
- * 两者都置位就是右下角手柄。 */
-static int g_resizing = -1;
-static int g_resize_edge = 0;
-static ui_rect g_resize_start;
-static int g_resize_mx0 = 0;
-static int g_resize_my0 = 0;
-
-static int g_search_open = 0;
-static char g_search[64];
-static int g_search_len = 0;
-static int g_search_sel = 0;
-
-static int g_user_menu = 0;
-static int g_power_menu = 0;
-static int g_net_menu = 0;
-static int g_pending_action = ACT_NONE;
-
-struct GuiAppDef {
-    const char *name;
-    const char *desc;
-    int         win;
-    int         hidden;   /* 1 = 不在任务栏显示，只在搜索面板出现 */
-};
-
-static const struct GuiAppDef g_apps[GUI_APP_COUNT] = {
-    { "Files",        "Browse your home directory",      WIN_FILES,    0 },
-    { "Text Editor",  "Create and edit text files",       WIN_EDITOR,   0 },
-    { "Terminal",     "Run shell commands in a window",   WIN_TERM,     0 },
-    { "Browser",      "Browse http pages (HTML + CSS)",   WIN_BROWSER,  0 },
-    { "Settings",     "Boot mode, clock and account",     WIN_SETTINGS, 0 },
-    { "Task Manager", "CPU, memory, disk and processes",  WIN_TASKMGR,  0 },
-    { "Calculator",   "Arithmetic with divide-by-zero guard", WIN_CALC, 0 },
-    { "SylFault",     "Crash, dump and memory leak lab",  WIN_SLYZ,     1 }
-};
-
-/* 任务栏与启动器只排列可见应用；隐藏项不占槽位，因此 SylFault
- * 放在数组末尾不会在任务栏留下空档。 */
-static int gui_visible_app_count(void) {
-    int n = 0;
-    for (int i = 0; i < GUI_APP_COUNT; i++) {
-        if (!g_apps[i].hidden) n++;
-    }
-    return n;
-}
-
-/* 由文件管理器 / 编辑器 / 设置页实现（本文件后半部分） */
-static void gui_files_open(const char *path);
-static void gui_files_render(const ui_theme *t, ui_rect content);
-static void gui_files_click(ui_rect content, int x, int y);
-static void gui_files_key(char key);
-static int  gui_files_modal_active(void);
-static void gui_files_modal_render(const ui_theme *t, ui_rect window);
-static int  gui_files_modal_key(char key);
-static void gui_files_modal_click(ui_rect window, int x, int y);
-
-static void gui_editor_open(const char *path);
-static int  gui_editor_is_open(void);
-static void gui_editor_render(const ui_theme *t, ui_rect content);
-static void gui_editor_click(ui_rect content, int x, int y);
-static void gui_editor_key(char key);
-static void gui_editor_drag_to(ui_rect content, int x, int y);
-static int  gui_editor_modal_active(void);
-static void gui_editor_modal_render(const ui_theme *t, ui_rect window);
-static int  gui_editor_modal_key(char key);
-static void gui_editor_modal_click(ui_rect window, int x, int y);
-
-/* 桌面（图标网格 + 右键菜单 + 新建提示）。
- * 实现放在文件管理器之后，这里先声明，供桌面渲染/点击/按键调用。 */
-static void gui_desk_render(void);
-static void gui_desk_click(int x, int y);
-static int  gui_desk_key(char key);
-static int  gui_desk_modal(void);
-static void gui_desk_reset(void);
-static void gui_desk_refresh(void);
-
-/* Slyz GUI 程序运行时（声明式界面 + 动作绑定） */
-static void gui_slyz_render(const ui_theme *t, ui_rect content);
-static void gui_slyz_click(ui_rect content, int x, int y);
-static void gui_slyz_key(char key);
-static int  gui_slyz_modal(void);
-static int  gui_slyz_is_program(const char *path);
-static int  gui_slyz_open(const char *path);
-static void gui_slyz_req_size(int *w, int *h);
-static int  gui_app_open_path(const char *path);
-static int  gui_ext_is(const char *path, const char *ext);
-static int  gui_open_media(const char *path);
-
-static void gui_settings_render(const ui_theme *t, ui_rect content);
-static void gui_settings_click(ui_rect content, int x, int y);
-
-/* 任务管理器：总览 / 进程 / 设备三个页面，数据每秒采样一次 */
-static void gui_tm_render(const ui_theme *t, ui_rect content);
-static void gui_tm_click(ui_rect content, int x, int y);
-static void gui_tm_key(char key);
-static int  gui_tm_sample(void);
-
-/* 计算器：整数定点运算，除零单独进入错误态 */
-static void gui_calc_render(const ui_theme *t, ui_rect content);
-static void gui_calc_click(ui_rect content, int x, int y);
-static void gui_calc_key(char key);
-
-static void gui_term_render(const ui_theme *t, ui_rect content);
-static void gui_term_click(ui_rect content, int x, int y);
-static void gui_term_key(char key);
-static void gui_term_scroll_by(int delta);
-static void gui_term_reset(void);
-
-static void gui_browser_render(const ui_theme *t, ui_rect content);
-static void gui_browser_click(ui_rect content, int x, int y);
-static void gui_browser_key(char key);
-static void gui_browser_reset(void);
-
-static ui_rect win_default_rect(int id) {
-    ui_rect r;
-
-    if (id == WIN_FILES) {
-        r.w = 900;
-        r.h = 600;
-    } else if (id == WIN_EDITOR) {
-        r.w = 960;
-        r.h = 620;
-    } else if (id == WIN_TERM) {
-        r.w = 900;
-        r.h = 600;
-    } else if (id == WIN_BROWSER) {
-        r.w = 1000;
-        r.h = 660;
-    } else if (id == WIN_SLYZ) {
-        int w = 660;
-        int h = 620;
-        gui_slyz_req_size(&w, &h);
-        r.w = w + 24;
-        r.h = h + 90;
-    } else if (id == WIN_TASKMGR) {
-        r.w = 1040;
-        r.h = 700;
-    } else if (id == WIN_CALC) {
-        r.w = 420;
-        r.h = 560;
-    } else if (id == WIN_MEDIA) {
-        r.w = 600;
-        r.h = 540;
-    } else if (id == WIN_EXTERNAL) {
-        r.w = g_ext_space_w + 20;
-        r.h = g_ext_space_h + 66;
-    } else {
-        r.w = 640;
-        r.h = 640;
-    }
-
-    int avail_w = gW - GUI_TASKBAR_W - 80;
-    int avail_h = gH - 120;
-    if (r.w > avail_w) r.w = avail_w;
-    if (r.h > avail_h) r.h = avail_h;
-
-    r.x = GUI_TASKBAR_W + (gW - GUI_TASKBAR_W - r.w) / 2;
-    r.y = (gH - r.h) / 2;
-    return r;
-}
-
-static void win_open(int id) {
-    if (!g_wins[id].open) {
-        g_wins[id].open = 1;
-        g_wins[id].r = win_default_rect(id);
-        g_wins[id].maximized = 0;
-        g_wins[id].minimized = 0;
-    }
-    g_wins[id].minimized = 0;
-    g_wins[id].z = ++g_z_counter;
-    g_focus = id;
-}
-
-static void win_focus(int id) {
-    g_wins[id].z = ++g_z_counter;
-    g_focus = id;
-}
-
-static void win_close(int id) {
-    if (gui_app_active(id)) {
-        gui_app_stop(id);
-    }
-    /* 原生应用窗口：先摘掉宿主再通知，避免 close 回调里再次
-     * 请求关闭造成递归。 */
-    if (id == WIN_EXTERNAL && g_ext_host) {
-        const GuiExternalHost *h = g_ext_host;
-        g_ext_host = 0;
-        g_ext_content_valid = 0;
-        if (h->close) h->close();
-    }
-    /* 媒体播放器没有独立进程：窗口关闭就停止音频，避免后台
-     * 继续播放却找不到控制入口。 */
-    if (id == WIN_MEDIA) {
-        audio_stop();
-    }
-    g_wins[id].open = 0;
-    g_wins[id].z = 0;
-    g_wins[id].maximized = 0;
-    g_wins[id].minimized = 0;
-    if (g_focus == id) g_focus = -1;
-    if (g_dragging == id) g_dragging = -1;
-    if (g_resizing == id) g_resizing = -1;
-    if (id == WIN_FILES || id == WIN_EDITOR) gui_desk_refresh();
-}
-
-/* ============================================================
- * 原生应用窗口（GuiExternalHost）
- * ============================================================ */
-
-int gui_external_open(const char *title, int w, int h,
-                      const GuiExternalHost *host) {
-    if (!host) return 0;
-    g_ext_host = host;
-    g_ext_space_w = w > 240 ? w : 240;
-    g_ext_space_h = h > 160 ? h : 160;
-    int n = 0;
-    if (title) {
-        while (title[n] && n < (int)sizeof(g_ext_title) - 1) {
-            g_ext_title[n] = title[n];
-            n++;
-        }
-    }
-    g_ext_title[n] = '\0';
-    g_ext_content_valid = 0;
-    win_open(WIN_EXTERNAL);
-    dirty_all();
-    return 1;
-}
-
-void gui_external_close(void) {
-    if (g_wins[WIN_EXTERNAL].open) {
-        win_close(WIN_EXTERNAL);
-    } else if (g_ext_host) {
-        const GuiExternalHost *h = g_ext_host;
-        g_ext_host = 0;
-        g_ext_content_valid = 0;
-        if (h->close) h->close();
-    }
-    dirty_all();
-}
-
-int gui_external_is_open(void) {
-    return g_wins[WIN_EXTERNAL].open && g_ext_host != 0;
-}
-
-uint32_t gui_ext_width(void) {
-    /* 窗口没打开时必须返回 0：TTY 会话里应用靠这个判断该走
-     * 全屏 fb_* 后端，而不是画到不存在的窗口内容区。 */
-    if (!g_wins[WIN_EXTERNAL].open) return 0;
-    if (g_ext_content_valid && g_ext_content.w > 0) {
-        return (uint32_t)g_ext_content.w;
-    }
-    return (uint32_t)g_ext_space_w;
-}
-
-uint32_t gui_ext_height(void) {
-    if (!g_wins[WIN_EXTERNAL].open) return 0;
-    if (g_ext_content_valid && g_ext_content.h > 0) {
-        return (uint32_t)g_ext_content.h;
-    }
-    return (uint32_t)g_ext_space_h;
-}
-
-void gui_ext_invalidate(void) {
-    /* 只标脏内容区：打字时不必重绘标题栏与阴影，逐个按键整窗重绘
-     * 在 QEMU 的软件渲染下会明显掉帧。 */
-    if (g_wins[WIN_EXTERNAL].open && g_ext_content_valid) {
-        dirty_add(g_ext_content.x, g_ext_content.y,
-                  g_ext_content.w, g_ext_content.h);
-    }
-}
-
-void gui_ext_request_close(void) {
-    gui_external_close();
-}
-
-void gui_ext_fill_rect(int x, int y, int w, int h, uint32_t color) {
-    if (!g_ext_content_valid || w <= 0 || h <= 0) return;
-    int x0 = g_ext_content.x + x;
-    int y0 = g_ext_content.y + y;
-    int x1 = x0 + w;
-    int y1 = y0 + h;
-    if (x0 < g_ext_content.x) x0 = g_ext_content.x;
-    if (y0 < g_ext_content.y) y0 = g_ext_content.y;
-    if (x1 > g_ext_content.x + g_ext_content.w) {
-        x1 = g_ext_content.x + g_ext_content.w;
-    }
-    if (y1 > g_ext_content.y + g_ext_content.h) {
-        y1 = g_ext_content.y + g_ext_content.h;
-    }
-    if (x1 <= x0 || y1 <= y0) return;
-    vbe_fill_rect((uint16_t)x0, (uint16_t)y0,
-                  (uint16_t)(x1 - x0), (uint16_t)(y1 - y0), color);
-}
-
-int gui_ext_draw_cell(int x, int y, int cw, int ch,
-                      uint32_t cp, uint32_t fg) {
-    if (!g_ext_content_valid) return 0;
-    int x0 = g_ext_content.x + x;
-    int y0 = g_ext_content.y + y;
-    if (x0 + cw <= g_ext_content.x || y0 + ch <= g_ext_content.y) return 0;
-    if (x0 >= g_ext_content.x + g_ext_content.w) return 0;
-    if (y0 >= g_ext_content.y + g_ext_content.h) return 0;
-    vbe_push_clip(g_ext_content.x, g_ext_content.y,
-                  g_ext_content.w, g_ext_content.h);
-    int r = slyertype_draw_cell_buf(x0, y0, cw, ch, cp, fg);
-    vbe_pop_clip();
-    return r;
-}
-
-/* 最小化：保留 open 与内容，只从桌面与命中测试里移除；
- * 任务栏的窗口按钮仍然可点，点一下还原。 */
-static void win_minimize(int id) {
-    g_wins[id].minimized = 1;
-    if (g_focus == id) g_focus = -1;
-    if (g_dragging == id) g_dragging = -1;
-    if (g_resizing == id) g_resizing = -1;
-}
-
-static void win_restore_from_min(int id) {
-    g_wins[id].minimized = 0;
-}
-
-static ui_rect win_max_rect(void) {
-    ui_rect r;
-    r.x = GUI_TASKBAR_W + 8;
-    r.y = 8;
-    r.w = gW - GUI_TASKBAR_W - 16;
-    r.h = gH - 16;
-    return r;
-}
-
-static void win_toggle_max(int id) {
-    struct GuiWindow *w = &g_wins[id];
-
-    if (w->maximized) {
-        w->r = w->restore;
-        w->maximized = 0;
-    } else {
-        w->restore = w->r;
-        w->r = win_max_rect();
-        w->maximized = 1;
-    }
-
-    w->minimized = 0;
-    win_focus(id);
-}
-
-static ui_rect win_content_rect(const ui_rect *r) {
-    ui_rect c;
-    c.x = r->x + 10;
-    c.y = r->y + 56;
-    c.w = r->w - 20;
-    c.h = r->h - 66;
-    return c;
-}
-
-static ui_rect win_close_rect(const ui_rect *r) {
-    ui_rect c;
-    c.w = 36;
-    c.h = 34;
-    c.x = r->x + r->w - 50;
-    c.y = r->y + 9;
-    return c;
-}
-
-static ui_rect win_max_btn_rect(const ui_rect *r) {
-    ui_rect c;
-    c.w = 36;
-    c.h = 34;
-    c.x = r->x + r->w - 50 - 42;
-    c.y = r->y + 9;
-    return c;
-}
-
-static ui_rect win_min_btn_rect(const ui_rect *r) {
-    ui_rect c;
-    c.w = 36;
-    c.h = 34;
-    c.x = r->x + r->w - 50 - 84;
-    c.y = r->y + 9;
-    return c;
-}
-
-/* 右下角调整手柄：18x18，画三条斜线作为视觉提示 */
-static ui_rect win_grip_rect(const ui_rect *r) {
-    ui_rect c;
-    c.w = 18;
-    c.h = 18;
-    c.x = r->x + r->w - 18;
-    c.y = r->y + r->h - 18;
-    return c;
-}
-
-/* 判定鼠标落在窗口的哪个调整边上；0 表示不在调整区 */
-static int win_resize_edge_at(const ui_rect *r, int x, int y, int maximized) {
-    if (maximized) return 0;
-
-    int edge = 0;
-
-    if (x >= r->x + r->w - 8 && x < r->x + r->w &&
-        y >= r->y + 52 && y < r->y + r->h) {
-        edge |= 1;
-    }
-    if (y >= r->y + r->h - 8 && y < r->y + r->h &&
-        x >= r->x + 8 && x < r->x + r->w) {
-        edge |= 2;
-    }
-
-    return edge;
-}
-
-static int win_topmost_at(int x, int y) {
-    int best = -1;
-    int best_z = -1;
-
-    for (int i = 0; i < GUI_WIN_MAX; i++) {
-        if (!g_wins[i].open || g_wins[i].minimized) continue;
-        if (g_point_in(&g_wins[i].r, x, y) && g_wins[i].z > best_z) {
-            best_z = g_wins[i].z;
-            best = i;
-        }
-    }
-    return best;
-}
-
-/* ---------- 任务栏几何 ----------
- * 竖直空间预算（1600x900）：头像 20..76、搜索 88..144、
- * 5 个应用按钮 156..456、窗口列表 470..700、
- * 网络 gH-192、时钟 gH-128、电源 gH-64。
- * 屏幕矮于 760 时窗口列表会与底部区重叠，此时按 gH 动态压缩。 */
-
-static ui_rect tb_avatar_rect(void) {
-    return (ui_rect){ 16, 20, 56, 56 };
-}
-
-static ui_rect tb_search_rect(void) {
-    return (ui_rect){ 16, 88, 56, 56 };
-}
-
-static ui_rect tb_app_rect(int i) {
-    return (ui_rect){ 16, 156 + i * 54, 56, 50 };
-}
-
-static ui_rect tb_win_rect(int i) {
-    /* 已打开窗口用 2 列紧凑网格：7 个应用占掉 156..530 后，
-     * 单列 46px 会把第 4 个窗口按钮推到网络按钮下面。 */
-    return (ui_rect){ 12 + (i % 2) * 34, 544 + (i / 2) * 30, 30, 26 };
-}
-
-static ui_rect tb_net_rect(void) {
-    return (ui_rect){ 16, gH - 200, 56, 48 };
-}
-
-static ui_rect tb_clock_rect(void) {
-    return (ui_rect){ 16, gH - 140, 56, 64 };
-}
-
-static ui_rect tb_power_rect(void) {
-    return (ui_rect){ 16, gH - 64, 56, 48 };
-}
-
-static ui_rect search_panel_rect(void) {
-    /* 高度随应用数量增长：固定 500 在应用超过 5 个后会把最后一行
-     * 画到面板外面。上限夹在屏幕内，保证任何分辨率都不越界。 */
-    int h = 120 + GUI_APP_COUNT * 72 + 16;
-    if (96 + h > gH - 16) h = gH - 16 - 96;
-    if (h < 240) h = 240;
-    return (ui_rect){ GUI_TASKBAR_W + 10, 96, 440, h };
-}
-
-static ui_rect user_menu_rect(void) {
-    return (ui_rect){ GUI_TASKBAR_W + 8, 20, 300, 176 };
-}
-
-static ui_rect power_menu_rect(void) {
-    return (ui_rect){ GUI_TASKBAR_W + 8, gH - 250, 300, 230 };
-}
-
-static ui_rect net_menu_rect(void) {
-    return (ui_rect){ GUI_TASKBAR_W + 8, gH - 560, 520, 520 };
-}
-
-static ui_rect volume_slider_rect(const ui_rect *p) {
-    return (ui_rect){ p->x + 20, p->y + 128, p->w - 40, 14 };
-}
-
-/* ---------- 搜索 ---------- */
-
-static int search_filter(int out[GUI_APP_COUNT]) {
-    int n = 0;
-    for (int i = 0; i < GUI_APP_COUNT; i++) {
-        if (g_search_len == 0 ||
-            g_contains_nocase(g_apps[i].name, g_search) ||
-            g_contains_nocase(g_apps[i].desc, g_search)) {
-            out[n++] = i;
-        }
-    }
-    return n;
-}
-
-static void launch_app(int win) {
-    if (win == WIN_FILES) {
-        const struct AuthUser *u = auth_current();
-        /* 文件管理器已迁移为独立 SLYZ 程序；镜像缺失时回退内置实现，
-         * 保证系统盘被替换或损坏时桌面仍然可用。 */
-        if (!gui_app_start(WIN_FILES, "system\\apps\\files.slyz")) {
-            gui_files_open(u ? u->home : "");
-        }
-    } else if (win == WIN_EDITOR) {
-        gui_editor_open("");
-    } else if (win == WIN_TERM) {
-        gui_term_reset();
-    } else if (win == WIN_BROWSER) {
-        gui_browser_reset();
-    } else if (win == WIN_CALC) {
-        /* 计算器已迁移为独立 SLYZ 程序。镜像缺失或损坏时保留内置实现，
-         * 桌面不会因为一个应用文件丢失而无法使用。 */
-        gui_app_start(WIN_CALC, "system\\apps\\calc.slyz");
-    } else if (win == WIN_SETTINGS) {
-        gui_app_start(WIN_SETTINGS, "system\\apps\\settings.slyz");
-    } else if (win == WIN_TASKMGR) {
-        gui_app_start(WIN_TASKMGR, "system\\apps\\taskmgr.slyz");
-    } else if (win == WIN_SLYZ) {
-        /* SylFault：开发工具，不在任务栏出现，只能从搜索启动。
-         * 镜像缺失时窗口仍会打开并显示通用 Slyz 页，便于诊断系统盘。 */
-        gui_app_start(WIN_SLYZ, "system\\apps\\sylfault.slyz");
-    }
-    win_open(win);
-    g_search_open = 0;
-}
-
-static int gui_hover_id(void) {
-    int x = g_mx;
-    int y = g_my;
-
-    if (g_search_open) {
-        ui_rect p = search_panel_rect();
-        return g_point_in(&p, x, y) ? 60 : 0;
-    }
-    if (g_user_menu) {
-        ui_rect p = user_menu_rect();
-        return g_point_in(&p, x, y) ? 61 : 0;
-    }
-    if (g_power_menu) {
-        ui_rect p = power_menu_rect();
-        return g_point_in(&p, x, y) ? 62 : 0;
-    }
-    if (g_net_menu) {
-        ui_rect p = net_menu_rect();
-        return g_point_in(&p, x, y) ? 63 : 0;
-    }
-
-    if (x < GUI_TASKBAR_W) {
-        ui_rect av = tb_avatar_rect();
-        if (g_point_in(&av, x, y)) return 1;
-        ui_rect sr = tb_search_rect();
-        if (g_point_in(&sr, x, y)) return 2;
-        for (int i = 0; i < GUI_APP_COUNT; i++) {
-            if (g_apps[i].hidden) continue;
-            ui_rect r = tb_app_rect(i);
-            if (g_point_in(&r, x, y)) return 10 + i;
-        }
-        for (int i = 0; i < GUI_WIN_MAX; i++) {
-            if (!g_wins[i].open || i == WIN_MEDIA) continue;
-            ui_rect r = tb_win_rect(i);
-            if (g_point_in(&r, x, y)) return 20 + i;
-        }
-        ui_rect nr = tb_net_rect();
-        if (g_point_in(&nr, x, y)) return 5;
-        ui_rect p = tb_power_rect();
-        if (g_point_in(&p, x, y)) return 3;
-        return 4;
-    }
-
-    int w = win_topmost_at(x, y);
-    if (w >= 0) {
-        ui_rect cr = win_close_rect(&g_wins[w].r);
-        if (g_point_in(&cr, x, y)) return 40 + w;
-        return 50 + w;
-    }
-    return 0;
-}
-
-/* hover id 反过来映射到"该控件占据的矩形"，局部重绘据此擦除旧高亮。
- * 返回 1 表示该 id 有明确矩形。 */
-static int gui_hover_rect(int id, ui_rect *out) {
-    if (id == 1) {
-        *out = tb_avatar_rect();
-        return 1;
-    }
-    if (id == 2) {
-        *out = tb_search_rect();
-        return 1;
-    }
-    if (id == 3) {
-        *out = tb_power_rect();
-        return 1;
-    }
-    if (id == 5) {
-        *out = tb_net_rect();
-        return 1;
-    }
-    if (id == 4) {
-        *out = (ui_rect){ 0, 0, GUI_TASKBAR_W, gH };
-        return 1;
-    }
-    if (id >= 10 && id < 13) {
-        *out = tb_app_rect(id - 10);
-        return 1;
-    }
-    if (id >= 20 && id < 20 + GUI_WIN_MAX) {
-        *out = tb_win_rect(id - 20);
-        return 1;
-    }
-    if (id >= 40 && id < 40 + GUI_WIN_MAX) {
-        *out = win_close_rect(&g_wins[id - 40].r);
-        return 1;
-    }
-    if (id >= 50 && id < 50 + GUI_WIN_MAX) {
-        *out = g_wins[id - 50].r;
-        return 1;
-    }
-    if (id == 60) {
-        *out = search_panel_rect();
-        return 1;
-    }
-    if (id == 61) {
-        *out = user_menu_rect();
-        return 1;
-    }
-    if (id == 62) {
-        *out = power_menu_rect();
-        return 1;
-    }
-    if (id == 63) {
-        *out = net_menu_rect();
-        return 1;
-    }
-    return 0;
-}
-
-/* ---------- 任务栏渲染 ---------- */
-
-static void gui_taskbar_render(void) {
-    ui_rect bar = { 0, 0, GUI_TASKBAR_W, gH };
-    ui_gradient_v(bar, 0x111A26, 0x0B121B);
-    ui_vline(GUI_TASKBAR_W - 1, 0, gH, C_BORDER);
-
-    const struct AuthUser *u = auth_current();
-    const char *uname = u ? u->name : "?";
-    ui_rect av = tb_avatar_rect();
-    gui_avatar(av.x + av.w / 2, av.y + av.h / 2, 28, uname,
-               C_AVATAR_A, C_AVATAR_B);
-
-    ui_rect sr = tb_search_rect();
-    int sr_hover = g_point_in(&sr, g_mx, g_my);
-    hunt_add(sr);
-    ui_round_panel(sr, 14, sr_hover ? C_ACCENT : C_BORDER,
-                   g_search_open ? 0x1B2A3C : C_PANEL2);
-    icon_search(sr.x + 28, sr.y + 26, 12, sr_hover ? C_ACCENT3 : C_DIM);
-
-    for (int i = 0; i < GUI_APP_COUNT; i++) {
-        if (g_apps[i].hidden) continue;
-        ui_rect r = tb_app_rect(i);
-        int hover = g_point_in(&r, g_mx, g_my);
-        int open = g_wins[g_apps[i].win].open;
-
-        hunt_add(r);
-        ui_round_panel(r, 12, hover ? C_ACCENT : (open ? C_ACCENT2 : C_BORDER),
-                       hover ? 0x1B2A3C : C_PANEL2);
-
-        int ix = r.x + 14;
-        int iy = r.y + 10;
-        uint32_t ic = open ? C_ACCENT3 : C_DIM;
-        if (g_apps[i].win == WIN_FILES) {
-            icon_folder(ix, iy, 28, ic);
-        } else if (g_apps[i].win == WIN_EDITOR) {
-            icon_editor(ix, iy, 28, ic);
-        } else if (g_apps[i].win == WIN_TERM) {
-            icon_terminal(ix, iy, 28, ic);
-        } else if (g_apps[i].win == WIN_BROWSER) {
-            icon_globe(ix, iy, 28, ic);
-        } else if (g_apps[i].win == WIN_TASKMGR) {
-            icon_chart(ix, iy, 28, ic);
-        } else if (g_apps[i].win == WIN_CALC) {
-            icon_calc(ix, iy, 28, ic);
-        } else {
-            icon_settings(ix, iy, 28, ic);
-        }
-
-        if (open) {
-            vbe_fill_rect((uint16_t)(r.x + 8), (uint16_t)(r.y + r.h - 3),
-                          40, 3, C_ACCENT);
-        }
-    }
-
-    int any_open = 0;
-    for (int i = 0; i < GUI_WIN_MAX; i++) {
-        if (g_wins[i].open && i != WIN_MEDIA) any_open = 1;
-    }
-    if (any_open) {
-        ui_hline(16, 156 + gui_visible_app_count() * 54 + 4, 56, C_BORDER);
-    }
-
-    for (int i = 0; i < GUI_WIN_MAX; i++) {
-        if (!g_wins[i].open || i == WIN_MEDIA) continue;
-        ui_rect r = tb_win_rect(i);
-        int hover = g_point_in(&r, g_mx, g_my);
-        int active = (g_focus == i);
-        int minimized = g_wins[i].minimized;
-
-        hunt_add(r);
-        ui_round_panel(r, 10,
-                       active ? C_ACCENT : (hover ? C_ACCENT2 : C_BORDER),
-                       minimized ? 0x141C27 : (active ? 0x1B2A3C : C_PANEL));
-
-        int ix = r.x + 7;
-        int iy = r.y + 5;
-        uint32_t ic = minimized ? 0x5A6B7E : (active ? C_TEXT : C_DIM);
-        if (i == WIN_FILES) {
-            icon_folder(ix, iy, 16, ic);
-        } else if (i == WIN_EDITOR) {
-            icon_file(ix, iy, 16, ic);
-        } else if (i == WIN_TERM) {
-            icon_terminal(ix, iy, 16, ic);
-        } else if (i == WIN_BROWSER) {
-            icon_globe(ix, iy, 16, ic);
-        } else if (i == WIN_TASKMGR) {
-            icon_chart(ix, iy, 16, ic);
-        } else if (i == WIN_CALC) {
-            icon_calc(ix, iy, 16, ic);
-        } else if (i == WIN_EXTERNAL) {
-            icon_editor(ix, iy, 16, ic);
-        } else {
-            icon_settings(ix, iy, 16, ic);
-        }
-    }
-
-    /* 网络状态：绿点 = 链路就绪且已配置，红点 = 不可用 */
-    ui_rect nr = tb_net_rect();
-    int nr_hover = g_point_in(&nr, g_mx, g_my);
-    hunt_add(nr);
-    int netok = net_ready();
-    uint32_t net_color = netok ? C_OK : C_ERR;
-    ui_round_panel(nr, 12, nr_hover ? C_ACCENT : C_BORDER,
-                   nr_hover ? 0x1B2A3C : C_PANEL2);
-    icon_net(nr.x + 14, nr.y + 8, 28, nr_hover ? C_ACCENT3 : C_DIM);
-    ui_round_fill((ui_rect){ nr.x + 36, nr.y + 34, 9, 9 }, 4, net_color);
-
-    ui_rect pr = tb_power_rect();
-    int pr_hover = g_point_in(&pr, g_mx, g_my);
-    hunt_add(pr);
-    ui_round_panel(pr, 12, pr_hover ? C_ERR : C_BORDER,
-                   pr_hover ? 0x2A1719 : C_PANEL2);
-    icon_power(pr.x + 28, pr.y + 24, 10, pr_hover ? C_ERR : C_DIM);
-
-    /* 任务栏时钟：两行显示，56px 宽刚好容纳两个数字，
-     * 不会像单行 "HH:MM"（80px）那样超出任务栏宽度。 */
-    char clock[6];
-    gui_clock_text(clock);
-    ui_rect clock_box = tb_clock_rect();
-    ui_round_panel(clock_box, 12, C_BORDER, C_PANEL2);
-
-    char hh[3];
-    char mm[3];
-    hh[0] = clock[0]; hh[1] = clock[1]; hh[2] = '\0';
-    mm[0] = clock[3]; mm[1] = clock[4]; mm[2] = '\0';
-    ui_text_transparent(clock_box.x + 12, clock_box.y + 1, hh, C_TEXT);
-    ui_text_transparent(clock_box.x + 12, clock_box.y + 33, mm, C_DIM);
-}
-
-/* ---------- 窗口渲染 ---------- */
-
-static void gui_window_frame(int id, const ui_theme *t) {
-    ui_rect r = g_wins[id].r;
-
-    ui_shadow(r, 16, 10);
-    ui_round_gradient(r, 16, 0x1A2431, 0x111925);
-    ui_round_panel(r, 16, (g_focus == id) ? 0x3B5570 : C_BORDER, 0x121A25);
-
-    /* 标题栏 */
-    ui_rect title = { r.x + 2, r.y + 2, r.w - 4, 50 };
-    ui_round_fill(title, 14, (g_focus == id) ? 0x1E2A39 : 0x18212D);
-    ui_hline(r.x + 16, r.y + 52, r.w - 32, C_BORDER);
-
-    int ix = r.x + 18;
-    int iy = r.y + 15;
-    if (id == WIN_FILES) {
-        icon_folder(ix, iy, 24, C_ACCENT3);
-    } else if (id == WIN_EDITOR) {
-        icon_file(ix, iy, 24, C_ACCENT3);
-    } else if (id == WIN_TERM) {
-        icon_terminal(ix, iy, 24, C_ACCENT3);
-    } else if (id == WIN_BROWSER) {
-        icon_globe(ix, iy, 24, C_ACCENT3);
-    } else if (id == WIN_SLYZ) {
-        icon_editor(ix, iy, 24, C_ACCENT3);
-    } else if (id == WIN_TASKMGR) {
-        icon_chart(ix, iy, 24, C_ACCENT3);
-    } else if (id == WIN_CALC) {
-        icon_calc(ix, iy, 24, C_ACCENT3);
-    } else if (id == WIN_MEDIA) {
-        icon_chart(ix, iy, 24, C_ACCENT3);
-    } else if (id == WIN_EXTERNAL) {
-        icon_editor(ix, iy, 24, C_ACCENT3);
-    } else {
-        icon_settings(ix, iy, 24, C_ACCENT3);
-    }
-
-    const char *custom_title = (id == WIN_SLYZ) ? gui_app_title(WIN_SLYZ) :
-                               (id == WIN_EXTERNAL) ? g_ext_title : 0;
-    const char *title_text = custom_title ? custom_title :
-                             id == WIN_FILES ? "Files" :
-                             id == WIN_EDITOR ? "Text Editor" :
-                             id == WIN_TERM ? "Terminal" :
-                             id == WIN_BROWSER ? "Browser" :
-                             id == WIN_SLYZ ? "Slyz App" :
-                             id == WIN_TASKMGR ? "Task Manager" :
-                             id == WIN_CALC ? "Calculator" :
-                             id == WIN_MEDIA ? "Media Player" : "Settings";
-    ui_text_transparent(r.x + 54, r.y + 10, title_text, C_TEXT);
-
-    ui_rect cr = win_close_rect(&r);
-    int cr_hover = g_point_in(&cr, g_mx, g_my);
-    hunt_add(cr);
-    ui_round_fill(cr, 8, cr_hover ? 0x7F1D1D : 0x1B2532);
-    icon_close(cr.x + 8, cr.y + 7, 20, cr_hover ? 0xFFFFFF : C_DIM);
-
-    ui_rect mr = win_max_btn_rect(&r);
-    int mr_hover = g_point_in(&mr, g_mx, g_my);
-    hunt_add(mr);
-    ui_round_fill(mr, 8, mr_hover ? 0x24405F : 0x1B2532);
-    if (g_wins[id].maximized) {
-        icon_restore(mr.x + 8, mr.y + 7, 20, mr_hover ? 0xFFFFFF : C_DIM);
-    } else {
-        icon_maximize(mr.x + 8, mr.y + 7, 20, mr_hover ? 0xFFFFFF : C_DIM);
-    }
-
-    ui_rect nr = win_min_btn_rect(&r);
-    int nr_hover = g_point_in(&nr, g_mx, g_my);
-    hunt_add(nr);
-    ui_round_fill(nr, 8, nr_hover ? 0x24405F : 0x1B2532);
-    icon_minimize(nr.x + 8, nr.y + 7, 20, nr_hover ? 0xFFFFFF : C_DIM);
-
-    ui_rect c = win_content_rect(&r);
-    if (id == WIN_FILES) {
-        gui_files_render(t, c);
-    } else if (id == WIN_EDITOR) {
-        gui_editor_render(t, c);
-    } else if (id == WIN_TERM) {
-        gui_term_render(t, c);
-    } else if (id == WIN_BROWSER) {
-        gui_browser_render(t, c);
-    } else if (id == WIN_SLYZ) {
-        /* 通用 SLYZ 窗口：有独立应用时由虚拟机绘制，
-         * 否则回退到旧的声明式界面渲染。 */
-        if (!gui_app_render(WIN_SLYZ, c)) {
-            gui_slyz_render(t, c);
-        }
-    } else if (id == WIN_TASKMGR) {
-        gui_tm_render(t, c);
-    } else if (id == WIN_CALC) {
-        gui_calc_render(t, c);
-    } else if (id == WIN_MEDIA) {
-        if (!gui_app_render(WIN_MEDIA, c)) {
-            vbe_fill_rect((uint16_t)c.x, (uint16_t)c.y, (uint16_t)c.w,
-                          (uint16_t)c.h, 0x0B1017);
-        }
-    } else if (id == WIN_EXTERNAL) {
-        /* 原生预装应用：只画内容区，标题栏/边框/层级由窗口系统负责。
-         * 内容区尺寸变化时先通知应用重新布局，再让它绘制。 */
-        if (g_ext_host) {
-            int resized = (!g_ext_content_valid ||
-                           g_ext_content.w != c.w || g_ext_content.h != c.h);
-            g_ext_content = c;
-            g_ext_content_valid = 1;
-            if (resized && g_ext_host->resize) {
-                g_ext_host->resize(c.w, c.h);
-            }
-            if (g_ext_host->render) {
-                g_ext_host->render(c.x, c.y, c.w, c.h);
-            }
-        } else {
-            vbe_fill_rect((uint16_t)c.x, (uint16_t)c.y, (uint16_t)c.w,
-                          (uint16_t)c.h, 0x0B1017);
-        }
-    } else {
-        gui_settings_render(t, c);
-    }
-
-    /* 右下角调整手柄：三条斜线，最大化的窗口不显示 */
-    if (!g_wins[id].maximized) {
-        ui_rect grip = win_grip_rect(&r);
-        int grip_hover = g_point_in(&grip, g_mx, g_my);
-        hunt_add(grip);
-
-        uint32_t gc = grip_hover ? C_ACCENT3 : 0x3E4E62;
-        for (int k = 0; k < 3; k++) {
-            int off = 5 + k * 4;
-            ui_line(grip.x + off, grip.y + grip.h - 4,
-                    grip.x + grip.w - 4, grip.y + off, gc);
-        }
-    }
-
-    if (id == WIN_FILES && gui_files_modal_active()) {
-        gui_files_modal_render(t, r);
-    } else if (id == WIN_EDITOR && gui_editor_modal_active()) {
-        gui_editor_modal_render(t, r);
-    }
-}
-
-/* ---------- 搜索面板 ---------- */
-
-static void gui_search_panel_render(void) {
-    ui_rect p = search_panel_rect();
-    ui_shadow(p, 16, 10);
-    ui_round_panel(p, 16, C_BORDER, 0x121A25);
-
-    ui_text_transparent(p.x + 20, p.y + 12, "SEARCH", C_DIM);
-
-    ui_rect box = { p.x + 16, p.y + 50, p.w - 32, 52 };
-    ui_round_panel(box, 10, C_ACCENT, 0x0C141E);
-    if (g_search_len > 0) {
-        gui_text_n(box.x + 14, box.y + 10, g_search, 24, C_TEXT);
-    } else {
-        ui_text_transparent(box.x + 14, box.y + 10, "type an app name", C_DIM);
-    }
-    if (((net_now_ms() / 500u) & 1u) == 0) {
-        vbe_fill_rect((uint16_t)(box.x + 14 + g_search_len * 16),
-                      (uint16_t)(box.y + 12), 2, 28, C_ACCENT);
-    }
-
-    int matches[GUI_APP_COUNT];
-    int n = search_filter(matches);
-
-    int y = p.y + 120;
-    for (int i = 0; i < n; i++) {
-        const struct GuiAppDef *a = &g_apps[matches[i]];
-        ui_rect row = { p.x + 12, y, p.w - 24, 64 };
-        int hover = g_point_in(&row, g_mx, g_my);
-        hunt_add(row);
-        if (i == g_search_sel) {
-            ui_round_fill(row, 10, 0x1E3048);
-        } else if (hover) {
-            ui_round_fill(row, 10, 0x18232F);
-        }
-
-        ui_rect icon = { row.x + 12, row.y + 16, 32, 32 };
-        if (a->win == WIN_FILES) {
-            icon_folder(icon.x, icon.y, 32, C_ACCENT3);
-        } else if (a->win == WIN_EDITOR) {
-            icon_editor(icon.x, icon.y, 32, C_ACCENT3);
-        } else if (a->win == WIN_TASKMGR) {
-            icon_chart(icon.x, icon.y, 32, C_ACCENT3);
-        } else if (a->win == WIN_CALC) {
-            icon_calc(icon.x, icon.y, 32, C_ACCENT3);
-        } else if (a->hidden) {
-            icon_fault(icon.x, icon.y, 32, C_WARN);
-        } else {
-            icon_settings(icon.x, icon.y, 32, C_ACCENT3);
-        }
-
-        ui_text_transparent(row.x + 60, row.y + 4, LTR(a->name), C_TEXT);
-        gui_text_n(row.x + 60, row.y + 34, LTR(a->desc), 20, C_DIM);
-        y += 72;
-    }
-
-    if (n == 0) {
-        ui_text_transparent(p.x + 24, p.y + 140, "No applications found.", C_DIM);
-    }
-}
-
-static void gui_user_menu_render(void) {
-    ui_rect p = user_menu_rect();
-    ui_shadow(p, 14, 8);
-    ui_round_panel(p, 14, C_BORDER, 0x121A25);
-
-    const struct AuthUser *u = auth_current();
-    gui_avatar(p.x + 38, p.y + 40, 22, u ? u->name : "?", C_AVATAR_A, C_AVATAR_B);
-    ui_text_transparent(p.x + 70, p.y + 14, u ? u->name : "?", C_TEXT);
-
-    char uid_text[24];
-    int n = g_utoa((uint32_t)(u ? u->uid : 0), uid_text);
-    g_copy(uid_text + n, "  (uid)", 8);
-
-    ui_text_transparent(p.x + 70, p.y + 48, uid_text, C_DIM);
-    ui_hline(p.x + 16, p.y + 86, p.w - 32, C_BORDER);
-
-    ui_rect out = { p.x + 12, p.y + 98, p.w - 24, 54 };
-    int hover = g_point_in(&out, g_mx, g_my);
-    hunt_add(out);
-    if (hover) ui_round_fill(out, 9, 0x1B2836);
-    ui_text_transparent(out.x + 16, out.y + 11, "Log Out", C_TEXT);
-}
-
-static void gui_power_menu_render(void) {
-    ui_rect p = power_menu_rect();
-    ui_shadow(p, 14, 8);
-    ui_round_panel(p, 14, C_BORDER, 0x121A25);
-
-    ui_text_transparent(p.x + 20, p.y + 14, LTR("POWER"), C_DIM);
-    ui_hline(p.x + 16, p.y + 52, p.w - 32, C_BORDER);
-
-    const char *items[4] = { "Restart", "Shut Down", "Exit to Terminal", "Cancel" };
-    for (int i = 0; i < 4; i++) {
-        ui_rect row = { p.x + 12, p.y + 60 + i * 42, p.w - 24, 38 };
-        int hover = g_point_in(&row, g_mx, g_my);
-        hunt_add(row);
-        if (hover) ui_round_fill(row, 8, i == 1 ? 0x3A1A1C : 0x1B2836);
-        ui_text_transparent(row.x + 16, row.y + 3, LTR(items[i]),
-                            i == 1 ? (hover ? 0xFFB4B4 : C_ERR) : C_TEXT);
-    }
-}
-
-/* 网络状态面板：链路、地址、速率与收发计数 */
-static ui_rect net_menu_close_rect(const ui_rect *p) {
-    return (ui_rect){ p->x + p->w - 132, p->y + 10, 116, 34 };
-}
-
-static void gui_net_menu_render(void) {
-    ui_rect p = net_menu_rect();
-    ui_shadow(p, 14, 8);
-    ui_round_panel(p, 14, C_BORDER, 0x121A25);
-
-    struct NetInfo *ni = net_info();
-    int ready = net_ready();
-
-    ui_text_transparent(p.x + 20, p.y + 14, "CONTROL CENTER", C_DIM);
-
-    ui_rect rf = net_menu_close_rect(&p);
-    int rf_hover = g_point_in(&rf, g_mx, g_my);
-    gui_button(rf, "Close", rf_hover, 0);
-
-    ui_hline(p.x + 16, p.y + 52, p.w - 32, C_BORDER);
-
-    /* 状态行 */
-    uint32_t st_color = ready ? C_OK : C_ERR;
-    ui_round_fill((ui_rect){ p.x + 20, p.y + 66, 10, 10 }, 5, st_color);
-    ui_text_transparent(p.x + 40, p.y + 56,
-                        ready ? "Connected" : "Not connected",
-                        st_color);
-
-    /* 音量：软件增益，控制所有 MP3 播放 */
-    int vol = audio_volume();
-    ui_text_transparent(p.x + 20, p.y + 96, "VOLUME", C_DIM);
-
-    char vol_text[8];
-    int vn = g_utoa((uint32_t)vol, vol_text);
-    vol_text[vn++] = '%';
-    vol_text[vn] = '\0';
-    ui_text_transparent(p.x + p.w - 40 - g_strlen(vol_text) * 16,
-                        p.y + 96, vol_text, C_TEXT);
-
-    ui_rect vs = volume_slider_rect(&p);
-    hunt_add(vs);
-    ui_round_fill(vs, 7, 0x223041);
-    int fillw = (vs.w * vol) / 100;
-    if (fillw > 0) {
-        ui_round_fill((ui_rect){ vs.x, vs.y, fillw, vs.h }, 7, C_ACCENT);
-    }
-    int kx = vs.x + fillw;
-    if (kx < vs.x + 7) kx = vs.x + 7;
-    if (kx > vs.x + vs.w - 7) kx = vs.x + vs.w - 7;
-    ui_round_fill((ui_rect){ kx - 7, vs.y - 3, 14, 20 }, 7, 0xF2F6FF);
-
-    ui_hline(p.x + 16, p.y + 160, p.w - 32, C_BORDER);
-
-    char line[96];
-    char ip_text[16];
-    int max_chars = (p.w - 40) / 16;
-
-    if (ni) {
-        /* 单列布局：两列在窄面板里会让右侧文本越过边界。
-         * 全部字段一行一个，统一按面板宽度限字符数。 */
-        int y = p.y + 182;
-
-        net_format_ipv4(ni->ip, ip_text);
-        g_copy(line, "IP      ", sizeof(line));
-        g_copy(line + 8, ip_text, 14);
-        gui_text_n(p.x + 20, y, line, max_chars, C_TEXT);
-        y += 32;
-
-        net_format_ipv4(ni->netmask, ip_text);
-        g_copy(line, "Mask    ", sizeof(line));
-        g_copy(line + 8, ip_text, 14);
-        gui_text_n(p.x + 20, y, line, max_chars, C_TEXT);
-        y += 32;
-
-        net_format_ipv4(ni->gateway, ip_text);
-        g_copy(line, "Gateway ", sizeof(line));
-        g_copy(line + 8, ip_text, 14);
-        gui_text_n(p.x + 20, y, line, max_chars, C_TEXT);
-        y += 32;
-
-        net_format_ipv4(ni->dns, ip_text);
-        g_copy(line, "DNS     ", sizeof(line));
-        g_copy(line + 8, ip_text, 14);
-        gui_text_n(p.x + 20, y, line, max_chars, C_TEXT);
-        y += 32;
-
-        char mac[18];
-        net_format_mac(ni->mac, mac);
-        g_copy(line, "MAC     ", sizeof(line));
-        g_copy(line + 8, mac, 18);
-        gui_text_n(p.x + 20, y, line, max_chars, C_DIM);
-        y += 32;
-
-        line[0] = '\0';
-        int pos = 0;
-        g_copy(line, "Speed   ", 10); pos = 8;
-        pos += g_utoa(ni->speed_mbps, line + pos);
-        g_copy(line + pos, " Mbps", 8);
-        gui_text_n(p.x + 20, y, line, max_chars, C_DIM);
-        y += 32;
-
-        /* 收发统计 */
-        pos = 0;
-        g_copy(line, "RX ", 4); pos = 3;
-        pos += g_utoa(ni->rx_packets, line + pos);
-        g_copy(line + pos, " pkts / ", 10); pos += 8;
-        pos += g_utoa(ni->rx_bytes, line + pos);
-        g_copy(line + pos, " B", 3);
-        gui_text_n(p.x + 20, y, line, max_chars, C_DIM);
-        y += 32;
-
-        pos = 0;
-        g_copy(line, "TX ", 4); pos = 3;
-        pos += g_utoa(ni->tx_packets, line + pos);
-        g_copy(line + pos, " pkts / ", 10); pos += 8;
-        pos += g_utoa(ni->tx_bytes, line + pos);
-        g_copy(line + pos, " B", 3);
-        gui_text_n(p.x + 20, y, line, max_chars, C_DIM);
-        y += 36;
-
-        if (!ready) {
-            ui_text_wrap(p.x + 20, y, p.w - 40, 34,
-                         "No link. Check that an e1000 adapter is attached.",
-                         C_WARN, 2);
-        }
-    } else {
-        ui_text_wrap(p.x + 20, p.y + 96, p.w - 40, 34,
-                     "Network stack has not been initialized yet.", C_DIM, 2);
-    }
-}
-
-/* ---------- 桌面整体渲染 ---------- */
-
-static int gui_window_zorder(int *order) {
-    int n = 0;
-    for (int i = 0; i < GUI_WIN_MAX; i++) {
-        if (g_wins[i].open && !g_wins[i].minimized) order[n++] = i;
-    }
-    for (int i = 1; i < n; i++) {
-        int v = order[i];
-        int j = i - 1;
-        while (j >= 0 && g_wins[order[j]].z > g_wins[v].z) {
-            order[j + 1] = order[j];
-            j--;
-        }
-        order[j + 1] = v;
-    }
-    return n;
-}
-
-static void gui_clock_badge(void) {
-    ui_rect badge = { gW - 116, 16, 100, 44 };
-    ui_round_panel(badge, 12, C_BORDER, 0x121A25);
-    char clock[6];
-    gui_clock_text(clock);
-    gui_text_center(clock, badge.x + badge.w / 2, badge.y + 6, C_TEXT);
-}
-
-static void gui_desktop_render(void) {
-    gui_background();
-    gui_clock_badge();
-
-    /* 桌面图标位于窗口之下：窗口是前景应用，绝不能被子图标盖住。
-     * 顺序必须与 gui_render_dirty_surfaces 完全一致，否则全屏刷新与
-     * 局部刷新会得到不同的层级结果。 */
-    gui_desk_render();
-
-    /* 窗口按 z 值从低到高绘制 */
-    int order[GUI_WIN_MAX];
-    int n = gui_window_zorder(order);
-    for (int i = 0; i < n; i++) {
-        gui_window_frame(order[i], &g_theme);
-    }
-
-    gui_taskbar_render();
-
-    if (g_search_open) gui_search_panel_render();
-    if (g_user_menu) gui_user_menu_render();
-    if (g_power_menu) gui_power_menu_render();
-    if (g_net_menu) gui_net_menu_render();
-}
-
-/* ============================================================
- * 动态脏矩形
- * ------------------------------------------------------------
- * 全屏 blit（1024x768 约 78 万像素）是旧版卡顿的主因。现在每帧只
- * 收集真正变化的矩形，重绘时用 vbe_set_clip 把整棵场景树的绘制限
- * 制在单个矩形内，表面包围盒与当前裁剪不相交就整块跳过，最后逐
- * 矩形 vbe_swap_rect 上屏。
- *
- * 画面不残留脏点由三层保证：
- *   1. 每个改变外观的事件都显式 dirty_add 出它影响的区域；
- *   2. 状态指纹兜底：结构性状态变了但没人标脏时退化成全屏刷新；
- *   3. 光标单独走"擦-重绘-画"路径，并与脏矩形一起上屏。
- * ============================================================ */
-
-#define GUI_DIRTY_MAX 12
-#define GUI_SHADOW_PAD 20
-
-static ui_rect g_dirty[GUI_DIRTY_MAX];
-static int g_dirty_count = 0;
-static int g_dirty_full = 0;
-static int g_redraw_all_pending = 0;
-
-static void dirty_reset(void) {
-    g_dirty_count = 0;
-    g_dirty_full = 0;
-}
-
-/* 应用通过 cfg.set 改了壁纸/头像后调用：下一帧丢弃局部脏矩形，
- * 整屏重绘，避免只刷新设置窗口而桌面背景保持旧图。 */
-void gui_request_redraw_all(void) {
-    g_redraw_all_pending = 1;
-}
-
-static void dirty_all(void) {
-    g_dirty_full = 1;
-    g_dirty_count = 0;
-}
-
-static int dirty_is_full(void) {
-    return g_dirty_full;
-}
-
-static int g_rect_touch(const ui_rect *a, const ui_rect *b) {
-    return !(a->x + a->w < b->x || b->x + b->w < a->x ||
-             a->y + a->h < b->y || b->y + b->h < a->y);
-}
-
-static void dirty_add(int x, int y, int w, int h) {
-    if (g_dirty_full || w <= 0 || h <= 0) return;
-
-    if (x < 0) { w += x; x = 0; }
-    if (y < 0) { h += y; y = 0; }
-    if (x + w > gW) w = gW - x;
-    if (y + h > gH) h = gH - y;
-    if (w <= 0 || h <= 0) return;
-
-    ui_rect r;
-    r.x = x;
-    r.y = y;
-    r.w = w;
-    r.h = h;
-
-    for (int i = 0; i < g_dirty_count; i++) {
-        ui_rect *d = &g_dirty[i];
-        if (!g_rect_touch(d, &r)) continue;
-
-        int x0 = (d->x < r.x) ? d->x : r.x;
-        int y0 = (d->y < r.y) ? d->y : r.y;
-        int x1 = (d->x + d->w > r.x + r.w) ? d->x + d->w : r.x + r.w;
-        int y1 = (d->y + d->h > r.y + r.h) ? d->y + d->h : r.y + r.h;
-
-        int merged = (x1 - x0) * (y1 - y0);
-        int apart = d->w * d->h + r.w * r.h;
-
-        /* 对角合并会把面积放大好几倍，宁可多留一块独立矩形 */
-        if (merged > apart + apart / 2 + 24576) continue;
-
-        d->x = x0;
-        d->y = y0;
-        d->w = x1 - x0;
-        d->h = y1 - y0;
-        return;
-    }
-
-    if (g_dirty_count >= GUI_DIRTY_MAX) {
-        dirty_all();
-        return;
-    }
-    g_dirty[g_dirty_count++] = r;
-}
-
-static void dirty_add_rect(const ui_rect *r) {
-    dirty_add(r->x, r->y, r->w, r->h);
-}
-
-static void dirty_add_padded(const ui_rect *r, int pad) {
-    dirty_add(r->x - pad, r->y - pad, r->w + pad * 2, r->h + pad * 2);
-}
-
-/* 多个矩形互相重叠时反复合并，减少渲染与上屏次数 */
-static void dirty_compact(void) {
-    int i = 0;
-    while (i < g_dirty_count) {
-        int merged = 0;
-        for (int j = i + 1; j < g_dirty_count; j++) {
-            ui_rect *a = &g_dirty[i];
-            ui_rect *b = &g_dirty[j];
-            if (!g_rect_touch(a, b)) continue;
-
-            int x0 = (a->x < b->x) ? a->x : b->x;
-            int y0 = (a->y < b->y) ? a->y : b->y;
-            int x1 = (a->x + a->w > b->x + b->w) ? a->x + a->w : b->x + b->w;
-            int y1 = (a->y + a->h > b->y + b->h) ? a->y + a->h : b->y + b->h;
-
-            int merged_area = (x1 - x0) * (y1 - y0);
-            int apart = a->w * a->h + b->w * b->h;
-            if (merged_area > apart + apart / 2 + 24576) continue;
-
-            a->x = x0;
-            a->y = y0;
-            a->w = x1 - x0;
-            a->h = y1 - y0;
-            g_dirty[j] = g_dirty[g_dirty_count - 1];
-            g_dirty_count--;
-            merged = 1;
-            break;
-        }
-        if (!merged) i++;
-    }
-}
-
-/* 鼠标移动后：只重绘"旧指针命中的 hover 控件"与"新指针命中的"。
- * g_hunt_prev 是上一帧渲染时登记的控件矩形，正好对应屏幕上当前的
- * 高亮状态，所以用它判断需要擦除的旧高亮。 */
-static void dirty_hover_scan(int old_x, int old_y, int x, int y) {
-    for (int i = 0; i < g_hunt_prev_count; i++) {
-        const ui_rect *r = &g_hunt_prev[i];
-        if (g_point_in(r, old_x, old_y) || g_point_in(r, x, y)) {
-            dirty_add_rect(r);
-        }
-    }
-}
-
-static void dirty_window(int id) {
-    if (id < 0 || id >= GUI_WIN_MAX) return;
-    if (!g_wins[id].open) return;
-    dirty_add_padded(&g_wins[id].r, GUI_SHADOW_PAD);
-}
-
-/* 鼠标所在表面（点击后没有结构性变化时只重绘这一块） */
-static void dirty_surface_at(int x, int y) {
-    if (g_search_open) {
-        ui_rect p = search_panel_rect();
-        if (g_point_in(&p, x, y)) {
-            dirty_add_padded(&p, 18);
-            return;
-        }
-    }
-    if (g_user_menu) {
-        ui_rect p = user_menu_rect();
-        if (g_point_in(&p, x, y)) {
-            dirty_add_padded(&p, 18);
-            return;
-        }
-    }
-    if (g_power_menu) {
-        ui_rect p = power_menu_rect();
-        if (g_point_in(&p, x, y)) {
-            dirty_add_padded(&p, 18);
-            return;
-        }
-    }
-    if (g_net_menu) {
-        ui_rect p = net_menu_rect();
-        if (g_point_in(&p, x, y)) {
-            dirty_add_padded(&p, 18);
-            return;
-        }
-    }
-    if (x < GUI_TASKBAR_W) {
-        dirty_add(0, 0, GUI_TASKBAR_W, gH);
-        return;
-    }
-
-    int id = win_topmost_at(x, y);
-    if (id >= 0) {
-        dirty_window(id);
-        return;
-    }
-
-    /* 桌面空白：中央那块空桌面提示可能被点亮 */
-    dirty_add(GUI_TASKBAR_W, gH / 2 - 100, gW - GUI_TASKBAR_W, 160);
-}
-
-/* 当前裁剪矩形与给定包围盒是否相交 */
-static int gui_clip_hit(const ui_rect *r) {
-    if (!vbe_clip_active()) return 1;
-
-    int cx = 0;
-    int cy = 0;
-    int cw = 0;
-    int ch = 0;
-    vbe_get_clip(&cx, &cy, &cw, &ch);
-
-    return !(r->x + r->w <= cx || cx + cw <= r->x ||
-             r->y + r->h <= cy || cy + ch <= r->y);
-}
-
-static int dirty_rect_count(void) {
-    return g_dirty_full ? 0 : g_dirty_count;
-}
-
-static void dirty_rect_get(int index, ui_rect *out) {
-    if (!out || index < 0 || index >= g_dirty_count) return;
-    *out = g_dirty[index];
-}
-
-/* 把"旧光标 + 全部脏矩形 + 新光标"依次上屏。
- * 旧光标位置已经被 gui_cursor_erase 恢复成背景，必须单独刷一次。 */
-static void dirty_swap_all(int old_cx, int old_cy) {
-    if (old_cx >= 0) {
-        vbe_swap_rect((uint16_t)old_cx, (uint16_t)old_cy,
-                      GUI_CURSOR_W, GUI_CURSOR_H);
-    }
-
-    int n = dirty_rect_count();
-    for (int i = 0; i < n; i++) {
-        ui_rect r;
-        dirty_rect_get(i, &r);
-        vbe_swap_rect((uint16_t)r.x, (uint16_t)r.y,
-                      (uint16_t)r.w, (uint16_t)r.h);
-    }
-
-    vbe_swap_rect((uint16_t)g_mx, (uint16_t)g_my,
-                  GUI_CURSOR_W, GUI_CURSOR_H);
-}
-
-/* 对每个脏矩形重绘一次场景树，绘制被裁剪在矩形内 */
-static void gui_render_dirty_surfaces(void) {
-    int order[GUI_WIN_MAX];
-    int n = gui_window_zorder(order);
-
-    for (int i = 0; i < g_dirty_count; i++) {
-        ui_rect d = g_dirty[i];
-        vbe_set_clip(d.x, d.y, d.w, d.h);
-
-        gui_background();
-        gui_desk_render();
-
-        ui_rect badge = { gW - 116, 16, 100, 44 };
-        if (gui_clip_hit(&badge)) gui_clock_badge();
-
-        for (int k = 0; k < n; k++) {
-            ui_rect box = g_wins[order[k]].r;
-            box.x -= GUI_SHADOW_PAD;
-            box.y -= GUI_SHADOW_PAD;
-            box.w += GUI_SHADOW_PAD * 2;
-            box.h += GUI_SHADOW_PAD * 2;
-            if (!gui_clip_hit(&box)) continue;
-            gui_window_frame(order[k], &g_theme);
-        }
-
-        ui_rect tb = { 0, 0, GUI_TASKBAR_W, gH };
-        if (gui_clip_hit(&tb)) gui_taskbar_render();
-
-        if (g_search_open) {
-            ui_rect p = search_panel_rect();
-            if (gui_clip_hit(&p)) gui_search_panel_render();
-        }
-        if (g_user_menu) {
-            ui_rect p = user_menu_rect();
-            if (gui_clip_hit(&p)) gui_user_menu_render();
-        }
-        if (g_power_menu) {
-            ui_rect p = power_menu_rect();
-            if (gui_clip_hit(&p)) gui_power_menu_render();
-        }
-        if (g_net_menu) {
-            ui_rect p = net_menu_rect();
-            if (gui_clip_hit(&p)) gui_net_menu_render();
-        }
-
-        /* 输入法候选窗永远画在最上层 */
-        if (gui_ime_active()) {
-            ui_rect ip = gui_ime_rect();
-            ui_rect hit = { ip.x - 4, ip.y - 4, ip.w + 8, ip.h + 8 };
-            if (gui_clip_hit(&hit)) gui_ime_render();
-        }
-
-        vbe_clear_clip();
-    }
-}
-
-
-/* ============================================================
  * 文件管理器
  * ------------------------------------------------------------
  * 只做"浏览 + 打开 + 新建 + 删除"四件事，但每个入口都完整：
@@ -3095,9 +514,9 @@ static struct GuiDirEntry g_fm_entries[GUI_FM_MAX];
 static int g_fm_count = 0;
 static int g_fm_sel = 0;
 static int g_fm_top = 0;
-static char g_fm_msg[96];
-static uint32_t g_fm_msg_until = 0;
-static int g_fm_modal = 0;          /* 1=new file, 2=new dir, 3=delete */
+char g_fm_msg[96];
+uint32_t g_fm_msg_until = 0;
+int g_fm_modal = 0;          /* 1=new file, 2=new dir, 3=delete */
 static char g_fm_input[64];
 static int g_fm_input_len = 0;
 static uint32_t g_fm_last_click_ms = 0;
@@ -3191,7 +610,7 @@ static void fm_select_name(const char *name) {
     }
 }
 
-static void gui_files_open(const char *path) {
+void gui_files_open(const char *path) {
     const struct AuthUser *u = auth_current();
 
     if (!path || !*path) {
@@ -3353,7 +772,7 @@ static void gui_files_render(const ui_theme *t, ui_rect c) {
 
     /* 路径栏 */
     ui_rect path_bar = { c.x, c.y + 52, c.w, 34 };
-    ui_round_panel(path_bar, 8, C_BORDER, 0x0E1620);
+    ui_round_panel(path_bar, 8, C_BORDER, C_PANEL2);
     char shown[280];
     int p = 0;
     shown[p++] = '\\';
@@ -3366,7 +785,7 @@ static void gui_files_render(const ui_theme *t, ui_rect c) {
     /* 列表 */
     int list_y = fm_list_top(c);
     int list_h = fm_list_height(c);
-    ui_round_fill((ui_rect){ c.x, list_y, c.w, list_h }, 10, 0x0C141E);
+    ui_round_fill((ui_rect){ c.x, list_y, c.w, list_h }, 10, C_PANEL);
 
     int rows = fm_visible_rows(c);
     if (g_fm_sel < g_fm_top) g_fm_top = g_fm_sel;
@@ -3383,17 +802,17 @@ static void gui_files_render(const ui_theme *t, ui_rect c) {
         hunt_add(row);
 
         if (idx == g_fm_sel) {
-            ui_round_fill(row, 8, 0x1E3048);
+            ui_round_fill(row, 8, C_SEL);
             ui_round_fill((ui_rect){ row.x, row.y + 8, 3, row.h - 16 }, 1, C_ACCENT);
         } else if (g_point_in(&row, g_mx, g_my)) {
-            ui_round_fill(row, 8, 0x16202C);
+            ui_round_fill(row, 8, C_HOVER);
         }
 
         int iy = row.y + 7;
         if (fm_is_dir(e)) {
             icon_folder(row.x + 12, iy, 28, C_WARN);
         } else {
-            icon_file(row.x + 12, iy, 28, 0xA9BDD2);
+            icon_file(row.x + 12, iy, 28, C_DIM);
         }
 
         gui_text_n(row.x + 52, row.y + 5, (const char *)e->name,
@@ -3419,7 +838,7 @@ static void gui_files_render(const ui_theme *t, ui_rect c) {
     /* 滚动条 */
     if (g_fm_count > rows) {
         int sb_x = c.x + c.w - 10;
-        ui_round_fill((ui_rect){ sb_x, list_y + 4, 8, list_h - 8 }, 4, 0x121A25);
+        ui_round_fill((ui_rect){ sb_x, list_y + 4, 8, list_h - 8 }, 4, C_MENU_BG);
         int track_h = list_h - 8;
         int thumb_h = track_h * rows / g_fm_count;
         if (thumb_h < 26) thumb_h = 26;
@@ -3596,7 +1015,7 @@ static void gui_files_modal_render(const ui_theme *t, ui_rect window) {
 
     ui_rect card = fm_modal_card(window);
     ui_shadow(card, 14, 8);
-    ui_round_panel(card, 14, C_BORDER, 0x141E2A);
+    ui_round_panel(card, 14, C_BORDER, C_MENU_BG);
 
     const char *title = g_fm_modal == 1 ? "New File" :
                         g_fm_modal == 2 ? "New Folder" : "Delete";
@@ -3615,7 +1034,7 @@ static void gui_files_modal_render(const ui_theme *t, ui_rect window) {
         ui_text_transparent(card.x + 24, card.y + 68, "Name:", C_DIM);
 
         ui_rect box = { card.x + 24, card.y + 100, card.w - 48, 40 };
-        ui_round_panel(box, 8, C_ACCENT, 0x0C141E);
+        ui_round_panel(box, 8, C_ACCENT, C_PANEL);
         gui_text_n(box.x + 12, box.y + 4, g_fm_input, 22, C_TEXT);
         if (((net_now_ms() / 500u) & 1u) == 0) {
             vbe_fill_rect((uint16_t)(box.x + 12 + g_fm_input_len * 16),
@@ -3692,16 +1111,16 @@ static uint32_t g_ed_hscroll = 0;
  * 复制/剪切/粘贴共用一个 4KB 剪贴板，足够覆盖正常文本片段。 */
 static uint32_t g_ed_sel_a = 0;
 static uint32_t g_ed_sel_b = 0;
-static int      g_ed_drag_sel = 0;
+int      g_ed_drag_sel = 0;
 static char     g_clip[4096];
 static int      g_clip_len = 0;
 static uint32_t g_ed_desired_col = 0;
 static int      g_ed_open = 0;
 static char     g_ed_path[256];
 static int      g_ed_dirty = 0;
-static char     g_ed_msg[96];
-static uint32_t g_ed_msg_until = 0;
-static int      g_ed_ask_save = 0;
+char     g_ed_msg[96];
+uint32_t g_ed_msg_until = 0;
+int      g_ed_ask_save = 0;
 static int      g_ed_close_request = 0;
 
 static uint32_t ed_line_of(uint32_t pos) {
@@ -3918,7 +1337,7 @@ static int ed_save(void) {
     return 1;
 }
 
-static void gui_editor_open(const char *path) {
+void gui_editor_open(const char *path) {
     g_ed_len = 0;
     g_ed_cursor = 0;
     g_ed_top = 0;
@@ -3956,7 +1375,7 @@ static void gui_editor_open(const char *path) {
     }
 }
 
-static int gui_editor_is_open(void) {
+int gui_editor_is_open(void) {
     return g_ed_open && g_wins[WIN_EDITOR].open;
 }
 
@@ -3993,7 +1412,7 @@ static void gui_editor_render(const ui_theme *t, ui_rect c) {
     int text_h = c.h - status_h - 12;
     if (text_h < 32) text_h = 32;
 
-    ui_round_fill((ui_rect){ c.x, c.y, c.w, c.h - status_h }, 10, 0x0C141E);
+    ui_round_fill((ui_rect){ c.x, c.y, c.w, c.h - status_h }, 10, C_PANEL);
 
     int visible = text_h / 32;
     if (visible < 1) visible = 1;
@@ -4018,7 +1437,7 @@ static void gui_editor_render(const ui_theme *t, ui_rect c) {
 
     /* 行号列 */
     ui_rect gutter_rect = { c.x, c.y, gutter, text_h };
-    ui_round_fill(gutter_rect, 10, 0x0A111A);
+    ui_round_fill(gutter_rect, 10, C_BG);
 
     uint32_t off = ed_offset_of_line(g_ed_top);
     for (int r = 0; r < visible; r++) {
@@ -4029,7 +1448,7 @@ static void gui_editor_render(const ui_theme *t, ui_rect c) {
 
         char num[12];
         g_itoa_pad(line_no + 1, num, 4);
-        ui_text_transparent(c.x + 12, y, num, 0x4E6A85);
+        ui_text_transparent(c.x + 12, y, num, C_DIM);
 
         uint32_t end = off;
         while (end < g_ed_len && g_ed_buf[end] != '\n') end++;
@@ -4061,7 +1480,7 @@ static void gui_editor_render(const ui_theme *t, ui_rect c) {
             /* 选区高亮：按字符实际宽度铺底，汉字占两格 */
             if (sel_lo != sel_hi && i >= sel_lo && i < sel_hi) {
                 vbe_fill_rect((uint16_t)cx, (uint16_t)y, (uint16_t)(16 * w), 32,
-                              0x1E3A5F);
+                              C_SEL);
             }
 
             if (w == 2) {
@@ -4400,7 +1819,7 @@ static void gui_editor_modal_render(const ui_theme *t, ui_rect window) {
 
     ui_rect card = ed_modal_card(window);
     ui_shadow(card, 14, 8);
-    ui_round_panel(card, 14, C_BORDER, 0x141E2A);
+    ui_round_panel(card, 14, C_BORDER, C_MENU_BG);
 
     ui_text_transparent(card.x + 26, card.y + 18, "Unsaved changes", C_TEXT);
     ui_hline(card.x + 22, card.y + 62, card.w - 44, C_BORDER);
@@ -4461,8 +1880,8 @@ static void gui_editor_modal_click(ui_rect window, int x, int y) {
  * 设置
  * ============================================================ */
 
-static char g_set_msg[96];
-static uint32_t g_set_msg_until = 0;
+char g_set_msg[96];
+uint32_t g_set_msg_until = 0;
 
 static void set_num2(char *out, int v) {
     out[0] = (char)('0' + (v / 10) % 10);
@@ -4843,7 +2262,7 @@ static void tm_cpu_brand(char *out, int cap) {
 
 /* 进度条：permille = 0..1000 */
 static void tm_bar(ui_rect r, uint32_t permille, uint32_t color) {
-    ui_round_fill(r, r.h / 2, 0x0C141E);
+    ui_round_fill(r, r.h / 2, C_PANEL);
     int w = (int)(((uint64_t)r.w * (uint64_t)permille) / 1000ull);
     if (w > r.w) w = r.w;
     if (w >= 4) {
@@ -4857,7 +2276,7 @@ static ui_rect tm_tab_rect(ui_rect c, int i) {
 
 /* 每秒采样一次：CPU 占用、每任务 CPU%、磁盘写入速率、运行时间。
  * 返回 1 表示产生了新样本，主循环据此把任务管理器窗口标脏。 */
-static int gui_tm_sample(void) {
+int gui_tm_sample(void) {
     uint32_t now = net_now_ms();
     uint32_t dt;
 
@@ -5043,7 +2462,7 @@ static void gui_tm_render_overview(ui_rect p) {
         ui_text_transparent(cpu_card.x + cpu_card.w - 68, y, pct, C_TEXT);
 
         ui_rect cb = { cpu_card.x + 20, y + 34, cpu_card.w - 40, 10 };
-        tm_bar(cb, used, used > 0 ? C_ACCENT3 : 0x2B3949);
+        tm_bar(cb, used, used > 0 ? C_ACCENT3 : C_PANEL3);
 
         y += 56;
     }
@@ -5245,7 +2664,7 @@ static void gui_tm_render_processes(ui_rect p) {
 
         ui_rect row = { p.x + 8, y - 4, p.w - 16, 40 };
         if ((i & 1) == 0) {
-            ui_round_fill(row, 8, 0x121A25);
+            ui_round_fill(row, 8, C_MENU_BG);
         }
 
         char num[16];
@@ -5533,7 +2952,7 @@ static void gui_tm_render_devices(ui_rect p) {
     ui_rect c6 = { rx, p.y + (card_h + gap) * 2, col_w, card_h };
     ui_round_panel(c6, 14, C_BORDER, C_PANEL);
     ui_text_transparent(c6.x + 18, c6.y + 10, "SYSTEM", C_DIM);
-    ui_text_transparent(c6.x + 18, c6.y + 44, "SaylterOS v0.3 Beta1  x86_64 long mode", C_TEXT);
+    ui_text_transparent(c6.x + 18, c6.y + 44, "SaylterOS v0.3 Beta2  x86_64 long mode", C_TEXT);
 
     g_copy(buf, "SMP ", sizeof(buf));
     bp = 4;
@@ -5576,7 +2995,7 @@ static void gui_tm_render(const ui_theme *t, ui_rect c) {
     for (int i = 0; i < TM_TAB_COUNT; i++) {
         ui_rect r = tm_tab_rect(c, i);
         int hover = g_point_in(&r, g_mx, g_my);
-        uint32_t fill = (g_tm_tab == i) ? 0x1B2A3C : (hover ? 0x18232F : C_PANEL2);
+        uint32_t fill = (g_tm_tab == i) ? C_SEL : (hover ? C_HOVER : C_PANEL2);
         ui_round_panel(r, 10, (g_tm_tab == i) ? C_ACCENT : C_BORDER, fill);
         ui_text_transparent(r.x + 20, r.y + 6, labels[i],
                             (g_tm_tab == i) ? C_TEXT : C_DIM);
@@ -5942,7 +3361,7 @@ static void gui_calc_render(const ui_theme *t, ui_rect c) {
     if (gui_app_render(WIN_CALC, c)) return;
 
     ui_rect disp = { c.x, c.y, c.w, 96 };
-    ui_round_panel(disp, 12, C_BORDER, 0x0C141E);
+    ui_round_panel(disp, 12, C_BORDER, C_PANEL);
 
     /* 左上角显示待定运算：按下运算符后必须有可见反馈，
      * 否则用户会以为按键没反应（主显示区此时仍是当前输入）。 */
@@ -6003,18 +3422,18 @@ static void gui_calc_render(const ui_theme *t, ui_rect c) {
                 fill = C_ACCENT;
                 border = C_ACCENT3;
             } else if (g_strcmp(label, "C") == 0) {
-                fill = 0x2A1719;
-                border = hover ? C_ERR : 0x4A2A2E;
+                fill = C_HOVER;
+                border = hover ? C_ERR : C_ERR;
                 fg = C_ERR;
             } else if (is_pending) {
-                fill = 0x24405F;
+                fill = C_ACCENT2;
                 border = C_ACCENT3;
             } else if (g_strcmp(label, "+/-") == 0 || g_strcmp(label, "%") == 0 ||
                        g_strcmp(label, "/") == 0 || g_strcmp(label, "*") == 0 ||
                        g_strcmp(label, "-") == 0 || g_strcmp(label, "+") == 0) {
-                fill = hover ? 0x24405F : C_PANEL3;
+                fill = hover ? C_ACCENT2 : C_PANEL3;
             } else if (hover) {
-                fill = 0x1B2A3C;
+                fill = C_SEL;
             }
 
             ui_round_panel(r, 10, border, fill);
@@ -6533,7 +3952,7 @@ static void te_close(void) {
 }
 
 static void te_render(ui_rect c) {
-    ui_round_fill(c, 10, 0x0A0F16);
+    ui_round_fill(c, 10, C_BG);
 
     int cols = (c.w - 24) / 16;
     if (cols < 24) cols = 24;
@@ -6589,7 +4008,7 @@ static void te_render(ui_rect c) {
             one[0] = (k < 4 - n) ? ' ' : num[k - (4 - n)];
             one[1] = '\0';
             if (one[0] != ' ') {
-                ui_text_transparent(c.x + 12 + k * 16, y, one, 0x4A5A6E);
+                ui_text_transparent(c.x + 12 + k * 16, y, one, C_DIM);
             }
         }
 
@@ -6622,7 +4041,7 @@ static void te_render(ui_rect c) {
 
     /* 底部状态行 */
     int sy = c.y + c.h - 34;
-    ui_hline(c.x + 12, sy - 6, c.w - 24, 0x1E2A39);
+    ui_hline(c.x + 12, sy - 6, c.w - 24, C_BORDER);
 
     if (g_te_confirm) {
         gui_text_n(c.x + 12, sy,
@@ -6887,11 +4306,11 @@ static void term_execute(void) {
     term_prompt();
 }
 
-static void gui_term_reset(void) {
+void gui_term_reset(void) {
     if (g_term_ready) return;
 
     term_clear();
-    term_print("SaylterOS v0.3 Beta1 - GUI terminal", 4);
+    term_print("SaylterOS v0.3 Beta2 - GUI terminal", 4);
     term_newline();
     term_print("Same shell as the TTY session. Type help for commands.", 3);
     term_newline();
@@ -6923,7 +4342,7 @@ static void gui_term_render(const ui_theme *t, ui_rect c) {
         return;
     }
 
-    ui_round_fill(c, 10, 0x0A0F16);
+    ui_round_fill(c, 10, C_BG);
 
     int cols = (c.w - 24) / 16;
     if (cols > GUI_TERM_COLS) cols = GUI_TERM_COLS;
@@ -6991,7 +4410,7 @@ static void gui_term_render(const ui_theme *t, ui_rect c) {
         int track_h = rows * 32;
         if (track_h > c.h - 16) track_h = c.h - 16;
 
-        ui_round_fill((ui_rect){ track_x, track_y, 6, track_h }, 3, 0x141C27);
+        ui_round_fill((ui_rect){ track_x, track_y, 6, track_h }, 3, C_PANEL);
 
         int thumb_h = (int)(((long)track_h * (long)rows) / (long)total);
         if (thumb_h < 24) thumb_h = 24;
@@ -7289,7 +4708,7 @@ static void br_load(const char *url, int add_history) {
     }
 }
 
-static void gui_browser_reset(void) {
+void gui_browser_reset(void) {
     if (g_br_ready) return;
 
     g_copy(g_br_input, "http://example.com/", GUI_BR_URL);
@@ -7305,7 +4724,7 @@ static void gui_browser_reset(void) {
 static void gui_browser_render(const ui_theme *t, ui_rect c) {
     (void)t;
 
-    ui_round_fill(c, 10, 0x0B1017);
+    ui_round_fill(c, 10, C_BG);
 
     ui_rect back = br_back_rect(c);
     ui_rect addr = br_addr_rect(c);
@@ -7317,7 +4736,7 @@ static void gui_browser_render(const ui_theme *t, ui_rect c) {
     int back_hover = g_point_in(&back, g_mx, g_my) && g_br_hist_pos > 1;
     gui_button(back, "Back", back_hover, 0);
 
-    ui_round_panel(addr, 10, g_br_addr_focus ? C_ACCENT : C_BORDER, 0x0C141E);
+    ui_round_panel(addr, 10, g_br_addr_focus ? C_ACCENT : C_BORDER, C_PANEL);
     gui_text_n(addr.x + 14, addr.y + 6, g_br_input,
                (addr.w - 28) / 16, C_TEXT);
     if (g_br_addr_focus && ((net_now_ms() / 500u) & 1u) == 0) {
@@ -7492,16 +4911,16 @@ struct GuiDeskEntry {
 };
 
 static struct GuiDeskEntry g_desk[GUI_DESK_MAX];
-static int      g_desk_count = 0;
+int      g_desk_count = 0;
 static char     g_desk_path[256];
-static int      g_desk_menu = 0;
+int      g_desk_menu = 0;
 static int      g_desk_menu_x = GUI_TASKBAR_W + 24;
 static int      g_desk_menu_y = 24;
-static int      g_desk_prompt = 0;      /* 1 = 新建文件, 2 = 新建文件夹 */
+int      g_desk_prompt = 0;      /* 1 = 新建文件, 2 = 新建文件夹 */
 static char     g_desk_input[64];
 static int      g_desk_input_len = 0;
 static uint32_t g_desk_click_ms = 0;
-static int      g_desk_click_idx = -1;
+int      g_desk_click_idx = -1;
 
 static int desk_is_dir(const struct GuiDeskEntry *e) {
     return e->type == GUI_DIR_DIR;
@@ -7531,7 +4950,7 @@ static void desk_layout(void) {
     }
 }
 
-static void gui_desk_refresh(void) {
+void gui_desk_refresh(void) {
     const struct AuthUser *u = auth_current();
     const char *home = (u && u->home[0]) ? u->home : "home\\root";
     g_copy(g_desk_path, home, (int)sizeof(g_desk_path));
@@ -7569,28 +4988,55 @@ static void gui_desk_reset(void) {
     gui_desk_refresh();
 }
 
+/* 右键菜单项定义。菜单尺寸完全由内容决定：宽度取最长文案，
+ * 高度按项数增长，再夹在桌面可用区域内。这样中文/英文、不同
+ * 字体宽度都不会出现文字被裁掉。 */
+#define DESK_MENU_ITEMS 4
+static const char *desk_menu_label(int i) {
+    static const char *labels[DESK_MENU_ITEMS] = {
+        "New File", "New Folder", "Refresh", "Open Home in Files"
+    };
+    return (i >= 0 && i < DESK_MENU_ITEMS) ? labels[i] : "";
+}
+
+static int desk_menu_width(void) {
+    int w = 220;
+    for (int i = 0; i < DESK_MENU_ITEMS; i++) {
+        int tw = ui_text_width(LTR(desk_menu_label(i))) + 16 + 28;
+        if (tw > w) w = tw;
+    }
+
+    int avail = gW - GUI_TASKBAR_W - 16;
+    if (w > avail) w = avail;
+    if (w < 160) w = 160;
+    return w;
+}
+
 static ui_rect desk_menu_rect(void) {
-    return (ui_rect){ g_desk_menu_x, g_desk_menu_y, 250, 168 };
+    int w = desk_menu_width();
+    int h = 16 + DESK_MENU_ITEMS * 38;
+
+    int x = g_desk_menu_x;
+    int y = g_desk_menu_y;
+    if (x + w > gW - 8) x = gW - 8 - w;
+    if (x < GUI_TASKBAR_W + 4) x = GUI_TASKBAR_W + 4;
+    if (y + h > gH - 8) y = gH - 8 - h;
+    if (y < 4) y = 4;
+    return (ui_rect){ x, y, w, h };
 }
 
 static void gui_desk_menu_render(void) {
     ui_rect p = desk_menu_rect();
-    int items = 4;
-    const char *labels[4] = { "New File", "New Folder", "Refresh", "Open Home in Files" };
-
-    /* 防止菜单超出屏幕右下角 */
-    if (p.x + p.w > gW - 8) p.x = gW - 8 - p.w;
-    if (p.y + p.h > gH - 8) p.y = gH - 8 - p.h;
 
     ui_shadow(p, 12, 8);
-    ui_round_panel(p, 12, C_BORDER, 0x121A25);
+    ui_round_panel(p, 12, C_BORDER, C_MENU_BG);
 
-    for (int i = 0; i < items; i++) {
+    for (int i = 0; i < DESK_MENU_ITEMS; i++) {
         ui_rect row = { p.x + 8, p.y + 8 + i * 38, p.w - 16, 34 };
         int hover = g_point_in(&row, g_mx, g_my);
         hunt_add(row);
-        if (hover) ui_round_fill(row, 8, 0x1B2836);
-        ui_text_transparent(row.x + 14, row.y + 1, LTR(labels[i]), C_TEXT);
+        if (hover) ui_round_fill(row, 8, C_HOVER);
+        ui_text_transparent(row.x + 14, row.y + 1, LTR(desk_menu_label(i)), C_TEXT);
     }
 
     g_desk_menu_x = p.x;
@@ -7609,13 +5055,13 @@ static ui_rect desk_prompt_card(void) {
 static void gui_desk_prompt_render(void) {
     ui_rect c = desk_prompt_card();
     ui_shadow(c, 16, 10);
-    ui_round_panel(c, 16, C_BORDER, 0x121A25);
+    ui_round_panel(c, 16, C_BORDER, C_MENU_BG);
 
     ui_text_transparent(c.x + 24, c.y + 16,
                         g_desk_prompt == 1 ? "NEW FILE" : "NEW FOLDER", C_DIM);
 
     ui_rect box = { c.x + 24, c.y + 60, c.w - 48, 44 };
-    ui_round_panel(box, 10, C_ACCENT, 0x0C141E);
+    ui_round_panel(box, 10, C_ACCENT, C_PANEL);
     gui_text_n(box.x + 14, box.y + 7, g_desk_input, (box.w - 28) / 16, C_TEXT);
     if (((net_now_ms() / 500u) & 1u) == 0) {
         int cx = box.x + 14 + g_desk_input_len * 16;
@@ -7668,7 +5114,7 @@ static void gui_desk_click(int x, int y) {
             g_desk_menu = 0;
             return;
         }
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < DESK_MENU_ITEMS; i++) {
             ui_rect row = { p.x + 8, p.y + 8 + i * 38, p.w - 16, 34 };
             if (!g_point_in(&row, x, y)) continue;
 
@@ -7730,17 +5176,29 @@ static void gui_desk_click(int x, int y) {
 /* 桌面右键：空白处弹出菜单；图标上右键选中图标后弹出；
  * 菜单已打开时，右键在菜单内等同执行该项，在菜单外则关闭。 */
 static void gui_desktop_rclick(int x, int y) {
+    if (gui_dialog_active()) {
+        return;
+    }
     if (g_desk_prompt) {
         g_desk_prompt = 0;
         return;
     }
 
-    /* 任务栏/搜索/电源/用户/网络弹出层打开时，右键先关闭它们 */
-    if (g_power_menu || g_user_menu || g_net_menu || g_search_open) {
+    /* 任务栏右键菜单打开时：右键只关闭它 */
+    if (g_tb_menu) {
+        gui_tb_menu_close();
+        return;
+    }
+
+    /* 任务栏/搜索/电源/用户/网络/时间/溢出弹出层打开时，右键先关闭它们 */
+    if (g_power_menu || g_user_menu || g_net_menu || g_search_open ||
+        g_time_menu || g_tb_overflow) {
         g_power_menu = 0;
         g_user_menu = 0;
         g_net_menu = 0;
         g_search_open = 0;
+        g_time_menu = 0;
+        g_tb_overflow = 0;
         return;
     }
 
@@ -7754,7 +5212,11 @@ static void gui_desktop_rclick(int x, int y) {
         return;
     }
 
-    if (x < GUI_TASKBAR_W) return;
+    /* 任务栏图标右键：打开"打开/取消固定"或"关闭/结束任务/固定"菜单 */
+    if (x < GUI_TASKBAR_W) {
+        gui_taskbar_rclick(x, y);
+        return;
+    }
 
     /* 右键落在窗口上：关闭桌面菜单，不做窗口级右键菜单 */
     if (win_topmost_at(x, y) >= 0) return;
@@ -7812,16 +5274,16 @@ static int gui_desk_key(char key) {
     return 1;
 }
 
-static void gui_desk_render(void) {
+void gui_desk_render(void) {
     for (int i = 0; i < g_desk_count; i++) {
         ui_rect r = g_desk[i].r;
         int selected = (g_desk_click_idx == i);
         int hover = g_point_in(&r, g_mx, g_my);
 
         if (selected) {
-            ui_round_fill(r, 10, 0x1E3048);
+            ui_round_fill(r, 10, C_SEL);
         } else if (hover) {
-            ui_round_fill(r, 10, 0x16202C);
+            ui_round_fill(r, 10, C_HOVER);
         }
 
         int icon = GUI_DESK_ICON;
@@ -7831,7 +5293,7 @@ static void gui_desk_render(void) {
         if (desk_is_dir(&g_desk[i])) {
             icon_folder(ix, iy, icon, C_WARN);
         } else {
-            icon_file(ix, iy, icon, 0xA9BDD2);
+            icon_file(ix, iy, icon, C_DIM);
         }
 
         int chars = (r.w - 12) / 16;
@@ -7842,7 +5304,7 @@ static void gui_desk_render(void) {
 
     if (g_desk_count == 0) {
         int cx = GUI_TASKBAR_W + (gW - GUI_TASKBAR_W) / 2;
-        gui_text_center("Empty home directory", cx, gH / 2 - 40, 0x24344A);
+        gui_text_center("Empty home directory", cx, gH / 2 - 40, C_DIM);
     }
 
     if (g_desk_menu) gui_desk_menu_render();
@@ -8059,7 +5521,7 @@ static int slz_parse(const char *src, int len) {
     return 1;
 }
 
-static void gui_slyz_req_size(int *w, int *h) {
+void gui_slyz_req_size(int *w, int *h) {
     if (!g_slz_ready) return;
     if (w) *w = g_slz_w;
     if (h) *h = g_slz_h;
@@ -8072,12 +5534,20 @@ static int gui_slyz_is_program(const char *path) {    void *fh = slyzfs_open(pat
     int n = slyzfs_read(fh, head, 8);
     slyzfs_close(fh);
 
-    /* SLYZ v2 编译产物以 "SLYZBIN\0" 开头。旧的 #gui 文本程序
-     * 已不再识别：驱动器/文件管理器双击时应启动独立应用窗口，
+    /* 两种二进制头都算独立应用：
+     *   SLYZBIN\0  v2 字节码
+     *   SLYZ3BIN   v3 字节码（声明式 screen）
+     * 旧的 #gui 文本程序已不再识别：双击时应启动独立应用窗口，
      * 而不是把二进制当文本丢进编辑器。 */
     if (n < 8) return 0;
+
+    if (head[0] == 'S' && head[1] == 'L' && head[2] == 'Y' && head[3] == 'Z' &&
+        head[4] == 'B' && head[5] == 'I' && head[6] == 'N' && head[7] == 0) {
+        return 1;
+    }
+
     return head[0] == 'S' && head[1] == 'L' && head[2] == 'Y' && head[3] == 'Z' &&
-           head[4] == 'B' && head[5] == 'I' && head[6] == 'N' && head[7] == 0;
+           head[4] == '3' && head[5] == 'B' && head[6] == 'I' && head[7] == 'N';
 }
 
 /* 从路径取出不含目录与扩展名的文件名，用于把 .slyz 绑定到窗口 */
@@ -8294,7 +5764,7 @@ static void slz_run_action(const char *action) {
 static void gui_slyz_render(const ui_theme *t, ui_rect c) {
     (void)t;
 
-    ui_round_fill(c, 10, 0x0B1017);
+    ui_round_fill(c, 10, C_BG);
 
     int x = c.x + 16;
     int y = c.y + 12;
@@ -8328,12 +5798,12 @@ static void gui_slyz_render(const ui_theme *t, ui_rect c) {
             int h = 44;
             ctl->r = (ui_rect){ x, y, w, h };
             ui_round_panel(ctl->r, 10,
-                           (g_slz_focus == i) ? C_ACCENT : C_BORDER, 0x0C141E);
+                           (g_slz_focus == i) ? C_ACCENT : C_BORDER, C_PANEL);
 
             if (ctl->value_len > 0) {
                 gui_text_n(x + 14, y + 7, ctl->value, (w - 28) / 16, C_TEXT);
             } else if (ctl->text[0]) {
-                gui_text_n(x + 14, y + 7, ctl->text, (w - 28) / 16, 0x5A6B7E);
+                gui_text_n(x + 14, y + 7, ctl->text, (w - 28) / 16, C_DIM);
             }
 
             if (g_slz_focus == i && ((net_now_ms() / 500u) & 1u) == 0) {
@@ -8357,7 +5827,7 @@ static void gui_slyz_render(const ui_theme *t, ui_rect c) {
     /* 输出区：占满剩余空间 */
     if (y < bottom - 60) {
         ui_rect out = { x, y + 6, w, bottom - y - 6 };
-        ui_round_fill(out, 10, 0x0A111A);
+        ui_round_fill(out, 10, C_BG);
 
         int rows = (out.h - 12) / 32;
         if (rows < 1) rows = 1;
@@ -8494,6 +5964,9 @@ static void gui_desktop_reset(void) {
     g_user_menu = 0;
     g_power_menu = 0;
     g_net_menu = 0;
+    g_time_menu = 0;
+    g_tb_overflow = 0;
+    g_tb_menu = 0;
 
     g_fm_modal = 0;
     g_fm_last_click_index = -1;
@@ -8505,9 +5978,19 @@ static void gui_desktop_reset(void) {
     gui_desk_reset();
 }
 
-static void dirty_key_surface(void);
-
 static void gui_desktop_key(char key) {
+    /* 模态对话框优先吃掉所有按键（Esc/Enter/文件名编辑）。 */
+    if (gui_dialog_active()) {
+        gui_dialog_key(key);
+        return;
+    }
+
+    /* PrtSc：先抓屏，再弹保存位置选择。 */
+    if (key == (char)0xFB) {
+        gui_dialog_open_screenshot();
+        return;
+    }
+
     /* Ctrl+Space 是输入法开关，任何焦点下都生效 */
     if (key == (char)0xFE) {
         int had_popup = gui_ime_active();
@@ -8683,226 +6166,31 @@ static void gui_desktop_key(char key) {
     }
 }
 
-static void gui_taskbar_click(int x, int y) {
-    ui_rect av = tb_avatar_rect();
-    ui_rect sr = tb_search_rect();
-    ui_rect pr = tb_power_rect();
-    ui_rect nr = tb_net_rect();
-
-    if (g_point_in(&av, x, y)) {
-        g_user_menu = !g_user_menu;
-        g_power_menu = 0;
-        return;
-    }
-    if (g_point_in(&sr, x, y)) {
-        g_search_open = !g_search_open;
-        if (g_search_open) {
-            g_search_len = 0;
-            g_search[0] = '\0';
-            g_search_sel = 0;
-        }
-        g_user_menu = 0;
-        g_power_menu = 0;
-        return;
-    }
-    if (g_point_in(&nr, x, y)) {
-        g_net_menu = !g_net_menu;
-        g_user_menu = 0;
-        g_power_menu = 0;
-        return;
-    }
-    if (g_point_in(&pr, x, y)) {
-        g_power_menu = !g_power_menu;
-        g_user_menu = 0;
-        return;
-    }
-
-    for (int i = 0; i < GUI_APP_COUNT; i++) {
-        if (g_apps[i].hidden) continue;
-        ui_rect r = tb_app_rect(i);
-        if (g_point_in(&r, x, y)) {
-            launch_app(g_apps[i].win);
-            return;
-        }
-    }
-
-    for (int i = 0; i < GUI_WIN_MAX; i++) {
-        if (!g_wins[i].open || i == WIN_MEDIA) continue;
-        ui_rect r = tb_win_rect(i);
-        if (g_point_in(&r, x, y)) {
-            if (g_wins[i].minimized) win_restore_from_min(i);
-            win_focus(i);
-            return;
-        }
-    }
-}
-
-static void gui_user_menu_click(int x, int y) {
-    ui_rect p = user_menu_rect();
-    if (!g_point_in(&p, x, y)) {
-        g_user_menu = 0;
-        return;
-    }
-
-    ui_rect out = { p.x + 12, p.y + 98, p.w - 24, 54 };
-    if (g_point_in(&out, x, y)) {
-        g_pending_action = ACT_LOGOUT;
-        g_user_menu = 0;
-    }
-}
-
-static void gui_power_menu_click(int x, int y) {
-    ui_rect p = power_menu_rect();
-    if (!g_point_in(&p, x, y)) {
-        g_power_menu = 0;
-        return;
-    }
-
-    for (int i = 0; i < 4; i++) {
-        ui_rect row = { p.x + 12, p.y + 60 + i * 42, p.w - 24, 38 };
-        if (!g_point_in(&row, x, y)) continue;
-
-        if (i == 0) g_pending_action = ACT_REBOOT;
-        else if (i == 1) g_pending_action = ACT_SHUTDOWN;
-        else if (i == 2) g_pending_action = ACT_TTY;
-        g_power_menu = 0;
-        return;
-    }
-}
-
-static void gui_net_menu_click(int x, int y) {
-    ui_rect p = net_menu_rect();
-    if (!g_point_in(&p, x, y)) {
-        g_net_menu = 0;
-        return;
-    }
-
-    ui_rect rf = net_menu_close_rect(&p);
-    if (g_point_in(&rf, x, y)) {
-        g_net_menu = 0;
-        return;
-    }
-
-    ui_rect vs = volume_slider_rect(&p);
-    ui_rect hit = { vs.x, vs.y - 12, vs.w, vs.h + 24 };
-    if (g_point_in(&hit, x, y)) {
-        int vol = (x - vs.x) * 100 / vs.w;
-        audio_set_volume(vol);
-        dirty_add_padded(&p, 18);
-        return;
-    }
-}
-
-static void gui_search_click(int x, int y) {
-    ui_rect p = search_panel_rect();
-    if (!g_point_in(&p, x, y)) {
-        g_search_open = 0;
-        return;
-    }
-
-    int matches[GUI_APP_COUNT];
-    int n = search_filter(matches);
-
-    int row_y = p.y + 120;
-    for (int i = 0; i < n; i++) {
-        ui_rect row = { p.x + 12, row_y + i * 72, p.w - 24, 64 };
-        if (g_point_in(&row, x, y)) {
-            launch_app(g_apps[matches[i]].win);
-            return;
-        }
-    }
-}
-
-static void gui_window_click(int id, int x, int y) {
-    ui_rect r = g_wins[id].r;
-
-    ui_rect close_r = win_close_rect(&r);
-    if (g_point_in(&close_r, x, y)) {
-        if (id == WIN_EDITOR && g_ed_dirty) {
-            g_ed_ask_save = 1;
-            win_focus(id);
-        } else {
-            win_close(id);
-        }
-        return;
-    }
-
-    ui_rect max_r = win_max_btn_rect(&r);
-    if (g_point_in(&max_r, x, y)) {
-        win_toggle_max(id);
-        return;
-    }
-
-    ui_rect min_r = win_min_btn_rect(&r);
-    if (g_point_in(&min_r, x, y)) {
-        win_minimize(id);
-        return;
-    }
-
-    /* 边缘/角落调整大小优先于拖动与内容点击 */
-    int edge = win_resize_edge_at(&r, x, y, g_wins[id].maximized);
-    if (edge) {
-        win_focus(id);
-        g_resizing = id;
-        g_resize_edge = edge;
-        g_resize_start = r;
-        g_resize_mx0 = x;
-        g_resize_my0 = y;
-        return;
-    }
-
-    if (y >= r.y && y < r.y + 52) {
-        win_focus(id);
-        /* 最大化时标题栏不拖动，避免把窗口拖成"半出屏"的怪状态 */
-        if (!g_wins[id].maximized) {
-            g_dragging = id;
-            g_drag_dx = x - r.x;
-            g_drag_dy = y - r.y;
-        }
-        return;
-    }
-
-    win_focus(id);
-
-    ui_rect c = win_content_rect(&r);
-    if (id == WIN_FILES) {
-        gui_files_click(c, x, y);
-    } else if (id == WIN_EDITOR) {
-        gui_editor_click(c, x, y);
-    } else if (id == WIN_TERM) {
-        gui_term_click(c, x, y);
-    } else if (id == WIN_BROWSER) {
-        gui_browser_click(c, x, y);
-    } else if (id == WIN_SLYZ) {
-        if (gui_app_active(WIN_SLYZ)) {
-            gui_app_click(WIN_SLYZ, x - c.x, y - c.y, 1);
-        } else {
-            gui_slyz_click(c, x, y);
-        }
-    } else if (id == WIN_TASKMGR) {
-        gui_tm_click(c, x, y);
-    } else if (id == WIN_CALC) {
-        gui_calc_click(c, x, y);
-    } else if (id == WIN_MEDIA) {
-        if (gui_app_active(WIN_MEDIA)) {
-            gui_app_click(WIN_MEDIA, x - c.x, y - c.y, 1);
-        }
-    } else if (id == WIN_EXTERNAL) {
-        if (g_ext_host && g_ext_host->mouse) {
-            g_ext_host->mouse(x - c.x, y - c.y, 1);
-        }
-    } else {
-        gui_settings_click(c, x, y);
-    }
-}
 
 static void gui_desktop_click(int x, int y) {
+    if (gui_dialog_active()) {
+        gui_dialog_click(x, y);
+        return;
+    }
     if (g_fm_modal) {
         gui_files_modal_click(g_wins[WIN_FILES].r, x, y);
         return;
     }
     if (g_ed_ask_save) {
         gui_editor_modal_click(g_wins[WIN_EDITOR].r, x, y);
+        return;
+    }
+
+    /* 任务栏右键菜单优先级最高：点菜单项执行，点外面关闭 */
+    if (g_tb_menu) {
+        if (gui_tb_menu_click(x, y)) return;
+    }
+    if (g_time_menu) {
+        gui_time_menu_click(x, y);
+        return;
+    }
+    if (g_tb_overflow) {
+        gui_tb_overflow_click(x, y);
         return;
     }
 
@@ -8943,157 +6231,109 @@ static void gui_desktop_click(int x, int y) {
 /* 结构性状态指纹：兜底检测"该刷新但没人标脏"的情况。
  * 刻意不含窗口坐标——拖动是逐帧标脏的，若把坐标算进来，每一帧
  * 指纹都会变化并退化成全屏刷新，动态脏矩形就白做了。 */
-static uint32_t g_sig_mix(uint32_t h, uint32_t v) {
-    h ^= v;
-    h *= 16777619u;
-    return h;
-}
 
-static uint32_t gui_state_sig(void) {
-    uint32_t h = 2166136261u;
+/* ============================================================
+ * 内置应用分发（dwm 的唯一入口）
+ * ------------------------------------------------------------
+ * 窗口装饰/层级由 gui_dwm.c 负责，内容区的绘制、点击与关闭确认
+ * 由本文件负责。两边只通过这三个函数耦合，以后把内置应用替换成
+ * 独立进程时，只需要在这里改成 surface 提交。
+ * ============================================================ */
 
-    h = g_sig_mix(h, (uint32_t)(g_focus + 1));
-    h = g_sig_mix(h, (uint32_t)g_search_open);
-    h = g_sig_mix(h, (uint32_t)g_user_menu);
-    h = g_sig_mix(h, (uint32_t)g_power_menu);
-    h = g_sig_mix(h, (uint32_t)g_net_menu);
-    h = g_sig_mix(h, (uint32_t)g_fm_modal);
-    h = g_sig_mix(h, (uint32_t)g_ed_ask_save);
-    h = g_sig_mix(h, (uint32_t)g_desk_menu);
-    h = g_sig_mix(h, (uint32_t)g_desk_prompt);
-    h = g_sig_mix(h, (uint32_t)(g_desk_click_idx + 1));
-    h = g_sig_mix(h, (uint32_t)g_desk_count);
-
-    for (int i = 0; i < GUI_WIN_MAX; i++) {
-        h = g_sig_mix(h, (uint32_t)(g_wins[i].open ? (g_wins[i].z + 1) : 0));
-        h = g_sig_mix(h, (uint32_t)g_wins[i].maximized);
-        h = g_sig_mix(h, (uint32_t)g_wins[i].minimized);
-    }
-
-    return h;
-}
-
-/* 键盘输入影响的表面：搜索面板 / 焦点窗口 */
-static void dirty_key_surface(void) {
-    if (g_search_open) {
-        ui_rect p = search_panel_rect();
-        dirty_add_padded(&p, 18);
-        return;
-    }
-    if (g_focus >= 0 && g_wins[g_focus].open) {
-        dirty_window(g_focus);
-        return;
-    }
-    dirty_all();
-}
-
-/* 光标闪烁只影响"带输入框"的表面 */
-static void dirty_blink_surface(void) {
-    if (g_search_open) {
-        ui_rect p = search_panel_rect();
-        dirty_add_padded(&p, 18);
-        return;
-    }
-    if (g_fm_modal) {
-        dirty_window(WIN_FILES);
-        return;
-    }
-    if (g_ed_ask_save) {
-        dirty_window(WIN_EDITOR);
-        return;
-    }
-    if (gui_editor_is_open()) {
-        dirty_window(WIN_EDITOR);
-    }
-}
-
-static void pf_account(int full, uint32_t pixels);
-
-static void gui_present_all(void) {
-    gui_cursor_erase();
-    hunt_reset();
-    gui_desktop_render();
-    hunt_snapshot();
-    gui_cursor_draw(g_mx, g_my);
-    ui_swap();
-}
-
-static void gui_present_cursor(void) {
-    int old_x = g_cursor_x;
-    int old_y = g_cursor_y;
-
-    gui_cursor_erase();
-    gui_cursor_draw(g_mx, g_my);
-
-    if (old_x >= 0) {
-        vbe_swap_rect((uint16_t)old_x, (uint16_t)old_y,
-                      GUI_CURSOR_W, GUI_CURSOR_H);
-    }
-    vbe_swap_rect((uint16_t)g_mx, (uint16_t)g_my,
-                  GUI_CURSOR_W, GUI_CURSOR_H);
-
-    pf_account(0, (uint32_t)GUI_CURSOR_W * GUI_CURSOR_H * 2u);
-}
-
-/* ---- 临时呈现统计（验证稳态没有全屏 blit） ---- */
-extern void kserial_puts(const char *s);
-extern void kserial_dec32(uint32_t v);
-
-static uint32_t g_pf_frames = 0;
-static uint32_t g_pf_full = 0;
-static uint32_t g_pf_pixels = 0;
-
-static void pf_account(int full, uint32_t pixels) {
-    g_pf_frames++;
-    if (full) g_pf_full++;
-    g_pf_pixels += pixels;
-
-    if (g_pf_frames >= 600) {
-        kserial_puts("[GUI] frames=");
-        kserial_dec32(g_pf_frames);
-        kserial_puts(" full=");
-        kserial_dec32(g_pf_full);
-        kserial_puts(" avg_px=");
-        kserial_dec32(g_pf_pixels / g_pf_frames);
-        kserial_puts("\r\n");
-        g_pf_frames = 0;
-        g_pf_full = 0;
-        g_pf_pixels = 0;
-    }
-}
-
-static void gui_present_dirty(void) {
-    int old_x = g_cursor_x;
-    int old_y = g_cursor_y;
-
-    gui_cursor_erase();
-
-    hunt_reset();
-    if (dirty_is_full()) {
-        gui_desktop_render();
+void gui_app_content_render(int id, const ui_theme *t, ui_rect c) {
+    if (id == WIN_FILES) {
+        gui_files_render(t, c);
+    } else if (id == WIN_EDITOR) {
+        gui_editor_render(t, c);
+    } else if (id == WIN_TERM) {
+        gui_term_render(t, c);
+    } else if (id == WIN_BROWSER) {
+        gui_browser_render(t, c);
+    } else if (id == WIN_SLYZ) {
+        /* 通用 SLYZ 窗口：有独立应用时由虚拟机绘制，
+         * 否则回退到旧的声明式界面渲染。 */
+        if (!gui_app_render(WIN_SLYZ, c)) {
+            gui_slyz_render(t, c);
+        }
+    } else if (id == WIN_TASKMGR) {
+        gui_tm_render(t, c);
+    } else if (id == WIN_CALC) {
+        gui_calc_render(t, c);
+    } else if (id == WIN_MEDIA) {
+        if (!gui_app_render(WIN_MEDIA, c)) {
+            vbe_fill_rect((uint16_t)c.x, (uint16_t)c.y, (uint16_t)c.w,
+                          (uint16_t)c.h, C_BG);
+        }
+    } else if (id == WIN_EXTERNAL) {
+        /* 原生预装应用：只画内容区，标题栏/边框/层级由窗口系统负责。
+         * 内容区尺寸变化时先通知应用重新布局，再让它绘制。 */
+        if (g_ext_host) {
+            int resized = (!g_ext_content_valid ||
+                           g_ext_content.w != c.w || g_ext_content.h != c.h);
+            g_ext_content = c;
+            g_ext_content_valid = 1;
+            if (resized && g_ext_host->resize) {
+                g_ext_host->resize(c.w, c.h);
+            }
+            if (g_ext_host->render) {
+                g_ext_host->render(c.x, c.y, c.w, c.h);
+            }
+        } else {
+            vbe_fill_rect((uint16_t)c.x, (uint16_t)c.y, (uint16_t)c.w,
+                          (uint16_t)c.h, C_BG);
+        }
     } else {
-        gui_render_dirty_surfaces();
+        gui_settings_render(t, c);
     }
-    hunt_snapshot();
 
-    gui_cursor_draw(g_mx, g_my);
+    /* 模态框覆盖整个窗口（不只是内容区），必须在内容之后绘制 */
+    if (id == WIN_FILES && gui_files_modal_active()) {
+        gui_files_modal_render(t, g_wins[id].r);
+    } else if (id == WIN_EDITOR && gui_editor_modal_active()) {
+        gui_editor_modal_render(t, g_wins[id].r);
+    }
+}
 
-    if (dirty_is_full()) {
-        ui_swap();
-        pf_account(1, (uint32_t)gW * (uint32_t)gH);
+void gui_app_content_click(int id, ui_rect c, int x, int y) {
+    if (id == WIN_FILES) {
+        gui_files_click(c, x, y);
+    } else if (id == WIN_EDITOR) {
+        gui_editor_click(c, x, y);
+    } else if (id == WIN_TERM) {
+        gui_term_click(c, x, y);
+    } else if (id == WIN_BROWSER) {
+        gui_browser_click(c, x, y);
+    } else if (id == WIN_SLYZ) {
+        if (gui_app_active(WIN_SLYZ)) {
+            gui_app_click(WIN_SLYZ, x - c.x, y - c.y, 1);
+        } else {
+            gui_slyz_click(c, x, y);
+        }
+    } else if (id == WIN_TASKMGR) {
+        gui_tm_click(c, x, y);
+    } else if (id == WIN_CALC) {
+        gui_calc_click(c, x, y);
+    } else if (id == WIN_MEDIA) {
+        if (gui_app_active(WIN_MEDIA)) {
+            gui_app_click(WIN_MEDIA, x - c.x, y - c.y, 1);
+        }
+    } else if (id == WIN_EXTERNAL) {
+        if (g_ext_host && g_ext_host->mouse) {
+            g_ext_host->mouse(x - c.x, y - c.y, 1);
+        }
+    } else {
+        gui_settings_click(c, x, y);
+    }
+}
+
+/* 关闭按钮：编辑器有未保存修改时先弹确认框，其余窗口直接关闭。 */
+void gui_window_request_close(int id) {
+    if (id == WIN_EDITOR && g_ed_dirty) {
+        g_ed_ask_save = 1;
+        win_focus(id);
         return;
     }
-
-    uint32_t px = (uint32_t)GUI_CURSOR_W * GUI_CURSOR_H * 2u;
-    int n_rects = dirty_rect_count();
-    for (int i = 0; i < n_rects; i++) {
-        ui_rect rr;
-        dirty_rect_get(i, &rr);
-        px += (uint32_t)rr.w * (uint32_t)rr.h;
-    }
-
-    dirty_swap_all(old_x, old_y);
-    pf_account(0, px);
+    win_close(id);
 }
 
 static int gui_desktop_run(void) {
@@ -9113,8 +6353,15 @@ static int gui_desktop_run(void) {
     last_sig = gui_state_sig();
     last_hover = gui_hover_id();
 
+    /* 性能窗口：每 500ms 往串口打一行，报告帧数、呈现次数、
+     * 最近一帧耗时以及呈现内部（渲染/上屏）的分段耗时。 */
+    uint32_t perf_last_us = net_now_us();
+    uint32_t perf_frames = 0;
+    uint32_t perf_presents = 0;
+
     for (;;) {
         uint64_t frame_start = gui_rdtsc();
+        uint32_t frame_t0_us = net_now_us();
 
         if (acpica_power_button_pending()) {
             gui_cursor_erase();
@@ -9148,8 +6395,12 @@ static int gui_desktop_run(void) {
 
         gui_mouse_update();
 
-        /* 鼠标滚轮：优先交给内容区内的 SLYZ 应用（v3 声明式界面可滚动），
+        /* 鼠标滚轮：模态对话框优先，其次内容区内的 SLYZ 应用，
          * 终端窗口沿用历史滚动。 */
+        if (g_mwheel != 0 && gui_dialog_active()) {
+            gui_dialog_wheel(g_mwheel);
+            g_mwheel = 0;
+        }
         if (g_mwheel != 0) {
             int top = win_topmost_at(g_mx, g_my);
             if (top >= 0 && gui_app_active(top)) {
@@ -9179,6 +6430,11 @@ static int gui_desktop_run(void) {
             int is_top = (win_topmost_at(g_mx, g_my) == mw);
             int down = (is_top && g_point_in(&mc, g_mx, g_my) && g_mdown) ? 1 : 0;
             gui_app_mouse(mw, lx, ly, down);
+        }
+
+        /* 任务栏固定图标拖动排序 */
+        if (g_mdown && g_mmoved) {
+            gui_taskbar_drag_update(g_mx, g_my);
         }
 
         if (g_dragging >= 0 && g_mmoved) {
@@ -9251,6 +6507,11 @@ static int gui_desktop_run(void) {
             if (gui_state_sig() != before_r) {
                 dirty_all();
             }
+        }
+
+        if (g_mreleased) {
+            /* 松开固定图标：没拖动就是普通点击，启动/聚焦应用 */
+            gui_taskbar_drag_end();
         }
 
         if (g_mreleased && g_dragging >= 0) {
@@ -9336,12 +6597,21 @@ static int gui_desktop_run(void) {
                 ui_rect nm = net_menu_rect();
                 dirty_add_rect(&nm);
             }
+            /* 时间菜单里的秒数每秒刷新 */
+            if (g_time_menu) {
+                ui_rect tm = time_menu_rect();
+                dirty_add_rect(&tm);
+            }
         }
 
         if (g_pending_action != ACT_NONE) {
             gui_cursor_erase();
             return g_pending_action;
         }
+
+        /* 动画期间强制整帧重绘：淡入混合需要完整的底图与前景，
+         * 局部脏矩形会重复混合同一块像素。 */
+        if (gui_anim_active()) dirty_all();
 
         /* 结构性状态变了却没人标脏时，兜底整帧刷新 */
         if (!dirty_is_full() && gui_state_sig() != last_sig) {
@@ -9351,6 +6621,7 @@ static int gui_desktop_run(void) {
         if (dirty_is_full() || g_dirty_count > 0) {
             dirty_compact();
             gui_present_dirty();
+            perf_presents++;
             last_sig = gui_state_sig();
         } else if (g_mmoved) {
             gui_present_cursor();
@@ -9381,6 +6652,37 @@ static int gui_desktop_run(void) {
 
         /* 调试 HUD：画在 backbuffer 上并单独上屏，覆盖在所有窗口之上。 */
         debug_hud_gui_tick();
+
+        /* ---- 串口实时性能报告（限频 500ms） ---- */
+        uint32_t frame_t1_us = net_now_us();
+        perf_frames++;
+        if ((int32_t)(frame_t1_us - perf_last_us) >= 500000) {
+            kserial_puts("[PERF] t=");
+            kserial_dec32(frame_t1_us / 1000u);
+            kserial_puts("ms frames=");
+            kserial_dec32(perf_frames);
+            kserial_puts(" present=");
+            kserial_dec32(perf_presents);
+            kserial_puts(" last=");
+            kserial_dec32(frame_t1_us - frame_t0_us);
+            kserial_puts("us render=");
+            kserial_dec32(g_perf_render_us);
+            kserial_puts("us blit=");
+            kserial_dec32(g_perf_blit_us);
+            kserial_puts("us dirty=");
+            kserial_dec32(g_perf_dirty_rects);
+            kserial_puts(" px=");
+            kserial_dec32(g_perf_dirty_px);
+            kserial_puts(" full=");
+            kserial_dec32((uint32_t)g_perf_full);
+            kserial_puts(" anim=");
+            kserial_dec32((uint32_t)(gui_anim_active() ? 1 : 0));
+            kserial_puts("\r\n");
+
+            perf_last_us = frame_t1_us;
+            perf_frames = 0;
+            perf_presents = 0;
+        }
     }
 }
 
@@ -9389,39 +6691,44 @@ static int gui_desktop_run(void) {
  * ============================================================ */
 
 void gui_main(void) {
+    g_perf_stage_us = net_now_us();
+    kserial_puts("[PERF] boot enter\r\n");
     if (!vbe_is_enabled()) return;
 
     gW = vbe_current.width;
     gH = vbe_current.height;
     if (gW < 800 || gH < 600) return;
+    perf_boot_stage("geom");
 
-    ui_theme_dark(&g_theme);
-    g_theme.bg = C_BG;
-    g_theme.panel = C_PANEL;
-    g_theme.panel_alt = C_PANEL2;
-    g_theme.border = C_BORDER;
-    g_theme.text = C_TEXT;
-    g_theme.text_dim = C_DIM;
-    g_theme.accent = C_ACCENT;
-    g_theme.accent_hover = C_ACCENT3;
-    g_theme.accent_dim = C_ACCENT2;
-    g_theme.ok = C_OK;
-    g_theme.warn = C_WARN;
-    g_theme.err = C_ERR;
+    /* 图形会话的输入法状态：从干净缓冲开始，登录后再加载用户词频。 */
+    ime_init();
+    perf_boot_stage("ime");
+
+    /* 主题在登录前就应用，启动画面与登录页也使用用户选择的配色。 */
+    gui_theme_apply(system_cfg_theme());
+    perf_boot_stage("theme");
 
     (void)ps2_mouse_init();
+    perf_boot_stage("mouse");
 
     /* 进入 GUI 时屏蔽 IRQ1，键盘改由 gui_kb_read 轮询。
      * 8086 的 8042 输出缓冲只有一个字节，键盘中断和鼠标轮询同时
      * 读会互抢数据（表现为按一个键出乱码），因此 GUI 全程只能有
      * 一个键盘读者。gui_kb_begin 内部已清空残留按键。 */
     gui_kb_begin();
+    perf_boot_stage("kbd");
 
     gui_app_init();
+    perf_boot_stage("apps");
+
+    /* 任务栏固定应用与顺序来自 etc\desktop.cfg */
+    gui_taskbar_prefs_load();
 
     /* AC'97 声卡与媒体播放服务；没有声卡时自动降级为静音。 */
     audio_init();
+    perf_boot_stage("audio_init");
     audio_start_task();
+    perf_boot_stage("audio_task");
 
     /* GUI 会话期间关闭 SlyzFS 的屏幕日志：文件管理器的 list_dir/open
      * 会在错误路径调用 printk，而 printk 直写 LFB，会直接在窗口上
@@ -9429,23 +6736,29 @@ void gui_main(void) {
     slyzfs_set_quiet(1);
 
     gui_startup_stage("Initializing display", 8);
-    gui_delay_ms(160);
+    gui_delay_ms(80);
+    perf_boot_stage("splash1");
 
     /* 网络栈只初始化一次：任务栏指示点、网络面板、浏览器都依赖它。
      * 没有网卡时 init 返回 -1，不影响后续启动。 */
     (void)net_init();
+    perf_boot_stage("net");
 
     auth_init();
+    perf_boot_stage("auth_init");
 
     gui_startup_stage("Loading accounts", 42);
-    gui_delay_ms(180);
+    gui_delay_ms(100);
     auth_reload();
+    perf_boot_stage("auth_reload");
 
     gui_startup_stage("Preparing user session", 74);
-    gui_delay_ms(180);
+    gui_delay_ms(100);
+    perf_boot_stage("splash2");
 
     gui_startup_stage("Starting desktop", 100);
-    gui_delay_ms(260);
+    gui_delay_ms(140);
+    perf_boot_stage("splash3");
 
     for (;;) {
         int uid = gui_login_screen();
@@ -9454,8 +6767,10 @@ void gui_main(void) {
             gui_kb_end();
             return;
         }
+        perf_boot_stage("login_done");
 
         int action = gui_desktop_run();
+        perf_boot_stage("desktop_exit");
 
         if (action == ACT_LOGOUT) {
             auth_logout();
@@ -9483,4 +6798,3 @@ void gui_main(void) {
         }
     }
 }
-

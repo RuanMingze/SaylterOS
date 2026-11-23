@@ -16,6 +16,10 @@ void gui_main(void);
  * 否则局部脏矩形重绘只会刷新设置窗口，桌面背景保持旧图。 */
 void gui_request_redraw_all(void);
 
+/* SLYZ 的 win.open(title, w, h)：按应用请求的内容区尺寸调整窗口，
+ * 自动居中并夹在可用桌面内。窗口尚未打开时同时完成打开与聚焦。 */
+void gui_slyz_resize_window(int win, int w, int h);
+
 /* 按扩展名打开文件：.mp3 -> 媒体播放器，SLYZ 程序 -> 应用窗口，
  * 其他文本 -> 编辑器。返回占用的窗口 id，失败返回 -1。
  * 供 SLYZ 的 os.open() 与桌面/文件管理器共用。 */

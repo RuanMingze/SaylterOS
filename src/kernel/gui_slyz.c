@@ -33,9 +33,13 @@
 #include "faultlab.h"
 #include "slyz3.h"
 #include "slyzui.h"
+#include "slyzfs_part.h"
 
 /* gui.c 每帧统计的 CPU 占用（千分比），由 gui.c 提供的访问器读取 */
 extern uint32_t gui_system_cpu_permille(void);
+/* gui_core.c 的主题切换与取色（gui_internal.h 属于内核私有头，这里只声明） */
+extern void gui_theme_apply(int id);
+extern uint32_t gui_theme_color(int slot);
 
 /* shell.c 的命令行执行入口：v3 的 os.exec 复用同一套命令解析 */
 extern int shell_exec_line(char *line);
@@ -70,7 +74,10 @@ struct GuiSlyzDirEntry {
 extern int   slyzfs_stat(const char *path, struct GuiSlyzDirEntry *out);
 extern int   slyzfs_list_dir(const char *path, struct GuiSlyzDirEntry *out, int out_max);
 extern int   slyzfs_mkdir(const char *path);
+extern int   slyzfs_rmdir(const char *path);
 extern int   slyzfs_remove(const char *path);
+extern int   slyzfs_copy_file(const char *src, const char *dst);
+extern int   slyzfs_move_file(const char *src, const char *dst);
 extern void *slyzfs_open(const char *path, const char *mode);
 extern int   slyzfs_read(void *fh, uint8_t *buf, int n);
 extern int   slyzfs_write(void *fh, const uint8_t *buf, int n);
@@ -420,6 +427,15 @@ static int cfg_get_value(const char *key, char *out, int cap) {
         slz_copy(out, system_cfg_avatar(), cap);
         return 1;
     }
+    if (slz_strlen(key) == 5 && key[0] == 't') {
+        slz_copy(out, system_cfg_theme() == SYSTEM_THEME_LIGHT_GREEN
+                          ? "light" : "dark", cap);
+        return 1;
+    }
+    if (slz_strlen(key) == 4 && key[0] == 'a') {
+        slz_copy(out, system_cfg_anim() ? "on" : "off", cap);
+        return 1;
+    }
     return 0;
 }
 
@@ -454,6 +470,19 @@ static int cfg_set_value(const char *key, const char *value) {
         gui_request_redraw_all();
         return 0;
     }
+    if (slz_strlen(key) == 5 && key[0] == 't') {
+        int id = (value[0] == 'l') ? SYSTEM_THEME_LIGHT_GREEN
+                                   : SYSTEM_THEME_DARK_ORANGE;
+        if (!system_cfg_set_theme(id)) return -1;
+        gui_theme_apply(id);
+        gui_request_redraw_all();
+        return 0;
+    }
+    if (slz_strlen(key) == 4 && key[0] == 'a') {
+        if (!system_cfg_set_anim(value[0] == 'o' && value[1] == 'n')) return -1;
+        gui_request_redraw_all();
+        return 0;
+    }
     return -1;
 }
 
@@ -473,9 +502,14 @@ static int gui_sys(struct SlyzVm *vm, uint16_t id,
             slyz_ret_nil(ret);
             return 0;
 
-        case SLE_SYS_WIN_OPEN:
+        case SLE_SYS_WIN_OPEN: {
+            /* win.open(title, w, h)：按应用声明的内容尺寸调整外框。 */
+            int w = (int)arg_i(args, argc, 1);
+            int h = (int)arg_i(args, argc, 2);
+            if (w > 0 && h > 0) gui_slyz_resize_window(a->win, w, h);
             slyz_ret_int(ret, (int64_t)a->win);
             return 0;
+        }
 
         case SLE_SYS_WIN_CLOSE:
             a->close_requested = 1;
@@ -659,12 +693,17 @@ static int gui_sys(struct SlyzVm *vm, uint16_t id,
             return 0;
         }
 
+        case SLE_SYS_THEME_GET:
+            slyz_ret_int(ret, (int64_t)gui_theme_color((int)arg_i(args, argc, 0)));
+            return 0;
+
         case SLE_SYS_CFG_KEYS: {
-            static const char *keys[5] = {
-                "boot.mode", "lang", "timezone", "wallpaper", "avatar"
+            static const char *keys[7] = {
+                "boot.mode", "lang", "timezone", "theme", "anim",
+                "wallpaper", "avatar"
             };
-            if (!slyz_ret_arr(vm, ret, 5)) return -1;
-            for (int i = 0; i < 5; i++) {
+            if (!slyz_ret_arr(vm, ret, 7)) return -1;
+            for (int i = 0; i < 7; i++) {
                 struct SlyzVal item;
                 if (!slyz_ret_str(vm, &item, keys[i], slz_strlen(keys[i]))) return -1;
                 slyz_arr_set(vm, ret, i, item);
@@ -1036,6 +1075,39 @@ static int v3_fs_entries(struct Slyz3Vm *vm, const char *path, struct SlyzVal *r
     return 0;
 }
 
+/* 分区列表 -> [[drive, start, sectors, mounted, label], ...] */
+static int v3_part_list(struct Slyz3Vm *vm, struct SlyzVal *ret) {
+    struct SlyzPartInfo info[4];
+    int n = slyzfs_part_list(info, 4);
+    if (n < 0) n = 0;
+
+    if (!slyz3_ret_arr(vm, ret, n)) return -1;
+    for (int i = 0; i < n; i++) {
+        struct SlyzVal row;
+        if (!slyz3_ret_arr(vm, &row, 5)) return -1;
+
+        struct SlyzVal item;
+        item.type = SLYZ_T_INT;
+        item.aux = 0;
+        item.u.i = info[i].drive;
+        slyz3_arr_set(vm, &row, 0, item);
+        item.u.i = (int64_t)info[i].start_lba;
+        slyz3_arr_set(vm, &row, 1, item);
+        item.u.i = (int64_t)info[i].sectors;
+        slyz3_arr_set(vm, &row, 2, item);
+        item.u.i = info[i].mounted ? 1 : 0;
+        slyz3_arr_set(vm, &row, 3, item);
+
+        int ll = 0;
+        while (ll < 23 && info[i].label[ll]) ll++;
+        if (!slyz3_ret_str(vm, &item, info[i].label, ll)) return -1;
+        slyz3_arr_set(vm, &row, 4, item);
+
+        slyz3_arr_set(vm, ret, i, row);
+    }
+    return 0;
+}
+
 static int v3_time_text(struct Slyz3Vm *vm, struct SlyzVal *ret, int date) {
     uint32_t ms = net_now_ms();
     char buf[24];
@@ -1121,6 +1193,47 @@ static int slyz3_gui_sys(struct Slyz3Vm *vm, uint16_t id,
             slyz3_ret_int(ret, slyzfs_mkdir(arg_s(args, argc, 0, 0)) ? 0 : -1);
             return 0;
 
+        case SLE_SYS_FS_RMDIR:
+            slyz3_ret_int(ret, slyzfs_rmdir(arg_s(args, argc, 0, 0)) ? 0 : -1);
+            return 0;
+
+        case SLE_SYS_FS_COPY:
+            slyz3_ret_int(ret, (int64_t)slyzfs_copy_file(
+                arg_s(args, argc, 0, 0), arg_s(args, argc, 1, 0)));
+            return 0;
+
+        case SLE_SYS_FS_MOVE:
+            slyz3_ret_int(ret, (int64_t)slyzfs_move_file(
+                arg_s(args, argc, 0, 0), arg_s(args, argc, 1, 0)));
+            return 0;
+
+        case SLE_SYS_PART_LIST:
+            return v3_part_list(vm, ret);
+
+        case SLE_SYS_PART_ADD:
+            slyz3_ret_int(ret, (int64_t)slyzfs_part_add(
+                (int)arg_i(args, argc, 0),
+                (uint32_t)arg_i(args, argc, 1),
+                arg_s(args, argc, 2, 0)));
+            return 0;
+
+        case SLE_SYS_PART_DELETE:
+            slyz3_ret_int(ret, (int64_t)slyzfs_part_delete((int)arg_i(args, argc, 0)));
+            return 0;
+
+        case SLE_SYS_PART_FORMAT:
+            slyz3_ret_int(ret, (int64_t)slyzfs_part_format(
+                (int)arg_i(args, argc, 0), arg_s(args, argc, 1, 0)));
+            return 0;
+
+        case SLE_SYS_PART_MOUNT:
+            slyz3_ret_int(ret, (int64_t)slyzfs_part_mount((int)arg_i(args, argc, 0)));
+            return 0;
+
+        case SLE_SYS_PART_UNMOUNT:
+            slyz3_ret_int(ret, (int64_t)slyzfs_part_unmount((int)arg_i(args, argc, 0)));
+            return 0;
+
         case SLE_SYS_CFG_GET: {
             char value[128];
             if (!cfg_get_value(arg_s(args, argc, 0, 0), value, (int)sizeof(value))) {
@@ -1136,12 +1249,17 @@ static int slyz3_gui_sys(struct Slyz3Vm *vm, uint16_t id,
                                                       arg_s(args, argc, 1, 0)));
             return 0;
 
+        case SLE_SYS_THEME_GET:
+            slyz3_ret_int(ret, (int64_t)gui_theme_color((int)arg_i(args, argc, 0)));
+            return 0;
+
         case SLE_SYS_CFG_KEYS: {
-            static const char *keys[5] = {
-                "boot.mode", "lang", "timezone", "wallpaper", "avatar"
+            static const char *keys[7] = {
+                "boot.mode", "lang", "timezone", "theme", "anim",
+                "wallpaper", "avatar"
             };
-            if (!slyz3_ret_arr(vm, ret, 5)) return -1;
-            for (int i = 0; i < 5; i++) {
+            if (!slyz3_ret_arr(vm, ret, 7)) return -1;
+            for (int i = 0; i < 7; i++) {
                 struct SlyzVal item;
                 if (!slyz3_ret_str(vm, &item, keys[i], slz_strlen(keys[i]))) return -1;
                 slyz3_arr_set(vm, ret, i, item);
@@ -1195,9 +1313,13 @@ static int slyz3_gui_sys(struct Slyz3Vm *vm, uint16_t id,
             slyz3_ret_nil(ret);
             return 0;
 
-        case SLE_SYS_WIN_OPEN:
+        case SLE_SYS_WIN_OPEN: {
+            int w = (int)arg_i(args, argc, 1);
+            int h = (int)arg_i(args, argc, 2);
+            if (w > 0 && h > 0) gui_slyz_resize_window(a->win, w, h);
             slyz3_ret_int(ret, (int64_t)a->win);
             return 0;
+        }
 
         case SLE_SYS_WIN_CLOSE:
             a->close_requested = 1;
@@ -1281,9 +1403,31 @@ static int slyz3_gui_sys(struct Slyz3Vm *vm, uint16_t id,
             return 0;
 
         case SLE_SYS_EVT_POLL:
-        case SLE_SYS_EVT_WAIT:
-            slyz3_ret_nil(ret);
+        case SLE_SYS_EVT_WAIT: {
+            /* v3 自绘应用（gfx.* + event.poll）靠这条通道取点击、滚轮与
+             * 关闭事件。此前 v3 分支是空桩，窗口能画但任何点击都没有
+             * 反应；这里与 v2 的实现保持一致。 */
+            struct SlyzEvent e;
+            if (!evt_pop(a, &e)) {
+                slyz3_ret_nil(ret);
+                return 0;
+            }
+            if (!slyz3_ret_arr(vm, ret, 4)) return -1;
+
+            struct SlyzVal item;
+            item.type = SLYZ_T_INT;
+            item.aux = 0;
+
+            item.u.i = e.type;
+            slyz3_arr_set(vm, ret, 0, item);
+            item.u.i = e.a;
+            slyz3_arr_set(vm, ret, 1, item);
+            item.u.i = e.b;
+            slyz3_arr_set(vm, ret, 2, item);
+            item.u.i = e.c;
+            slyz3_arr_set(vm, ret, 3, item);
             return 0;
+        }
 
         case SLE_SYS_INFO: {
             int key = (int)arg_i(args, argc, 0);
@@ -1752,10 +1896,12 @@ const char *gui_app_title(int win) {
 void gui_app_click(int win, int x, int y, int button) {
     struct GuiSlyzApp *a = app_for_win(win);
     if (!a) return;
-    if (a->is_v3) {
-        if (a->ui) slyzui_mouse(a->ui, x, y, 1);
-        return;
-    }
+    /* v3 应用有两种取事件的方式：
+     *   1) ui.present（声明式 UI）——slyzui 自己维护点击队列；
+     *   2) event.poll（gfx 自绘）——需要这里把坐标推进通用事件队列。
+     * 两条路都要走：只用 gfx 的应用没有 a->ui，旧代码直接 return
+     * 会吞掉所有点击，表现为窗口能画出来但按钮全无反应。 */
+    if (a->is_v3 && a->ui) slyzui_mouse(a->ui, x, y, 1);
     evt_push(a, SLE_EVT_CLICK, x, y, button);
 }
 
@@ -1768,20 +1914,14 @@ void gui_app_mouse(int win, int x, int y, int down) {
 void gui_app_key(int win, int ch) {
     struct GuiSlyzApp *a = app_for_win(win);
     if (!a) return;
-    if (a->is_v3) {
-        if (a->ui) slyzui_key(a->ui, ch);
-        return;
-    }
+    if (a->is_v3 && a->ui) slyzui_key(a->ui, ch);
     evt_push(a, SLE_EVT_KEY, ch, 0, 0);
 }
 
 void gui_app_wheel(int win, int delta) {
     struct GuiSlyzApp *a = app_for_win(win);
     if (!a) return;
-    if (a->is_v3) {
-        if (a->ui) slyzui_wheel(a->ui, delta);
-        return;
-    }
+    if (a->is_v3 && a->ui) slyzui_wheel(a->ui, delta);
     evt_push(a, SLE_EVT_WHEEL, delta, 0, 0);
 }
 

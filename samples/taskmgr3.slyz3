@@ -1,0 +1,204 @@
+# ============================================================
+# taskmgr3.slyz3 - 任务管理器（SLYZ v3）
+# ------------------------------------------------------------
+# 数据来自 os.info / os.proc / os.proc_name；界面与 v2 版一致。
+# ============================================================
+
+state cpu = 0
+state mem_total = 0
+state mem_used = 0
+state mem_peak = 0
+state tasks = 0
+state task_mem = 0
+state disk = 0
+state uptime = 0
+state slots = 4
+
+# ---- 主题色 ----
+state c_bg = 0x0B1017
+state c_card = 0x141C27
+state c_field = 0x1B2532
+state c_row = 0x101722
+state c_border = 0x2B3949
+state c_text = 0xE9EFF7
+state c_dim = 0x8EA0B4
+state c_ok = 0x34D399
+state c_warn = 0xFBBF24
+state c_err = 0xF87171
+
+fn load_theme() {
+    c_bg = ui.theme(0)
+    c_card = ui.theme(2)
+    c_field = ui.theme(3)
+    c_row = ui.theme(3)
+    c_border = ui.theme(5)
+    c_text = ui.theme(6)
+    c_dim = ui.theme(7)
+    c_ok = ui.theme(11)
+    c_warn = ui.theme(13)
+    c_err = ui.theme(12)
+}
+
+fn refresh() {
+    cpu = os.info(9)
+    mem_total = os.info(1)
+    mem_used = os.info(2)
+    mem_peak = os.info(3)
+    tasks = os.info(5)
+    task_mem = os.info(6)
+    disk = os.info(7)
+    uptime = os.info(8)
+    slots = os.info(10)
+}
+
+fn fmt_kb(v) {
+    if v >= 1024 {
+        return str(v / 1024) + " MB"
+    }
+    return str(v) + " KB"
+}
+
+fn fmt_bytes(v) {
+    if v >= 1048576 {
+        return str(v / 1048576) + " MB"
+    }
+    if v >= 1024 {
+        return str(v / 1024) + " KB"
+    }
+    return str(v) + " B"
+}
+
+fn fmt_uptime(ms) {
+    let s = ms / 1000
+    let m = s / 60
+    let h = m / 60
+    return str(h) + "h " + str(m % 60) + "m " + str(s % 60) + "s"
+}
+
+fn state_name(v) {
+    if v == 0 {
+        return "free"
+    }
+    if v == 1 {
+        return "ready"
+    }
+    if v == 2 {
+        return "running"
+    }
+    if v == 3 {
+        return "dead"
+    }
+    return "?"
+}
+
+fn bar(x, y, w, h, permille, color) {
+    gfx.rect(x, y, w, h, c_field)
+    let filled = w * permille / 1000
+    if filled > 0 {
+        gfx.rect(x, y, filled, h, color)
+    }
+    gfx.frame(x, y, w, h, c_border, 1)
+}
+
+fn bar_color(permille) {
+    if permille > 800 {
+        return c_err
+    }
+    if permille > 500 {
+        return c_warn
+    }
+    return c_ok
+}
+
+fn draw_overview() {
+    gfx.rect(24, 96, 460, 150, c_card)
+    gfx.text(40, 108, "CPU", c_dim)
+    gfx.text(40, 140, str(cpu / 10) + "%", c_text)
+    bar(40, 190, 428, 18, cpu, bar_color(cpu))
+    gfx.text(40, 218, "per-core average, 0..1000 permille", c_dim)
+
+    gfx.rect(500, 96, 496, 150, c_card)
+    gfx.text(516, 108, "Memory", c_dim)
+
+    let mem_pm = 0
+    if mem_total > 0 {
+        mem_pm = mem_used * 1000 / mem_total
+    }
+    gfx.text(516, 140, fmt_kb(mem_used) + " / " + fmt_kb(mem_total), c_text)
+    bar(516, 190, 464, 18, mem_pm, bar_color(mem_pm))
+    gfx.text(516, 218, "peak " + fmt_kb(mem_peak), c_dim)
+
+    gfx.rect(24, 262, 972, 48, c_card)
+    gfx.text(40, 272, "Tasks " + str(tasks) + "/" + str(slots), c_dim)
+    gfx.text(250, 272, "Task memory " + fmt_bytes(task_mem), c_dim)
+    gfx.text(520, 272, "Disk " + fmt_bytes(disk), c_dim)
+    gfx.text(760, 272, "Uptime " + fmt_uptime(uptime), c_dim)
+}
+
+fn draw_processes() {
+    gfx.text(24, 328, "Processes", c_text)
+
+    gfx.rect(24, 364, 972, 36, c_field)
+    gfx.text(40, 370, "PID", c_dim)
+    gfx.text(120, 370, "NAME", c_dim)
+    gfx.text(480, 370, "STATE", c_dim)
+    gfx.text(640, 370, "STEPS", c_dim)
+    gfx.text(800, 370, "MEMORY", c_dim)
+
+    let y = 404
+    let i = 0
+    while i < slots {
+        let st = os.proc(i, 2)
+        if st > 0 {
+            let pid = os.proc(i, 1)
+            let name = os.proc_name(i)
+            let steps = os.proc(i, 3)
+            let used = os.proc(i, 5)
+
+            gfx.rect(24, y - 4, 972, 38, c_row)
+            gfx.text(40, y, str(pid), c_text)
+            gfx.text(120, y, name, c_text)
+            gfx.text(480, y, state_name(st), c_ok)
+            gfx.text(640, y, str(steps), c_dim)
+            gfx.text(800, y, fmt_bytes(used), c_dim)
+
+            y = y + 44
+        }
+        i = i + 1
+    }
+}
+
+fn draw() {
+    gfx.clear(c_bg)
+
+    gfx.text(24, 16, "Task Manager", c_text)
+    gfx.text(24, 52, "Live counters refreshed every frame from the kernel.", c_dim)
+
+    draw_overview()
+    draw_processes()
+
+    gfx.flush()
+}
+
+fn main() {
+    let handle = win.open("Task Manager", 1040, 700)
+    if handle < 0 {
+        return
+    }
+    load_theme()
+
+    let running = 1
+    while running == 1 {
+        refresh()
+        draw()
+
+        let ev = event.poll()
+        if ev != nil && ev.at(0) == 5 {
+            running = 0
+        }
+    }
+}
+
+on start {
+    main()
+}

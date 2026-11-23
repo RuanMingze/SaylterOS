@@ -72,6 +72,17 @@ extern void kserial_putchar(char c);
 #define VM_MAX_FRAMES     65536u              /* 最多管理 256MB 物理内存 */
 #define VM_MAX_WORDS       (VM_MAX_FRAMES / 32u)
 
+/* Slyz 模块固定映射区：驱动 0x02000000、SlyzFS 0x04000000、
+ * VizCormin 0x08000000、Slyz libc 0x09000000。这些地址不是由
+ * 帧分配器管理的普通内存——模块的代码/BSS 就住在里面。帧池如果
+ * 从 24MB 一路向上分配，超过 32MB 后就会把正在运行的驱动 BSS
+ * 覆盖掉（表现为音频任务跳到 0x0200xxxx 触发 #GP）。
+ *
+ * 因此把整个固定模块区在位图里预先标记为占用，帧池只使用
+ * [24MB, 32MB) 与 [160MB, RAM) 两段。 */
+#define VM_MODULE_ARENA_BASE 0x02000000u      /* 32MB */
+#define VM_MODULE_ARENA_END  0x0A000000u      /* 160MB */
+
 /* PTE 标志 */
 #define VM_PTE_PRESENT    0x001ull
 #define VM_PTE_WRITE      0x002ull
@@ -226,6 +237,64 @@ static void vm_free_frame_raw(uint32_t phys) {
             g_frame_scan = index;
         }
     }
+}
+
+/* ============================================================
+ * 连续大块分配（图片解码缓冲）
+ * ------------------------------------------------------------
+ * 帧池本身就是恒等映射的物理内存，只要找到一段连续空闲页就能
+ * 直接把首地址交给调用方当指针用。这里按首次适配扫描；图片数量
+ * 很少，扫描代价可以忽略。
+ *
+ * 注意：分配的页已被标记占用，但不会计入 g_resident（按需分页
+ * 统计只覆盖用户态窗口），任务管理器的"驻留页"不会被图片撑大。
+ * ============================================================ */
+uint32_t vm_alloc_phys_bytes(uint32_t bytes) {
+    if (bytes == 0 || g_frame_count == 0) return 0;
+
+    uint32_t pages = (bytes + VM_PAGE_SIZE - 1u) / VM_PAGE_SIZE;
+    if (pages == 0 || pages > g_frame_free) return 0;
+
+    uint32_t run = 0;
+    uint32_t start = 0;
+    for (uint32_t i = 0; i < g_frame_count; i++) {
+        if (!vm_frame_test(i)) {
+            if (run == 0) start = i;
+            run++;
+            if (run == pages) {
+                for (uint32_t k = start; k < start + pages; k++) {
+                    vm_frame_mark(k, 1);
+                }
+                g_frame_free -= pages;
+                if (start + pages < g_frame_scan || g_frame_scan < start) {
+                    g_frame_scan = start + pages;
+                    if (g_frame_scan >= g_frame_count) g_frame_scan = 0;
+                }
+                return g_frame_base + start * VM_PAGE_SIZE;
+            }
+        } else {
+            run = 0;
+        }
+    }
+    return 0;
+}
+
+void vm_free_phys_bytes(uint32_t phys, uint32_t bytes) {
+    if (bytes == 0 || g_frame_count == 0) return;
+    if (phys < g_frame_base) return;
+
+    uint32_t start = (phys - g_frame_base) / VM_PAGE_SIZE;
+    uint32_t pages = (bytes + VM_PAGE_SIZE - 1u) / VM_PAGE_SIZE;
+    if (start >= g_frame_count) return;
+    if (pages > g_frame_count - start) pages = g_frame_count - start;
+
+    for (uint32_t i = start; i < start + pages; i++) {
+        if (vm_frame_test(i)) {
+            vm_frame_mark(i, 0);
+            g_frame_free++;
+        }
+    }
+    if (start < g_frame_scan) g_frame_scan = start;
 }
 
 /* ============================================================
@@ -630,6 +699,36 @@ void vm_init(void) {
 
     for (uint32_t i = 0; i < VM_MAX_WORDS; i++) {
         g_frame_bitmap[i] = 0;
+    }
+
+    /* 预占 Slyz 模块固定区，避免大块图片缓冲覆盖驱动代码/BSS。 */
+    {
+        uint32_t pool_end = g_frame_base + g_frame_count * VM_PAGE_SIZE;
+        uint32_t lo = VM_MODULE_ARENA_BASE;
+        uint32_t hi = VM_MODULE_ARENA_END;
+        if (lo < g_frame_base) lo = g_frame_base;
+        if (hi > pool_end) hi = pool_end;
+
+        if (hi > lo) {
+            uint32_t first = (lo - g_frame_base) / VM_PAGE_SIZE;
+            uint32_t last = (hi - g_frame_base) / VM_PAGE_SIZE;
+            uint32_t reserved = 0;
+            for (uint32_t i = first; i < last && i < g_frame_count; i++) {
+                if (!vm_frame_test(i)) {
+                    vm_frame_mark(i, 1);
+                    reserved++;
+                }
+            }
+            if (g_frame_free >= reserved) g_frame_free -= reserved;
+            else g_frame_free = 0;
+            kserial_puts("[VM] reserved module arena frames=");
+            kserial_dec32(reserved);
+            kserial_puts(" (0x");
+            kserial_hex32(lo);
+            kserial_puts("-0x");
+            kserial_hex32(hi);
+            kserial_puts(")\r\n");
+        }
     }
 
     kserial_puts("[VM] frame pool base=0x");

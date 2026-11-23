@@ -1,0 +1,783 @@
+# ============================================================
+# settings3.slyz3 - 桌面设置（SLYZ v3）
+# ------------------------------------------------------------
+# 读写 etc\system.cfg：启动模式、语言、主题、时区、壁纸、头像。
+# 壁纸/头像支持 bmp/jpg/jpeg/png/svg，可从文件系统任意目录选择，
+# 也可以一键还原为镜像自带的默认素材。
+# ============================================================
+
+state W = 760
+state H = 660
+
+state LEFT_X = 20
+state LEFT_W = 320
+state RIGHT_X = 356
+state RIGHT_W = 384
+
+state mode = "tty"
+state lang = "en"
+state theme = "dark"
+state anim = "off"
+state tz = 8
+state wallpaper = ""
+state avatar = ""
+state walls = []
+state avatars = []
+state msg = ""
+state msg_until = 0
+
+# 文件选择器：0 关闭，1 选壁纸，2 选头像
+state picker = 0
+state pick_dir = ""
+state pick_off = 0
+state pick_sel = -1
+state pick_rows = 8
+
+# ---- 主题调色板（由 load_palette 按 theme 填充） ----
+state c_bg = 0x0B1017
+state c_bg2 = 0x141C27
+state c_card = 0x141C27
+state c_field = 0x0C141E
+state c_border = 0x2B3949
+state c_text = 0xE9EFF7
+state c_dim = 0x8EA0B4
+state c_accent = 0xFF7A18
+state c_accent2 = 0xD85B05
+state c_hover = 0x2B1F13
+
+fn load_palette() {
+    if theme == "light" {
+        c_bg = 0xE9F4EB
+        c_bg2 = 0xF6FBF7
+        c_card = 0xFFFFFF
+        c_field = 0xF1F7F2
+        c_border = 0xC6DCCB
+        c_text = 0x15271B
+        c_dim = 0x5B7263
+        c_accent = 0x1FA45A
+        c_accent2 = 0x177F46
+        c_hover = 0xE3F1E7
+    } else {
+        c_bg = 0x0E0B08
+        c_bg2 = 0x1A140F
+        c_card = 0x1A140F
+        c_field = 0x231A12
+        c_border = 0x3C2C1D
+        c_text = 0xF7EFE5
+        c_dim = 0xB39C83
+        c_accent = 0xFF7A18
+        c_accent2 = 0xD85B05
+        c_hover = 0x2B1F13
+    }
+}
+
+fn is_image(name) {
+    let n = lower(name)
+    if index_of(n, ".bmp") > 0 { return 1 }
+    if index_of(n, ".jpg") > 0 { return 1 }
+    if index_of(n, ".jpeg") > 0 { return 1 }
+    if index_of(n, ".png") > 0 { return 1 }
+    if index_of(n, ".svg") > 0 { return 1 }
+    return 0
+}
+
+fn list_images(dir) {
+    let out = []
+    let items = fs.entries(dir)
+    let i = 0
+    while i < items.length {
+        let row = items.at(i)
+        let name = row.at(0)
+        if row.at(1) == 1 && is_image(name) == 1 {
+            push(out, name)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn load_all() {
+    mode = cfg.get("boot.mode")
+    if mode == "" {
+        mode = "tty"
+    }
+    lang = cfg.get("lang")
+    if lang == "" {
+        lang = "en"
+    }
+    theme = cfg.get("theme")
+    if theme == "" {
+        theme = "dark"
+    }
+    anim = cfg.get("anim")
+    if anim == "" {
+        anim = "off"
+    }
+    load_palette()
+
+    tz = int(cfg.get("timezone"))
+    wallpaper = cfg.get("wallpaper")
+    avatar = cfg.get("avatar")
+    walls = list_images("system\\wallpapers")
+    avatars = list_images("system\\avatars")
+}
+
+fn notice(text) {
+    msg = text
+    msg_until = time.ms() + 2600
+}
+
+fn pjoin(base, name) {
+    if base == "" {
+        return name
+    }
+    return base + "\\" + name
+}
+
+fn parent_of(p) {
+    let i = len(p) - 1
+    while i >= 0 && str_at(p, i) != "\\" {
+        i = i - 1
+    }
+    if i <= 0 {
+        return ""
+    }
+    return substr(p, 0, i)
+}
+
+fn fit(s, maxchars) {
+    if len(s) <= maxchars {
+        return s
+    }
+    if maxchars <= 3 {
+        return substr(s, 0, maxchars)
+    }
+    return substr(s, 0, maxchars - 3) + "..."
+}
+
+fn pick_mode(value) {
+    if cfg.set("boot.mode", value) == 0 {
+        mode = value
+        notice("Startup mode saved. Reboot to apply.")
+    } else {
+        notice("Cannot write etc\\system.cfg")
+    }
+}
+
+fn pick_lang(value) {
+    if cfg.set("lang", value) == 0 {
+        lang = value
+        notice("Language saved. Reboot to apply.")
+    } else {
+        notice("Cannot write etc\\system.cfg")
+    }
+}
+
+fn pick_theme(value) {
+    if cfg.set("theme", value) == 0 {
+        theme = value
+        load_palette()
+        notice("Theme applied.")
+    } else {
+        notice("Cannot write etc\\system.cfg")
+    }
+}
+
+fn pick_anim(value) {
+    if cfg.set("anim", value) == 0 {
+        anim = value
+        notice("Animation saved.")
+    } else {
+        notice("Cannot write etc\\system.cfg")
+    }
+}
+
+fn shift_tz(delta) {
+    let next = tz + delta
+    if next < -12 {
+        next = -12
+    }
+    if next > 14 {
+        next = 14
+    }
+    if cfg.set("timezone", str(next)) == 0 {
+        tz = next
+        notice("Timezone saved.")
+    } else {
+        notice("Cannot write etc\\system.cfg")
+    }
+}
+
+fn pick_wallpaper(path) {
+    if cfg.set("wallpaper", path) == 0 {
+        wallpaper = path
+        notice("Wallpaper applied.")
+    } else {
+        notice("Cannot write etc\\system.cfg")
+    }
+}
+
+fn pick_avatar(path) {
+    if cfg.set("avatar", path) == 0 {
+        avatar = path
+        notice("Avatar applied.")
+    } else {
+        notice("Cannot write etc\\system.cfg")
+    }
+}
+
+fn draw_tab(x, y, w, h, label, active) {
+    let bg = c_field
+    let fg = c_dim
+    if active != 0 {
+        bg = c_accent
+        fg = 0xFFFFFF
+    }
+    gfx.rect(x, y, w, h, bg)
+    gfx.frame(x, y, w, h, c_border, 1)
+    let lw = gfx.text_width(label)
+    gfx.text(x + (w - lw) / 2, y + (h - 32) / 2, label, fg)
+}
+
+fn draw_card(x, y, w, h) {
+    gfx.rect(x, y, w, h, c_card)
+    gfx.frame(x, y, w, h, c_border, 1)
+}
+
+fn draw_avatar_option(cx, cy, r, index, selected) {
+    if selected != 0 {
+        gfx.circle(cx, cy, r + 3, c_accent)
+    }
+
+    if index == 0 {
+        gfx.circle(cx, cy, r, c_field)
+        gfx.circle(cx, cy - 4, 5, c_text)
+        gfx.rect(cx - 8, cy + 4, 16, 8, c_text)
+        return
+    }
+
+    let path = "system\\avatars\\" + avatars.at(index - 1)
+    let handle = img.load(path)
+    if handle >= 0 {
+        img.draw_circle(handle, cx, cy, r)
+    } else {
+        gfx.circle(cx, cy, r, c_hover)
+    }
+}
+
+fn draw_wallpaper_card() {
+    draw_card(RIGHT_X, 80, RIGHT_W, 268)
+    gfx.text(RIGHT_X + 16, 94, "Wallpaper", c_text)
+    gfx.text(RIGHT_X + 16, 126, "BMP / JPG / PNG / SVG", c_dim)
+
+    let active = 0
+    if wallpaper == "" {
+        active = 1
+    }
+    draw_tab(RIGHT_X + 14, 156, RIGHT_W - 28, 30, "Default (bundled)", active)
+
+    let i = 0
+    while i < walls.length && i < 3 {
+        let name = walls.at(i)
+        let path = "system\\wallpapers\\" + name
+        let picked = 0
+        if path == wallpaper {
+            picked = 1
+        }
+        draw_tab(RIGHT_X + 14, 190 + i * 32, RIGHT_W - 28, 30,
+                 fit(name, 22), picked)
+        i = i + 1
+    }
+
+    if walls.length == 0 {
+        gfx.text(RIGHT_X + 16, 196, "No wallpapers in system.", c_dim)
+    }
+
+    draw_tab(RIGHT_X + 14, 300, RIGHT_W - 28, 32, "Browse file system...", 0)
+}
+
+fn draw_avatar_card() {
+    draw_card(RIGHT_X, 360, RIGHT_W, 200)
+    gfx.text(RIGHT_X + 16, 374, "Avatar", c_text)
+    gfx.text(RIGHT_X + 16, 406, "Portrait image", c_dim)
+
+    let pcx = RIGHT_X + 54
+    let pcy = 468
+    if avatar == "" {
+        gfx.circle(pcx, pcy, 36, c_field)
+        gfx.circle(pcx, pcy - 6, 9, c_text)
+        gfx.rect(pcx - 14, pcy + 7, 28, 14, c_text)
+    } else {
+        let handle = img.load(avatar)
+        if handle >= 0 {
+            gfx.circle(pcx, pcy, 39, c_accent)
+            img.draw_circle(handle, pcx, pcy, 36)
+        } else {
+            gfx.circle(pcx, pcy, 36, c_hover)
+        }
+    }
+
+    let i = 0
+    while i < avatars.length + 1 && i < 4 {
+        let cx = RIGHT_X + 126 + i * 44
+        let cy = 460
+        let sel = 0
+        if i == 0 && avatar == "" {
+            sel = 1
+        }
+        if i > 0 {
+            let p = "system\\avatars\\" + avatars.at(i - 1)
+            if p == avatar {
+                sel = 1
+            }
+        }
+        draw_avatar_option(cx, cy, 14, i, sel)
+        i = i + 1
+    }
+
+    draw_tab(RIGHT_X + 14, 514, RIGHT_W - 28, 32, "Browse file system...", 0)
+}
+
+fn draw_theme_card() {
+    draw_card(LEFT_X, 344, LEFT_W, 150)
+    gfx.text(LEFT_X + 16, 358, "Theme", c_text)
+    gfx.text(LEFT_X + 16, 390, "Dark / light", c_dim)
+
+    let dark_active = 0
+    if theme != "light" {
+        dark_active = 1
+    }
+    let light_active = 0
+    if theme == "light" {
+        light_active = 1
+    }
+    draw_tab(LEFT_X + 16, 416, 140, 32, "Orange", dark_active)
+    draw_tab(LEFT_X + 164, 416, 140, 32, "Green", light_active)
+
+    gfx.text(LEFT_X + 16, 458, "Animation", c_dim)
+    let on_active = 0
+    if anim == "on" {
+        on_active = 1
+    }
+    let off_active = 0
+    if anim != "on" {
+        off_active = 1
+    }
+    draw_tab(LEFT_X + 164, 456, 66, 32, "On", on_active)
+    draw_tab(LEFT_X + 238, 456, 66, 32, "Off", off_active)
+}
+
+fn draw_picker() {
+    gfx.rect(8, 8, W - 16, H - 16, c_bg2)
+    gfx.frame(8, 8, W - 16, H - 16, c_border, 2)
+
+    let title = "Choose wallpaper"
+    if picker == 2 {
+        title = "Choose avatar"
+    }
+    gfx.text(24, 22, title, c_text)
+    gfx.text(24, 56, fit(pick_dir, 40), c_dim)
+
+    draw_tab(24, 92, 90, 32, "Up", 0)
+    draw_tab(122, 92, 110, 32, "Cancel", 0)
+
+    let items = fs.entries(pick_dir)
+    let shown = []
+    let i = 0
+    while i < items.length {
+        let row = items.at(i)
+        let name = row.at(0)
+        if row.at(1) == 2 || is_image(name) == 1 {
+            push(shown, name)
+        }
+        i = i + 1
+    }
+
+    if pick_off > shown.length - pick_rows {
+        pick_off = shown.length - pick_rows
+    }
+    if pick_off < 0 {
+        pick_off = 0
+    }
+
+    let y = 142
+    i = 0
+    while i < pick_rows {
+        let idx = pick_off + i
+        if idx < shown.length {
+            let name = shown.at(idx)
+            let isdir = 0
+            let j = 0
+            while j < items.length {
+                if items.at(j).at(0) == name && items.at(j).at(1) == 2 {
+                    isdir = 1
+                }
+                j = j + 1
+            }
+            let bg = c_card
+            if idx == pick_sel {
+                bg = c_hover
+            }
+            gfx.rect(24, y, W - 48, 34, bg)
+            let fg = c_text
+            let label = fit(name, 40)
+            if isdir == 1 {
+                fg = c_accent
+                label = "[" + label + "]"
+            }
+            gfx.text(36, y + 2, label, fg)
+        }
+        y = y + 38
+        i = i + 1
+    }
+
+    if shown.length == 0 {
+        gfx.text(36, 160, "No images or folders here.", c_dim)
+    }
+
+    gfx.text(24, H - 44, "Click a folder to enter, an image to apply.", c_dim)
+}
+
+fn draw() {
+    gfx.clear(c_bg)
+
+    if picker != 0 {
+        draw_picker()
+        gfx.flush()
+        return
+    }
+
+    gfx.text(LEFT_X, 16, "Settings", c_text)
+    gfx.text(LEFT_X, 48, "Values are written to etc\\system.cfg", c_dim)
+
+    draw_card(LEFT_X, 80, LEFT_W, 120)
+    gfx.text(LEFT_X + 16, 94, "Startup mode", c_text)
+    gfx.text(LEFT_X + 16, 126, "Startup session", c_dim)
+    let gui_active = 0
+    if mode == "gui" {
+        gui_active = 1
+    }
+    draw_tab(LEFT_X + 16, 158, 140, 32, "Desktop", gui_active)
+    let tty_active = 0
+    if mode == "tty" {
+        tty_active = 1
+    }
+    draw_tab(LEFT_X + 164, 158, 140, 32, "Shell", tty_active)
+
+    draw_card(LEFT_X, 212, LEFT_W, 120)
+    gfx.text(LEFT_X + 16, 226, "Language", c_text)
+    gfx.text(LEFT_X + 16, 258, "UI language", c_dim)
+    let en_active = 0
+    if lang == "en" {
+        en_active = 1
+    }
+    draw_tab(LEFT_X + 16, 290, 140, 32, "English", en_active)
+    let zh_active = 0
+    if lang == "zh" {
+        zh_active = 1
+    }
+    draw_tab(LEFT_X + 164, 290, 140, 32, "Chinese", zh_active)
+
+    draw_theme_card()
+
+    draw_card(LEFT_X, 504, LEFT_W, 88)
+    gfx.text(LEFT_X + 16, 514, "Timezone", c_text)
+    let sign = ""
+    if tz >= 0 {
+        sign = "+"
+    }
+    let tzv = "UTC " + sign + str(tz)
+    gfx.text(LEFT_X + LEFT_W - 16 - gfx.text_width(tzv), 516, tzv, c_text)
+    draw_tab(LEFT_X + 16, 552, 48, 28, "-", 0)
+    draw_tab(LEFT_X + 72, 552, 48, 28, "+", 0)
+
+    draw_wallpaper_card()
+    draw_avatar_card()
+
+    if msg != "" && time.ms() < msg_until {
+        gfx.text(LEFT_X, 608, fit(msg, 40), c_accent)
+    }
+
+    gfx.flush()
+}
+
+fn hit_mode(px, py) {
+    if py < 158 || py > 190 {
+        return ""
+    }
+    if px >= LEFT_X + 16 && px < LEFT_X + 156 {
+        return "gui"
+    }
+    if px >= LEFT_X + 164 && px < LEFT_X + 304 {
+        return "tty"
+    }
+    return ""
+}
+
+fn hit_lang(px, py) {
+    if py < 290 || py > 322 {
+        return ""
+    }
+    if px >= LEFT_X + 16 && px < LEFT_X + 156 {
+        return "en"
+    }
+    if px >= LEFT_X + 164 && px < LEFT_X + 304 {
+        return "zh"
+    }
+    return ""
+}
+
+fn hit_theme(px, py) {
+    if py < 416 || py > 448 {
+        return ""
+    }
+    if px >= LEFT_X + 16 && px < LEFT_X + 156 {
+        return "dark"
+    }
+    if px >= LEFT_X + 164 && px < LEFT_X + 304 {
+        return "light"
+    }
+    return ""
+}
+
+fn hit_anim(px, py) {
+    if py < 456 || py > 488 {
+        return ""
+    }
+    if px >= LEFT_X + 164 && px < LEFT_X + 230 {
+        return "on"
+    }
+    if px >= LEFT_X + 238 && px < LEFT_X + 304 {
+        return "off"
+    }
+    return ""
+}
+
+fn hit_wallpaper(px, py) {
+    if px < RIGHT_X + 14 || px > RIGHT_X + RIGHT_W - 14 {
+        return -1
+    }
+    if py >= 156 && py < 186 {
+        return 0
+    }
+    if py >= 190 && py < 286 {
+        return 1 + (py - 190) / 32
+    }
+    if py >= 300 && py < 332 {
+        return 90
+    }
+    return -1
+}
+
+fn hit_avatar(px, py) {
+    if px >= RIGHT_X + 14 && py >= 514 && py < 546 {
+        return 90
+    }
+    let i = 0
+    while i < 4 {
+        let cx = RIGHT_X + 126 + i * 44
+        let cy = 460
+        let dx = px - cx
+        let dy = py - cy
+        if dx * dx + dy * dy <= 324 {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn open_picker(kind) {
+    picker = kind
+    pick_off = 0
+    pick_sel = -1
+    if kind == 1 {
+        pick_dir = "system\\wallpapers"
+    } else {
+        pick_dir = "system\\avatars"
+    }
+    if fs.exists(pick_dir) == 0 {
+        pick_dir = ""
+    }
+}
+
+fn picker_click(px, py) {
+    if px >= 24 && px < 114 && py >= 92 && py < 124 {
+        let up = parent_of(pick_dir)
+        if up != pick_dir {
+            pick_dir = up
+            pick_off = 0
+            pick_sel = -1
+        }
+        return
+    }
+    if px >= 122 && px < 232 && py >= 92 && py < 124 {
+        picker = 0
+        return
+    }
+
+    let items = fs.entries(pick_dir)
+    let shown = []
+    let i = 0
+    while i < items.length {
+        let row = items.at(i)
+        if row.at(1) == 2 || is_image(row.at(0)) == 1 {
+            push(shown, row.at(0))
+        }
+        i = i + 1
+    }
+
+    if px < 24 || px > W - 24 {
+        return
+    }
+    if py < 142 || py >= 142 + pick_rows * 38 {
+        return
+    }
+    let idx = pick_off + (py - 142) / 38
+    if idx >= shown.length {
+        return
+    }
+    pick_sel = idx
+    let name = shown.at(idx)
+
+    let isdir = 0
+    i = 0
+    while i < items.length {
+        if items.at(i).at(0) == name && items.at(i).at(1) == 2 {
+            isdir = 1
+        }
+        i = i + 1
+    }
+
+    if isdir == 1 {
+        pick_dir = pjoin(pick_dir, name)
+        pick_off = 0
+        pick_sel = -1
+        return
+    }
+
+    let full = pjoin(pick_dir, name)
+    if picker == 1 {
+        pick_wallpaper(full)
+    } else {
+        pick_avatar(full)
+    }
+    picker = 0
+}
+
+fn handle_click(px, py) {
+    if picker != 0 {
+        picker_click(px, py)
+        return
+    }
+
+    let m = hit_mode(px, py)
+    if m != "" {
+        pick_mode(m)
+    }
+
+    let l = hit_lang(px, py)
+    if l != "" {
+        pick_lang(l)
+    }
+
+    let t = hit_theme(px, py)
+    if t != "" {
+        pick_theme(t)
+    }
+
+    let a = hit_anim(px, py)
+    if a != "" {
+        pick_anim(a)
+    }
+
+    if py >= 552 && py <= 580 {
+        if px >= LEFT_X + 16 && px < LEFT_X + 64 {
+            shift_tz(-1)
+        }
+        if px >= LEFT_X + 72 && px < LEFT_X + 120 {
+            shift_tz(1)
+        }
+    }
+
+    let wi = hit_wallpaper(px, py)
+    if wi >= 0 {
+        if wi == 90 {
+            open_picker(1)
+        } else if wi == 0 {
+            pick_wallpaper("")
+        } else if wi - 1 < walls.length {
+            pick_wallpaper("system\\wallpapers\\" + walls.at(wi - 1))
+        }
+    }
+
+    let ai = hit_avatar(px, py)
+    if ai >= 0 {
+        if ai == 90 {
+            open_picker(2)
+        } else if ai == 0 {
+            pick_avatar("")
+        } else if ai - 1 < avatars.length {
+            pick_avatar("system\\avatars\\" + avatars.at(ai - 1))
+        }
+    }
+}
+
+fn scroll(delta) {
+    if picker == 0 {
+        return
+    }
+    let items = fs.entries(pick_dir)
+    let n = 0
+    let i = 0
+    while i < items.length {
+        let row = items.at(i)
+        if row.at(1) == 2 || is_image(row.at(0)) == 1 {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    let max_offset = n - pick_rows
+    if max_offset < 0 {
+        max_offset = 0
+    }
+    pick_off = pick_off - delta
+    if pick_off < 0 {
+        pick_off = 0
+    }
+    if pick_off > max_offset {
+        pick_off = max_offset
+    }
+}
+
+fn main() {
+    let handle = win.open("Settings", W, H)
+    if handle < 0 {
+        return
+    }
+
+    load_all()
+
+    let running = 1
+    while running == 1 {
+        draw()
+
+        let ev = event.poll()
+        if ev != nil {
+            let kind = ev.at(0)
+            if kind == 3 {
+                handle_click(ev.at(1), ev.at(2))
+            }
+            if kind == 4 {
+                scroll(ev.at(1))
+            }
+            if kind == 5 {
+                running = 0
+            }
+        }
+    }
+}
+
+on start {
+    main()
+}

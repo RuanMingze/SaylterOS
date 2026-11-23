@@ -108,6 +108,13 @@ uint32_t net_now_ms(void) {
     return (uint32_t)((net_rdtsc() - g_tsc_base) / g_tsc_per_ms);
 }
 
+uint32_t net_now_us(void) {
+    if (!g_time_ready) net_time_init();
+    /* 先乘 1000 再除：g_tsc_per_ms 通常是几十万量级，
+     * 这样在几百毫秒的差值范围内不会溢出 64 位。 */
+    return (uint32_t)(((net_rdtsc() - g_tsc_base) * 1000ull) / g_tsc_per_ms);
+}
+
 /* ============================================================
  * IPv4 / MAC 文本转换
  * ============================================================ */
@@ -665,7 +672,18 @@ int net_init(void) {
     return 0;
 }
 
+static int g_flight_mode = 0;
+
+int net_flight(void) {
+    return g_flight_mode;
+}
+
+void net_set_flight(int on) {
+    g_flight_mode = on ? 1 : 0;
+}
+
 int net_ready(void) {
+    if (g_flight_mode) return 0;
     if (!g_info.initialized || !g_info.present) return 0;
 
     /* 链路状态按需刷新：e1000 的 STATUS.LU 在协商完成后才置位，
@@ -1652,6 +1670,7 @@ static void net_handle_frame(const uint8_t *frame, uint32_t len) {
 }
 
 void net_poll(void) {
+    if (g_flight_mode) return;
     if (!g_info.present) return;
 
     for (uint32_t budget = 0; budget < NET_POLL_BUDGET; budget++) {
@@ -1775,7 +1794,7 @@ int net_http_get(const char *url, char *out, int cap, int *status_out,
     http_append(req, (int)sizeof(req), &rp, " HTTP/1.0\r\nHost: ");
     http_append(req, (int)sizeof(req), &rp, host);
     http_append(req, (int)sizeof(req), &rp,
-                "\r\nUser-Agent: SaylterOS/0.3-Beta1 (x86_64)\r\n"
+                "\r\nUser-Agent: SaylterOS/0.3-Beta2 (x86_64)\r\n"
                 "Accept: text/html,application/xhtml+xml,text/plain,*/*\r\n"
                 "Connection: close\r\n\r\n");
 

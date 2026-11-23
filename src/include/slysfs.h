@@ -99,7 +99,8 @@ enum {
     SFS_OP_COUNT_VOLUMES,     /* -> 实际挂载的卷数 */
     SFS_OP_VOLUME_INFO,       /* a=drive, b=out[4] u32（base,sectors,clusters,flags） -> 1/0 */
     SFS_OP_FAULT_READ,        /* b=out SlysFaultRecord -> 1/0 */
-    SFS_OP_FAULT_WRITE        /* b=in SlysFaultRecord -> 1/0 */
+    SFS_OP_FAULT_WRITE,       /* b=in SlysFaultRecord -> 1/0 */
+    SFS_OP_RENAME             /* a=drive, b=old, c=new -> 1/0（同卷改名/移动） */
 };
 
 typedef int64_t (*SlysFsCall)(int64_t op, int64_t a, int64_t b,

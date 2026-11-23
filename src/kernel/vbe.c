@@ -259,6 +259,15 @@ void vbe_swap_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
     uint32_t lfb_stride = vbe_current.pitch / 4;
     uint32_t back_stride = back_pitch_bytes / 4;
 
+    /* 整行宽度且两张缓冲步长一致时，矩形在内存里是连续的，
+     * 一次 rep movsq 完成，省掉每行一次循环与函数调用开销。
+     * 这是壁纸/最大化窗口/任务栏整列最常见的形态。 */
+    if (x == 0 && lfb_stride == back_stride && w >= vbe_current.width) {
+        fast_copy_dwords(fb32 + (uint32_t)y * lfb_stride, back + (uint32_t)y * back_stride,
+                         back_stride * (uint32_t)h);
+        return;
+    }
+
     for (uint16_t row = 0; row < h; row++) {
         fast_copy_dwords(fb32 + (uint32_t)(y + row) * lfb_stride + x,
                          back + (uint32_t)(y + row) * back_stride + x, w);
@@ -307,9 +316,9 @@ void vbe_fill_rect_rows(uint16_t x, uint16_t w, uint16_t y0, uint16_t y1,
     uint32_t stride = back_pitch_bytes / 4;
     for (int yy = yy0; yy < yy1; yy++) {
         uint32_t *row = back + (uint32_t)yy * stride;
-        for (int xx = x0; xx < x1; xx++) {
-            row[xx] = color;
-        }
+        /* 用 rep stosq 填充整行区间：逐像素 C 循环在 QEMU TCG 下会
+         * 产生 4 倍以上的指令数，壁纸背景每次局部重绘都要走这里。 */
+        fast_fill_dwords(row + x0, (uint32_t)(x1 - x0), color);
     }
 }
 
@@ -373,8 +382,38 @@ void vbe_blend_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
     }
 }
 
-void vbe_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint32_t color) {
-    if (!vbe_is_enabled()) return;
+void vbe_blit_argb(const uint32_t *src, int src_stride,
+                   int x, int y, int w, int h) {
+    if (!vbe_is_enabled() || !src || w <= 0 || h <= 0) return;
+
+    int x0 = x;
+    int y0 = y;
+    int x1 = x + w;
+    int y1 = y + h;
+
+    if (x1 > (int)vbe_current.width) x1 = (int)vbe_current.width;
+    if (y1 > (int)vbe_current.height) y1 = (int)vbe_current.height;
+
+    if (g_clip_active) {
+        if (x0 < g_clip_x0) x0 = g_clip_x0;
+        if (y0 < g_clip_y0) y0 = g_clip_y0;
+        if (x1 > g_clip_x1) x1 = g_clip_x1;
+        if (y1 > g_clip_y1) y1 = g_clip_y1;
+    }
+    if (x0 >= x1 || y0 >= y1 || x0 >= (int)vbe_current.width ||
+        y0 >= (int)vbe_current.height) {
+        return;
+    }
+
+    for (int row = y0; row < y1; row++) {
+        uint32_t *dst = back_ptr((uint16_t)x0, (uint16_t)row);
+        const uint32_t *s = src + (uint32_t)(row - y) * (uint32_t)src_stride +
+                            (uint32_t)(x0 - x);
+        fast_copy_dwords((volatile uint32_t *)dst, s, (uint32_t)(x1 - x0));
+    }
+}
+
+void vbe_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint32_t color) {    if (!vbe_is_enabled()) return;
 
     int x0 = x;
     int y0 = y;
@@ -795,12 +834,17 @@ void vbe_fb_draw_char(uint16_t cx, uint16_t cy, char c, uint32_t fg, uint32_t bg
     if ((uint32_t)px + FONT16_W > vbe_current.width) return;
     if ((uint32_t)py + FONT16_H > vbe_current.height) return;
 
-    /* 终端直写路径：SlyerType 用 bg 计算混合色，不回读显存。 */
-    if (slyertype_draw_cell_fb(px, py, FONT16_W, FONT16_H,
+    /* 终端直写优先走 SlyerType 平滑字形。字形掩码由引擎按
+     * (码位, 字号, 单元格) 缓存，重复字符不会重新光栅化，
+     * 因此这里只付一次掩码混合的代价，而不是每字符解析轮廓。
+     * 字体未就绪 / 未覆盖的字符回退 16×32 点阵。 */
+    if (slyertype_available() &&
+        slyertype_draw_cell_fb((int)px, (int)py, FONT16_W, FONT16_H,
                                (uint32_t)(uint8_t)c, fg, bg)) {
         return;
     }
 
+    /* 回退：16×32 点阵查表直写。 */
     build_row_lut(fg, bg);
 
     const uint8_t (*glyph)[2] = font16x32[(uint8_t)c];
@@ -847,8 +891,9 @@ void vbe_fb_draw_cjk(uint16_t cx, uint16_t cy, uint32_t cp, uint32_t fg, uint32_
     if (px + FONT_CJK_W > vbe_current.width) return;
     if (py + FONT_CJK_H > vbe_current.height) return;
 
-    /* 系统装了 CJK TrueType 时走平滑轮廓；否则回退 32x32 点阵。 */
-    if (slyertype_draw_cell_fb((int)px, (int)py, FONT_CJK_W, FONT_CJK_H,
+    /* 与 ASCII 直写一致：优先平滑字形，缺字再回退 32×32 点阵。 */
+    if (cp != 0 && slyertype_available() &&
+        slyertype_draw_cell_fb((int)px, (int)py, FONT_CJK_W, FONT_CJK_H,
                                cp, fg, bg)) {
         return;
     }

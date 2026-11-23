@@ -39,9 +39,19 @@ static int g_timezone = 8;
 /* 界面语言：0 = English，1 = 简体中文。首次生成配置时默认中文，
  * 因为本机面向中文用户；改成 lang=en 即可回到英文界面。 */
 static int g_lang = 1;
-/* 外观：壁纸与头像都是 SlyzFS 绝对路径，空表示使用内置样式。 */
-static char g_wallpaper[CFG_PATH_MAX] = "";
-static char g_avatar[CFG_PATH_MAX] = "";
+/* 外观：壁纸与头像都是 SlyzFS 绝对路径，空表示使用内置样式。
+ * 出厂默认指向镜像预置的 JPEG 壁纸与 SVG 头像；设置页可以选择
+ * 其他文件或"还原默认"（清空后由 cfg_parse 补回这两个值）。 */
+#define CFG_DEFAULT_WALLPAPER "system\\wallpapers\\default.bmp"
+#define CFG_DEFAULT_AVATAR    "system\\avatars\\default.svg"
+
+static char g_wallpaper[CFG_PATH_MAX] = CFG_DEFAULT_WALLPAPER;
+static char g_avatar[CFG_PATH_MAX] = CFG_DEFAULT_AVATAR;
+
+/* 界面主题：默认深色科技橙。 */
+static int g_theme = SYSTEM_THEME_DARK_ORANGE;
+/* 界面动画：默认关闭。 */
+static int g_anim = 0;
 static int g_loaded = 0;
 
 /* 最近一次从磁盘读到的原始内容。写回时以它为底稿过滤托管行。 */
@@ -215,9 +225,26 @@ static void cfg_parse(const char *buf, int len) {
                 g_lang = 1;
             }
         } else if (cfg_strcmp(key, "wallpaper") == 0) {
-            cfg_copy_str(g_wallpaper, value, CFG_PATH_MAX);
+            /* 空值表示"使用默认壁纸"：设置页的还原默认就是写空，
+             * 再由这里补回出厂素材路径。 */
+            cfg_copy_str(g_wallpaper, value[0] ? value : CFG_DEFAULT_WALLPAPER,
+                         CFG_PATH_MAX);
         } else if (cfg_strcmp(key, "avatar") == 0) {
-            cfg_copy_str(g_avatar, value, CFG_PATH_MAX);
+            cfg_copy_str(g_avatar, value[0] ? value : CFG_DEFAULT_AVATAR,
+                         CFG_PATH_MAX);
+        } else if (cfg_strcmp(key, "theme") == 0) {
+            if (cfg_strcmp(value, "light") == 0 ||
+                cfg_strcmp(value, "green") == 0 ||
+                cfg_strcmp(value, "light_green") == 0) {
+                g_theme = SYSTEM_THEME_LIGHT_GREEN;
+            } else {
+                g_theme = SYSTEM_THEME_DARK_ORANGE;
+            }
+        } else if (cfg_strcmp(key, "anim") == 0 ||
+                   cfg_strcmp(key, "animation") == 0) {
+            g_anim = (cfg_strcmp(value, "on") == 0 ||
+                      cfg_strcmp(value, "1") == 0 ||
+                      cfg_strcmp(value, "yes") == 0) ? 1 : 0;
         }
     }
 }
@@ -279,7 +306,7 @@ static int cfg_buf_append_int(char *out, int cap, int *o, int v) {
 }
 
 /* 用原始内容 + 新的托管键组装配置文件并落盘。 */
-static int cfg_save_state(int gui, int tz, int lang,
+static int cfg_save_state(int gui, int tz, int lang, int theme, int anim,
                           const char *wallpaper, const char *avatar) {
     char out[CFG_MAX_BYTES];
     int o = 0;
@@ -302,9 +329,9 @@ static int cfg_save_state(int gui, int tz, int lang,
                 "# lang = en : English interface")) return 0;
         if (!cfg_buf_append_line(out, (int)sizeof(out), &o, "#")) return 0;
         if (!cfg_buf_append_line(out, (int)sizeof(out), &o,
-                "# wallpaper = system\\wallpapers\\<name>.bmp (empty = gradient)")) return 0;
+                "# wallpaper = .bmp/.jpg/.png/.svg path (empty = default)")) return 0;
         if (!cfg_buf_append_line(out, (int)sizeof(out), &o,
-                "# avatar    = system\\avatars\\<name>.bmp   (empty = initial)")) return 0;
+                "# avatar    = .bmp/.jpg/.png/.svg path (empty = default)")) return 0;
         if (!cfg_buf_append_line(out, (int)sizeof(out), &o, "#")) return 0;
         if (!cfg_buf_append_line(out, (int)sizeof(out), &o,
                 "# Edit with: nano etc\\system.cfg   then reboot.")) return 0;
@@ -322,6 +349,9 @@ static int cfg_save_state(int gui, int tz, int lang,
                 cfg_line_owns_key(g_raw + start, end - start, "tz") ||
                 cfg_line_owns_key(g_raw + start, end - start, "lang") ||
                 cfg_line_owns_key(g_raw + start, end - start, "language") ||
+                cfg_line_owns_key(g_raw + start, end - start, "theme") ||
+                cfg_line_owns_key(g_raw + start, end - start, "anim") ||
+                cfg_line_owns_key(g_raw + start, end - start, "animation") ||
                 cfg_line_owns_key(g_raw + start, end - start, "wallpaper") ||
                 cfg_line_owns_key(g_raw + start, end - start, "avatar")) {
                 continue;
@@ -344,6 +374,13 @@ static int cfg_save_state(int gui, int tz, int lang,
     if (!cfg_buf_append_line(out, (int)sizeof(out), &o,
             lang ? "lang=zh" : "lang=en")) return 0;
 
+    if (!cfg_buf_append_line(out, (int)sizeof(out), &o,
+            theme == SYSTEM_THEME_LIGHT_GREEN ? "theme=light" : "theme=dark")) {
+        return 0;
+    }
+    if (!cfg_buf_append_line(out, (int)sizeof(out), &o,
+            anim ? "anim=on" : "anim=off")) return 0;
+
     if (!cfg_buf_append_line(out, (int)sizeof(out), &o, "wallpaper=")) return 0;
     if (!cfg_buf_append(out, (int)sizeof(out), &o, wallpaper ? wallpaper : "")) return 0;
     if (!cfg_buf_append_line(out, (int)sizeof(out), &o, "")) return 0;
@@ -361,6 +398,9 @@ static int cfg_save_state(int gui, int tz, int lang,
     g_boot_gui = gui ? 1 : 0;
     g_timezone = tz;
     g_lang = lang ? 1 : 0;
+    g_theme = (theme == SYSTEM_THEME_LIGHT_GREEN)
+                  ? SYSTEM_THEME_LIGHT_GREEN : SYSTEM_THEME_DARK_ORANGE;
+    g_anim = anim ? 1 : 0;
     cfg_copy_str(g_wallpaper, wallpaper ? wallpaper : "", CFG_PATH_MAX);
     cfg_copy_str(g_avatar, avatar ? avatar : "", CFG_PATH_MAX);
     return 1;
@@ -378,13 +418,15 @@ void system_cfg_init(void) {
 
     if (n < 0) {
         g_raw_len = 0;
-        g_wallpaper[0] = '\0';
-        g_avatar[0] = '\0';
-        if (!cfg_save_state(0, 8, 1, "", "")) {
+        cfg_copy_str(g_wallpaper, CFG_DEFAULT_WALLPAPER, CFG_PATH_MAX);
+        cfg_copy_str(g_avatar, CFG_DEFAULT_AVATAR, CFG_PATH_MAX);
+        if (!cfg_save_state(0, 8, 1, SYSTEM_THEME_DARK_ORANGE, 0,
+                            CFG_DEFAULT_WALLPAPER, CFG_DEFAULT_AVATAR)) {
             /* 文件系统不可写（未挂载/只读）时保持 TTY 默认模式 */
             g_boot_gui = 0;
             g_timezone = 8;
             g_lang = 1;
+            g_theme = SYSTEM_THEME_DARK_ORANGE;
         }
         g_loaded = 1;
         return;
@@ -403,7 +445,8 @@ int system_cfg_boot_gui(void) {
 }
 
 int system_cfg_set_boot_gui(int gui) {
-    return cfg_save_state(gui ? 1 : 0, g_timezone, g_lang, g_wallpaper, g_avatar);
+    return cfg_save_state(gui ? 1 : 0, g_timezone, g_lang, g_theme, g_anim,
+                          g_wallpaper, g_avatar);
 }
 
 int system_cfg_timezone(void) {
@@ -413,7 +456,8 @@ int system_cfg_timezone(void) {
 int system_cfg_set_timezone(int hours) {
     if (hours < CFG_TZ_MIN) hours = CFG_TZ_MIN;
     if (hours > CFG_TZ_MAX) hours = CFG_TZ_MAX;
-    return cfg_save_state(g_boot_gui, hours, g_lang, g_wallpaper, g_avatar);
+    return cfg_save_state(g_boot_gui, hours, g_lang, g_theme, g_anim,
+                          g_wallpaper, g_avatar);
 }
 
 int system_cfg_lang(void) {
@@ -421,7 +465,7 @@ int system_cfg_lang(void) {
 }
 
 int system_cfg_set_lang(int id) {
-    return cfg_save_state(g_boot_gui, g_timezone, id ? 1 : 0,
+    return cfg_save_state(g_boot_gui, g_timezone, id ? 1 : 0, g_theme, g_anim,
                           g_wallpaper, g_avatar);
 }
 
@@ -431,8 +475,11 @@ const char *system_cfg_wallpaper(void) {
 
 int system_cfg_set_wallpaper(const char *path) {
     char value[CFG_PATH_MAX];
-    cfg_copy_str(value, path ? path : "", (int)sizeof(value));
-    return cfg_save_state(g_boot_gui, g_timezone, g_lang, value, g_avatar);
+    /* 空路径 = 还原默认壁纸（立即生效，不必等下次启动重新解析配置）。 */
+    cfg_copy_str(value, (path && path[0]) ? path : CFG_DEFAULT_WALLPAPER,
+                 (int)sizeof(value));
+    return cfg_save_state(g_boot_gui, g_timezone, g_lang, g_theme, g_anim,
+                          value, g_avatar);
 }
 
 const char *system_cfg_avatar(void) {
@@ -441,6 +488,28 @@ const char *system_cfg_avatar(void) {
 
 int system_cfg_set_avatar(const char *path) {
     char value[CFG_PATH_MAX];
-    cfg_copy_str(value, path ? path : "", (int)sizeof(value));
-    return cfg_save_state(g_boot_gui, g_timezone, g_lang, g_wallpaper, value);
+    cfg_copy_str(value, (path && path[0]) ? path : CFG_DEFAULT_AVATAR,
+                 (int)sizeof(value));
+    return cfg_save_state(g_boot_gui, g_timezone, g_lang, g_theme, g_anim,
+                          g_wallpaper, value);
+}
+
+int system_cfg_theme(void) {
+    return g_theme;
+}
+
+int system_cfg_set_theme(int id) {
+    int theme = (id == SYSTEM_THEME_LIGHT_GREEN)
+                    ? SYSTEM_THEME_LIGHT_GREEN : SYSTEM_THEME_DARK_ORANGE;
+    return cfg_save_state(g_boot_gui, g_timezone, g_lang, theme, g_anim,
+                          g_wallpaper, g_avatar);
+}
+
+int system_cfg_anim(void) {
+    return g_anim;
+}
+
+int system_cfg_set_anim(int on) {
+    return cfg_save_state(g_boot_gui, g_timezone, g_lang, g_theme,
+                          on ? 1 : 0, g_wallpaper, g_avatar);
 }

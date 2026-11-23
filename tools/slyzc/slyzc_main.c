@@ -103,78 +103,84 @@ static char *make_output_name(const char *source) {
 
 /* ---------- 编译 ---------- */
 
-static int build_compiler(const char *path, uint8_t *source, uint32_t size) {
-    memset(&g_cc, 0, sizeof(g_cc));
-    g_cc.path = path;
-    g_cc.source = (const char *)source;
-    g_cc.source_len = (int)size;
-    consts_init(&g_cc.consts);
-
-    if (setjmp(g_parse_jmp) != 0) {
-        return 0;
-    }
-
-    lex_init((const char *)source, (int)size, path);
-    parse_program(&g_cc);
-
-    if (g_cc.error_count) return 0;
-
-    codegen_program(&g_cc);
-
-    if (g_cc.error_count) return 0;
-    return 1;
-}
-
-static int cmd_compile(const char *source_path, const char *out_path, int write_file) {
+static int cmd_compile(const char *source_path, const char *out_path,
+                       int write_file, int json) {
     uint32_t size = 0;
     uint8_t *src = read_whole_file(source_path, &size);
-    if (!src) return 1;
+    if (!src) {
+        if (json) {
+            printf("{\"ok\":false,\"errorCount\":1,\"diagnostics\":"
+                   "[{\"line\":0,\"col\":0,\"severity\":\"error\",\"message\":");
+            slyz_write_json_string(stdout, "cannot open source file");
+            printf("}]}\n");
+        }
+        return 1;
+    }
 
     if (!has_suffix(source_path, ".slyzcode")) {
-        fprintf(stderr, "slyzc: warning: source file should use the .slyzcode extension\n");
+        if (!json) {
+            fprintf(stderr, "slyzc: warning: source file should use the .slyzcode extension\n");
+        }
     }
 
-    if (!build_compiler(source_path, src, size)) {
-        free(src);
-        fprintf(stderr, "slyzc: %d error(s), no image written\n", g_cc.error_count);
-        return 1;
-    }
+    if (json) slyz_diag_set_quiet(1);
 
+    int ok = slyz_compile_source(source_path, src, size);
     uint8_t *image = 0;
     uint32_t image_size = 0;
-    if (!compile_image(&g_cc, &image, &image_size)) {
-        free(src);
-        return 1;
+    int wrote = 0;
+
+    if (ok && write_file) {
+        if (!compile_image(&g_cc, &image, &image_size)) {
+            ok = 0;
+        } else {
+            char *generated = 0;
+            const char *target = out_path;
+            if (!target) {
+                generated = make_output_name(source_path);
+                target = generated;
+            }
+            if (!write_whole_file(target, image, image_size)) {
+                ok = 0;
+            } else {
+                wrote = 1;
+            }
+            if (!json && wrote) {
+                printf("slyzc: wrote %s (%u bytes, code %u, const %u, globals %d, functions %d)\n",
+                       target, (unsigned)image_size,
+                       (unsigned)g_cc.code_len, (unsigned)g_cc.consts.len,
+                       g_cc.global_count, g_cc.func_count);
+            }
+            free(generated);
+        }
     }
 
-    if (write_file) {
-        char *generated = 0;
-        const char *target = out_path;
-        if (!target) {
-            generated = make_output_name(source_path);
-            target = generated;
+    if (json) {
+        printf("{\"ok\":%s,\"errorCount\":%d,\"diagnostics\":",
+               ok ? "true" : "false", g_cc.error_count);
+        slyz_write_diagnostics_json(stdout);
+        if (ok) {
+            fputs(",\"stats\":", stdout);
+            slyz_write_stats_json(stdout);
         }
-        if (!write_whole_file(target, image, image_size)) {
-            free(generated);
-            free(image);
-            free(src);
-            return 1;
+        fputs("}\n", stdout);
+        fflush(stdout);
+    } else if (!write_file) {
+        if (ok) {
+            printf("slyzc: OK  code=%u const=%u globals=%d functions=%d stack=%d%s\n",
+                   (unsigned)g_cc.code_len, (unsigned)g_cc.consts.len,
+                   g_cc.global_count, g_cc.func_count, g_cc.max_stack + 32,
+                   g_cc.uses_gui ? " gui" : "");
+        } else {
+            fprintf(stderr, "slyzc: %d error(s)\n", g_cc.error_count);
         }
-        printf("slyzc: wrote %s (%u bytes, code %u, const %u, globals %d, functions %d)\n",
-               target, (unsigned)image_size,
-               (unsigned)g_cc.code_len, (unsigned)g_cc.consts.len,
-               g_cc.global_count, g_cc.func_count);
-        free(generated);
-    } else {
-        printf("slyzc: OK  code=%u const=%u globals=%d functions=%d stack=%d%s\n",
-               (unsigned)g_cc.code_len, (unsigned)g_cc.consts.len,
-               g_cc.global_count, g_cc.func_count, g_cc.max_stack + 32,
-               g_cc.uses_gui ? " gui" : "");
+    } else if (!ok) {
+        fprintf(stderr, "slyzc: %d error(s), no image written\n", g_cc.error_count);
     }
 
     free(image);
     free(src);
-    return 0;
+    return ok ? 0 : 1;
 }
 
 /* ---------- 反汇编 ---------- */
@@ -443,8 +449,16 @@ static void print_doc(void) {
         "\n"
         "编译与运行\n"
         "  slyzc compile app.slyzcode -o app.slyz\n"
+        "  slyzc check   app.slyzcode\n"
+        "  slyzc check   app.slyzcode --json   输出一行 JSON 诊断\n"
+        "  slyzc serve                         常驻检查服务（编辑器插件用）\n"
         "  slyzc run app.slyz\n"
         "  slyzc dump app.slyz\n"
+        "\n"
+        "常驻协议（stdin/stdout，每行一个 JSON）\n"
+        "  请求 {\"id\":1,\"path\":\"a.slyzcode\",\"text\":\"...\"}\n"
+        "  响应 {\"id\":1,\"ok\":true,\"errorCount\":0,\"diagnostics\":[],\"stats\":{...}}\n"
+        "  结束 {\"method\":\"exit\"}\n"
     );
 }
 
@@ -454,10 +468,11 @@ static void usage(void) {
     fprintf(stderr,
             "slyzc - SLYZ v2 compiler\n"
             "usage:\n"
-            "  slyzc compile <source.slyzcode> [-o out.slyz]\n"
-            "  slyzc check   <source.slyzcode>\n"
+            "  slyzc compile <source.slyzcode> [-o out.slyz] [--json]\n"
+            "  slyzc check   <source.slyzcode> [--json]\n"
             "  slyzc dump    <image.slyz>\n"
             "  slyzc run     <image.slyz>\n"
+            "  slyzc serve            常驻检查服务（JSON Lines，stdin/stdout）\n"
             "  slyzc doc\n");
 }
 
@@ -474,18 +489,25 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    if (strcmp(cmd, "serve") == 0) {
+        return slyz_serve_main();
+    }
+
     if (strcmp(cmd, "compile") == 0 || strcmp(cmd, "check") == 0) {
         if (argc < 3) {
             usage();
             return 1;
         }
         const char *out = 0;
+        int json = 0;
         for (int i = 3; i < argc; i++) {
             if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
                 out = argv[++i];
+            } else if (strcmp(argv[i], "--json") == 0) {
+                json = 1;
             }
         }
-        return cmd_compile(argv[2], out, strcmp(cmd, "compile") == 0);
+        return cmd_compile(argv[2], out, strcmp(cmd, "compile") == 0, json);
     }
 
     if (strcmp(cmd, "dump") == 0) {

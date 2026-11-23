@@ -8,12 +8,18 @@
 
 #include "slyzc.h"
 
+/* 常驻检查进程用累计分配量做内存水位判断：编译器的 AST 不做精细
+ * 回收，单次编译结束即弃用；serve 模式在处理若干次请求后主动退出，
+ * 由扩展重启，避免长时间编辑把内存吃满。 */
+unsigned long long g_alloc_bytes = 0;
+
 void *xmalloc(size_t n) {
     void *p = malloc(n ? n : 1);
     if (!p) {
         fprintf(stderr, "slyzc: out of memory (%lu bytes)\n", (unsigned long)n);
         exit(2);
     }
+    g_alloc_bytes += (unsigned long long)n;
     return p;
 }
 
@@ -24,6 +30,7 @@ void *xcalloc(size_t n, size_t m) {
                 (unsigned long)n, (unsigned long)m);
         exit(2);
     }
+    g_alloc_bytes += (unsigned long long)n * (unsigned long long)m;
     return p;
 }
 

@@ -20,6 +20,7 @@
 #include "smp.h"
 #include "mem.h"
 #include "net.h"
+#include "tty.h"
 #include "task.h"
 #include "slyzlink.h"
 #include "vbe.h"
@@ -57,6 +58,25 @@ struct SlysDirEntry {
 #pragma pack(pop)
 
 static smp_lock_t g_slys_lock = 0;
+
+/* 清零 BSS：模块的 BSS 可达 8MB 以上，逐字节循环在 QEMU 下要
+ * 几十毫秒。rep stosq 一次写 8 字节，并对齐到 8 字节边界后使用，
+ * 避免越界写。 */
+static void slz_zero(uint8_t *dst, uint32_t n) {
+    uint32_t i = 0;
+    while (i < n && ((uintptr_t)(dst + i) & 7u)) dst[i++] = 0;
+
+    uint32_t left = n - i;
+    uint32_t qwords = left >> 3;
+    if (qwords) {
+        uint64_t *q = (uint64_t *)(void *)(dst + i);
+        __asm__ volatile ("cld\n\trep stosq"
+                          : "+D"(q), "+c"(qwords)
+                          : "a"(0ull)
+                          : "memory");
+    }
+    for (uint32_t k = qwords << 3; k < left; k++) dst[i + k] = 0;
+}
 
 void slys_lock(void) {
     smp_spin_lock(&g_slys_lock);
@@ -182,9 +202,7 @@ int slys_load(const char *path, void **entry, char *name, int name_cap) {
     }
 
     /* 清零 BSS，保证驱动静态变量从 0 开始。 */
-    for (uint32_t i = 0; i < bss_size; i++) {
-        dst[image_size + i] = 0;
-    }
+    slz_zero(dst + image_size, bss_size);
 
     if (name && name_cap > 0) {
         int n = 0;
@@ -290,14 +308,11 @@ int slys_load_raw(uint32_t lba, void **entry, char *name, int name_cap) {
         return 0;
     }
 
-    for (uint32_t i = 0; i < bss_size; i++) {
-        dst[image_size + i] = 0;
-    }
+    slz_zero(dst + image_size, bss_size);
 
     if (name && name_cap > 0) {
         int n = 0;
-        while (n < 23 && sec[40 + n] && n < name_cap - 1) {
-            name[n] = (char)sec[40 + n];
+        while (n < 23 && sec[40 + n] && n < name_cap - 1) {            name[n] = (char)sec[40 + n];
             n++;
         }
         name[n] = '\0';
@@ -466,8 +481,91 @@ void slys_set_arg(const char *arg) {
     g_slys_arg = arg ? arg : "";
 }
 
+/* ---- POSIX 段：musl libc 的 syscall 垫片落到这里 ----
+ * fd 表由内核持有：3..31 是模块打开的文件，0/1/2 保留给标准流。
+ * 失败一律返回 -errno，与 Linux 语义一致。 */
+#define SLYZ_FD_MAX 32
+static void *g_posix_fds[SLYZ_FD_MAX];
+
+static int api_posix_write(int fd, const void *buf, int len) {
+    if (!buf || len < 0) return -22;
+    if (fd == 1 || fd == 2) {
+        const char *p = (const char *)buf;
+        for (int i = 0; i < len; i++) {
+            tty_putchar(p[i]);
+        }
+        return len;
+    }
+    if (fd < 3 || fd >= SLYZ_FD_MAX || !g_posix_fds[fd]) return -9;
+    return slyzfs_write(g_posix_fds[fd], (const uint8_t *)buf, len);
+}
+
+static int api_posix_read(int fd, void *buf, int len) {
+    if (!buf || len < 0) return -22;
+    /* 标准输入还没有接到 tty 行编辑：返回 0 表示 EOF，让 getchar/fgets
+     * 走正常结束路径，而不是拿到 -EBADF 变成读错误。 */
+    if (fd == 0) return 0;
+    if (fd < 3 || fd >= SLYZ_FD_MAX || !g_posix_fds[fd]) return -9;
+    return slyzfs_read(g_posix_fds[fd], (uint8_t *)buf, len);
+}
+
+static int api_posix_open(const char *path, int flags) {
+    if (!path) return -22;
+    const char *mode = (flags == 0) ? "r" : ((flags == 1) ? "w" : "a");
+    void *fh = slyzfs_open(path, mode);
+    if (!fh) return -2;
+    for (int i = 3; i < SLYZ_FD_MAX; i++) {
+        if (!g_posix_fds[i]) {
+            g_posix_fds[i] = fh;
+            return i;
+        }
+    }
+    slyzfs_close(fh);
+    return -24;
+}
+
+static int api_posix_close(int fd) {
+    if (fd < 3 || fd >= SLYZ_FD_MAX || !g_posix_fds[fd]) return -9;
+    slyzfs_close(g_posix_fds[fd]);
+    g_posix_fds[fd] = 0;
+    return 0;
+}
+
+static int64_t api_posix_lseek(int fd, int64_t offset, int whence) {
+    (void)fd; (void)offset; (void)whence;
+    /* SlyzFS v2 的句柄是顺序读写，暂不支持随机定位。 */
+    return -29;
+}
+
+static int api_posix_fstat(int fd, void *st) {
+    (void)fd; (void)st;
+    return -38;
+}
+
+static uint64_t api_posix_time_ms(void) {
+    return net_now_ms();
+}
+
+/* 匿名映射：在 kmalloc 之上做页对齐包装，头部保存原始指针。
+ * 多分配 4096 + 8 字节，保证对齐后往前 8 字节仍在块内。 */
+static void *api_posix_map(uint64_t len) {
+    if (len == 0 || len > 0x7FFFFFFFu) return 0;
+    uint8_t *raw = (uint8_t *)kmalloc((uint32_t)(len + 4096u + 8u));
+    if (!raw) return 0;
+    uintptr_t aligned = ((uintptr_t)raw + 8u + 4095u) & ~(uintptr_t)4095u;
+    *(void **)(aligned - sizeof(void *)) = raw;
+    return (void *)aligned;
+}
+
+static void api_posix_unmap(void *ptr, uint64_t len) {
+    (void)len;
+    if (!ptr) return;
+    void *raw = *(void **)((uint8_t *)ptr - sizeof(void *));
+    kfree(raw);
+}
+
 static const struct SlysKernelApi g_api = {
-    1,
+    2,
     api_alloc,
     api_free,
     api_now_ms,
@@ -496,7 +594,16 @@ static const struct SlysKernelApi g_api = {
     api_win_width,
     api_win_height,
     api_win_invalidate,
-    api_win_close
+    api_win_close,
+    api_posix_write,
+    api_posix_read,
+    api_posix_open,
+    api_posix_close,
+    api_posix_lseek,
+    api_posix_fstat,
+    api_posix_time_ms,
+    api_posix_map,
+    api_posix_unmap
 };
 
 const struct SlysKernelApi *slys_kernel_api(void) {
@@ -757,9 +864,7 @@ static int link_load_file(const char *path, int depth, uint32_t *entry_out) {
         return 0;
     }
 
-    for (uint32_t i = 0; i < bss_size; i++) {
-        dst[image_size + i] = 0;
-    }
+    slz_zero(dst + image_size, bss_size);
 
     /* 注册导出。 */
     int slot = -1;

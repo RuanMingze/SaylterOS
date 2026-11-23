@@ -209,6 +209,39 @@ extern Compiler g_cc;
 void diag_error(int line, int col, const char *fmt, ...);
 void diag_warn(int line, int col, const char *fmt, ...);
 
+/* ---------- 结构化诊断（--json / serve 使用） ---------- */
+
+#define SLYZ_DIAG_MSG_MAX 512
+
+typedef struct {
+    int  line;
+    int  col;
+    int  severity;                  /* 0 = error, 1 = warning */
+    char message[SLYZ_DIAG_MSG_MAX];
+} SlyzDiag;
+
+void slyz_diag_reset(void);
+int  slyz_diag_count(void);
+const SlyzDiag *slyz_diag_at(int index);
+void slyz_diag_set_quiet(int quiet);   /* 1 = 只收集，不写 stderr */
+int  slyz_diag_quiet(void);
+void slyz_diag_emit(int severity, int line, int col, const char *fmt, ...);
+void slyz_diag_record(int severity, int line, int col, const char *message);
+
+/* 累计分配字节数：常驻进程用它判断何时该重启，避免 AST 泄漏无上限。 */
+extern unsigned long long g_alloc_bytes;
+
+/* 编译一段内存中的源码（不写文件）。返回 1 表示没有错误。 */
+int slyz_compile_source(const char *path, const uint8_t *source, uint32_t size);
+
+/* JSON 输出辅助：check --json 与 serve 共用同一套格式。 */
+void slyz_write_json_string(FILE *out, const char *s);
+void slyz_write_diagnostics_json(FILE *out);
+void slyz_write_stats_json(FILE *out);
+
+/* 常驻检查服务：JSON Lines 协议，读 stdin 写 stdout。 */
+int slyz_serve_main(void);
+
 /* ---------- 词法 ---------- */
 
 void  lex_init(const char *source, int len, const char *path);

@@ -117,6 +117,12 @@ static int acpi_rsdp_valid(uint32_t addr) {
 }
 
 uint32_t acpi_find_rsdp_phys(void) {
+    /* 0) UEFI 引导器直接提供的 RSDP 地址（BIOS 路径下该槽为 0）。
+     *    UEFI 固件把 ACPI 表放在任意内存，且低地址 ROM 区不可靠，
+     *    由引导器在退出固件前把地址写到 0x7DC0。 */
+    uint32_t hint = acpi_rd32(0x7DC0);
+    if (hint && acpi_rsdp_valid(hint)) return hint;
+
     /* 1) EBDA：BIOS 数据区 0x040E 存 EBDA 段地址，其前 1KB 内可能有 RSDP */
     uint32_t ebda = (uint32_t)acpi_rd16(0x040E) << 4;
     if (ebda >= 0x400 && ebda < 0xA0000) {

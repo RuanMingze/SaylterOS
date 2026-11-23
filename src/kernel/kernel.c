@@ -23,6 +23,9 @@ static void kernel_delay(uint32_t count) {
     while (count--) __asm__ volatile ("nop");
 }
 
+/* PC 蜂鸣器在不少主板上不存在（无蜂鸣器/无源），这里不再依赖声音；
+ * 进度改用帧缓冲左下角的彩色方块（debug_progress），屏幕可见即可。 */
+
 static void kernel_print_centered(const char *text, uint16_t row, uint8_t color) {
     uint16_t len = 0;
     while (text[len] != '\0') {
@@ -49,7 +52,7 @@ static void kernel_draw_logo(void) {
         " \\___ \\ / _` |/ _ \\ | | __/ _ \\  \\___ \\|  __||  __|  ",
         " ____) | (_| |  __/ | | || (_) | ____) | |___| |     ",
         "|_____/ \\__,_|\\___| |_|\\__\\___/ |_____/|_____|_|     ",
-        "  [ SAYLTER OPERATING SYSTEM ] v0.3 Beta1 - TTY Shell   ",
+        "  [ SAYLTER OPERATING SYSTEM ] v0.3 Beta2 - TTY Shell   ",
         NULL
     };
 
@@ -145,15 +148,16 @@ void kernel_main(void) {
     outb(0x3F8 + 3, 0x03);   /* DLAB off, 8N1 */
     outb(0x3F8 + 1, 0x00);   /* interrupts off */
 
-    /* --- 显示子系统 ---
-     * 统一走 VBE 图形终端：bootloader 已在实模式设好模式并把结果留在
-     * 0x7DF0。tty_init 依据 framebuffer 尺寸与 16x32 字体算出字符行列。
-     * VBE 不可用时 tty_init 自动回退到 80x25 文本模式。 */
+    /* 真机无蜂鸣器：进度改由帧缓冲左下角的色块表示。
+     * 第 0 块亮起 = 已进入 C 内核并且 vbe_init 完成。 */
     vbe_init();
+    debug_progress(0);
     /* GPU 探测必须在 tty 之前：LFB 要先标成写合并，否则后面
      * 每一次上屏都是逐行 uncached 写。失败不影响启动。 */
     gpu_init();
+    debug_progress(1);
     tty_init();
+    debug_progress(2);
 
     /* 调试模式：在正常内核启动之前运行早期控制台。
      * 此时 SlyzFS 尚未挂载；用户输入 next 后才继续下面的启动流程。 */
@@ -168,14 +172,22 @@ void kernel_main(void) {
     if (info_row >= tty_get_rows()) info_row = (uint16_t)(tty_get_rows() - 1);
     tty_set_cursor(0, info_row);
     tty_set_color(0x0F);
-    printk("[KERNEL] SaylterOS C Kernel v0.3 Beta1 booted!\n");
+    printk("[KERNEL] SaylterOS C Kernel v0.3 Beta2 booted!\n");
     printk("[KERNEL] Running in 64-bit long mode\n");
     printk("[KERNEL] Interrupts enabled (PIC remapped to 0x20)\n");
 
     /* --- 多核 ---
      * 解析 MADT -> 初始化 BSP LAPIC -> INIT-SIPI-SIPI 拉起所有 AP。
      * 单个 AP 的启动超时是 400ms，最坏情况下这里会短暂停顿。 */
-    int cpus = smp_init();
+    int cpus;
+    if (*(volatile uint32_t *)(uintptr_t)0x7DBC) {
+        /* UEFI 引导：AP trampoline 依赖 pm.asm 的实模式入口，UEFI 下
+         * 没有这套环境，强制单核以保证稳定。 */
+        printk("[KERNEL] UEFI boot: SMP disabled\n");
+        cpus = 1;
+    } else {
+        cpus = smp_init();
+    }
     if (cpus > 1) {
         printk("[KERNEL] SMP: %d CPUs online, local APIC at 0x%x\n",
                cpus, smp_lapic_base());

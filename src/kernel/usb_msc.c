@@ -158,6 +158,28 @@ static uint32_t g_write_sectors;
 static int      g_state;          /* 0 未试，1 可用，2 已失败 */
 static char     g_name[32];
 
+/* ---- 控制器共享状态 ---- */
+static int      g_ctrl_ready;     /* xHCI 已初始化（MSC 或键盘） */
+static uint32_t g_msc_port;       /* MSC 占用的根端口（0 = 无） */
+
+/* ---- USB HID 启动键盘（独立槽位） ---- */
+static uint8_t  g_kbd_ep0_mem[TRB_BYTES]  __attribute__((aligned(4096)));
+static uint8_t  g_kbd_in_mem[TRB_BYTES]   __attribute__((aligned(4096)));
+static uint8_t  g_kbd_dev_ctx[4096]       __attribute__((aligned(4096)));
+static uint8_t  g_kbd_report[64]          __attribute__((aligned(64)));
+static struct XhciRing g_kbd_ep0;
+static struct XhciRing g_kbd_in;
+static uint32_t g_kbd_slot;
+static uint32_t g_kbd_dci;
+static uint32_t g_kbd_mps;
+static uint32_t g_kbd_interval;
+static int      g_kbd_ready;
+static int      g_kbd_pending;
+static int      g_kbd_tried;
+static uint64_t g_kbd_last_try;
+static uint32_t g_kbd_port;       /* 键盘占用的根端口 */
+static uint32_t g_kbd_fail_mask;  /* 已确认不是键盘的端口 */
+
 /* ============================================================
  * 基础工具
  * ============================================================ */
@@ -401,8 +423,30 @@ static int event_wait(uint32_t want_type, uint32_t want_ep,
     }
 }
 
-static int wait_bits_clear(uint32_t addr, uint32_t mask, uint64_t timeout) {
-    uint64_t start = u_rdtsc();
+/* 非阻塞取出一个事件（供 USB 键盘轮询使用）。同时会推进 ERDP。 */
+static int event_poll_one(uint32_t *out_type, uint32_t *out_ep,
+                          uint32_t *out_dw2, uint32_t *out_dw3) {
+    struct XhciTrb *t = &((struct XhciTrb *)(void *)g_evt_mem)[g_evt_deq];
+
+    if ((t->dw3 & 1u) != (uint32_t)(g_evt_cycle & 1u)) return 0;
+
+    g_evt_deq++;
+    if (g_evt_deq >= TRB_COUNT) {
+        g_evt_deq = 0;
+        g_evt_cycle ^= 1u;
+    }
+    wr64(g_rt + RT_ERDP,
+         ((uint64_t)(uintptr_t)g_evt_mem) +
+         (uint64_t)g_evt_deq * 16ull + 8ull);
+
+    if (out_type) *out_type = (t->dw3 >> 10) & 0x3Fu;
+    if (out_ep)   *out_ep   = (t->dw3 >> 24) & 0xFFu;
+    if (out_dw2)  *out_dw2  = t->dw2;
+    if (out_dw3)  *out_dw3  = t->dw3;
+    return 1;
+}
+
+static int wait_bits_clear(uint32_t addr, uint32_t mask, uint64_t timeout) {    uint64_t start = u_rdtsc();
     while (rd32(addr) & mask) {
         if (u_rdtsc() - start > timeout) {
             return 0;
@@ -1023,7 +1067,9 @@ static int scsi_probe(void) {
 static int usb_enumerate(void) {
     uint32_t port = 0;
     for (uint32_t p = 1; p <= g_max_ports; p++) {
-        uint32_t v = rd32(g_op + OP_PORTS + (p - 1u) * 0x10u);
+        uint32_t v;
+        if (p == g_kbd_port) continue;      /* 已被 USB 键盘占用 */
+        v = rd32(g_op + OP_PORTS + (p - 1u) * 0x10u);
         if (v & 1u) {
             port = p;
             break;
@@ -1140,7 +1186,320 @@ static int usb_enumerate(void) {
         printk("[USB] write self-test passed\n");
     }
 
+    g_msc_port = port;
     return 1;
+}
+
+/* ============================================================
+ * USB HID 启动键盘（2.4G 无线键盘接收器 / 有线 USB 键盘）
+ * ------------------------------------------------------------
+ * 复用已初始化的 xHCI 控制器：独立槽位、独立 EP0 环、一条中断 IN
+ * 端点。只使用启动协议（8 字节报告：修饰键 + 保留 + 6 个键码），
+ * 不解析 HID 报告描述符。
+ * 边界：只处理直接挂在根端口上的设备，不做 Hub 级联。
+ * ============================================================ */
+
+static int kbd_control(uint8_t bm, uint8_t br, uint16_t wvalue,
+                       uint16_t windex, void *buf, uint16_t len, int in) {
+    uint32_t dw2 = 0, dw3 = 0;
+    uint32_t cc;
+
+    ring_push(&g_kbd_ep0,
+              (uint32_t)bm | ((uint32_t)br << 8) | ((uint32_t)wvalue << 16),
+              (uint32_t)windex | ((uint32_t)len << 16),
+              8u, TRB_TYPE(TRB_SETUP) | TRB_IDT);
+
+    if (len != 0) {
+        uint32_t addr = (uint32_t)(uintptr_t)buf;
+        ring_push(&g_kbd_ep0, addr,
+                  (uint32_t)(((uint64_t)(uintptr_t)buf) >> 32),
+                  (uint32_t)len,
+                  TRB_TYPE(TRB_DATA) | (in ? TRB_DIR_IN : 0u));
+    }
+
+    ring_push(&g_kbd_ep0, 0, 0, 0,
+              TRB_TYPE(TRB_STATUS) | ((len != 0 && in) ? 0u : TRB_DIR_IN) |
+              TRB_IOC);
+
+    flush_ring(&g_kbd_ep0);
+    if (len != 0) cache_flush_range(buf, len);
+
+    doorbell(g_kbd_slot, 1);
+
+    if (!event_wait(TRB_EVT_TRANSFER, 1u, &dw2, &dw3, USB_TIMEOUT_XFER)) {
+        return 0;
+    }
+    if (len != 0) cache_flush_range(buf, len);
+
+    cc = (dw2 >> 24) & 0xFFu;
+    return (cc == 1u || cc == 13u);
+}
+
+static int kbd_address_device(uint32_t slot, uint32_t port, uint32_t speed) {
+    uint32_t *ictx;
+    uint32_t *slotc;
+    uint32_t *ep0;
+    uint32_t mps;
+    uint32_t dw2 = 0, dw3 = 0;
+
+    u_memset(g_kbd_dev_ctx, 0, sizeof(g_kbd_dev_ctx));
+    ((uint64_t *)(void *)g_dcbaa)[slot] = (uint64_t)(uintptr_t)g_kbd_dev_ctx;
+
+    u_memset(g_in_ctx, 0, sizeof(g_in_ctx));
+    ictx = (uint32_t *)(void *)g_in_ctx;
+    ictx[1] = (1u << 0) | (1u << 1);
+
+    slotc = ictx + 8;
+    slotc[0] = (speed << 20) | (1u << 27);
+    slotc[1] = (port << 16);
+
+    mps = (speed == 4u) ? 512u : (speed == 3u ? 64u : 8u);
+    ep0 = ictx + 16;
+    ep0[1] = (mps << 16) | (3u << 1) | (4u << 3);
+    ep0[2] = ((uint32_t)(uintptr_t)g_kbd_ep0_mem) | 1u;
+    ep0[3] = (uint32_t)(((uint64_t)(uintptr_t)g_kbd_ep0_mem) >> 32);
+    ep0[4] = 8u << 16;
+
+    ring_init(&g_kbd_ep0, g_kbd_ep0_mem);
+
+    ring_push(&g_cmd,
+              (uint32_t)(uintptr_t)g_in_ctx,
+              (uint32_t)(((uint64_t)(uintptr_t)g_in_ctx) >> 32),
+              0,
+              TRB_TYPE(TRB_ADDRESS_DEV) | (slot << 24));
+    cache_flush_range(g_in_ctx, sizeof(g_in_ctx));
+    cache_flush_range(g_dcbaa, sizeof(g_dcbaa));
+    flush_ring(&g_cmd);
+    doorbell(0, 0);
+
+    if (!event_wait(TRB_EVT_CMD, 0xFFFFFFFFu, &dw2, &dw3, USB_TIMEOUT_INIT)) {
+        return 0;
+    }
+    return ((dw2 >> 24) & 0xFFu) == 1u;
+}
+
+/* 在配置描述符里找 HID 启动键盘接口及其中断 IN 端点 */
+static int kbd_parse_config(uint8_t *iface_out, uint32_t *dci,
+                            uint32_t *mps, uint32_t *interval) {
+    uint32_t total;
+    uint32_t i;
+    int in_kbd = 0;
+    uint8_t iface_no = 0;
+
+    if (!kbd_control(0x80, 6, (DESC_CONFIG << 8), 0, g_desc, 9, 1)) return 0;
+    total = (uint32_t)g_desc[2] | ((uint32_t)g_desc[3] << 8);
+    if (total < 9u || total > sizeof(g_desc)) return 0;
+    if (!kbd_control(0x80, 6, (DESC_CONFIG << 8), 0, g_desc,
+                     (uint16_t)total, 1)) return 0;
+
+    i = 0;
+    while (i + 2u <= total) {
+        uint32_t len = g_desc[i];
+        uint32_t type = g_desc[i + 1];
+
+        if (len < 2u || i + len > total) break;
+
+        if (type == DESC_INTERFACE && len >= 9u) {
+            uint8_t cls = g_desc[i + 5];
+            uint8_t sub = g_desc[i + 6];
+            uint8_t proto = g_desc[i + 7];
+
+            iface_no = g_desc[i + 2];
+            in_kbd = (cls == 3u && sub == 1u && (proto == 1u || proto == 0u));
+        } else if (type == DESC_ENDPOINT && len >= 7u && in_kbd) {
+            uint8_t addr = g_desc[i + 2];
+            uint8_t attr = g_desc[i + 3];
+            uint32_t ep_mps = (uint32_t)g_desc[i + 4] |
+                              ((uint32_t)g_desc[i + 5] << 8);
+            uint8_t ep_interval = g_desc[i + 6];
+
+            if ((addr & 0x80u) && (attr & 3u) == 3u) {
+                *iface_out = iface_no;
+                *dci = ((uint32_t)(addr & 0x0Fu) << 1) | 1u;
+                *mps = ep_mps & 0x7FFu;
+                if (*mps == 0) *mps = 8u;
+                *interval = ep_interval;
+                return 1;
+            }
+        }
+        i += len;
+    }
+    return 0;
+}
+
+static int kbd_configure(uint32_t slot, uint32_t port, uint32_t speed,
+                         uint32_t dci, uint32_t mps, uint32_t interval) {
+    uint32_t *ictx;
+    uint32_t *slotc;
+    uint32_t *ep;
+    uint32_t dw2 = 0, dw3 = 0;
+
+    u_memset(g_in_ctx, 0, sizeof(g_in_ctx));
+    ictx = (uint32_t *)(void *)g_in_ctx;
+    ictx[1] = (1u << 0) | (1u << dci);
+
+    slotc = ictx + 8;
+    slotc[0] = (speed << 20) | (dci << 27);
+    slotc[1] = (port << 16);
+
+    ep = ictx + (dci + 1u) * 8u;
+    ep[0] = ((interval ? interval : 8u) & 0xFFu) << 16;
+    ep[1] = (mps << 16) | (3u << 1) | (6u << 3);   /* 中断 IN */
+    ep[2] = ((uint32_t)(uintptr_t)g_kbd_in_mem) | 1u;
+    ep[3] = (uint32_t)(((uint64_t)(uintptr_t)g_kbd_in_mem) >> 32);
+    ep[4] = mps << 16;
+
+    ring_init(&g_kbd_in, g_kbd_in_mem);
+
+    ring_push(&g_cmd,
+              (uint32_t)(uintptr_t)g_in_ctx,
+              (uint32_t)(((uint64_t)(uintptr_t)g_in_ctx) >> 32),
+              0,
+              TRB_TYPE(TRB_CONFIGURE_EP) | (slot << 24));
+    cache_flush_range(g_in_ctx, sizeof(g_in_ctx));
+    flush_ring(&g_cmd);
+    doorbell(0, 0);
+
+    if (!event_wait(TRB_EVT_CMD, 0xFFFFFFFFu, &dw2, &dw3, USB_TIMEOUT_INIT)) {
+        return 0;
+    }
+    return ((dw2 >> 24) & 0xFFu) == 1u;
+}
+
+/* 预先挂一个 8 字节中断 IN 传输；收到报告后由轮询重新挂上 */
+static void kbd_arm(void) {
+    uint64_t a = (uint64_t)(uintptr_t)g_kbd_report;
+
+    u_memset(g_kbd_report, 0, 8);   /* 短包时避免残留上一帧按键 */
+    ring_push(&g_kbd_in, (uint32_t)a, (uint32_t)(a >> 32), 8u,
+              TRB_TYPE(TRB_NORMAL) | TRB_IOC);
+    flush_ring(&g_kbd_in);
+    cache_flush_range(g_kbd_report, 8);
+    doorbell(g_kbd_slot, g_kbd_dci);
+    g_kbd_pending = 1;
+}
+
+static int kbd_try_port(uint32_t port) {
+    uint32_t portsc;
+    uint32_t speed;
+    uint32_t slot = 0;
+    uint8_t iface = 0;
+    uint32_t dci = 0, mps = 8, interval = 8;
+
+    if (!port_reset(port)) return 0;
+
+    portsc = rd32(g_op + OP_PORTS + (port - 1u) * 0x10u);
+    speed = (portsc >> 10) & 0xFu;
+
+    if (!enable_slot(&slot)) return 0;
+    g_kbd_slot = slot;
+
+    if (!kbd_address_device(slot, port, speed)) return 0;
+
+    if (!kbd_control(0x80, 6, (DESC_DEVICE << 8), 0, g_desc, 18, 1)) {
+        return 0;
+    }
+    printk("[KBD] usb device %x:%x port=%u speed=%u\n",
+           (unsigned int)(g_desc[8] | ((uint32_t)g_desc[9] << 8)),
+           (unsigned int)(g_desc[10] | ((uint32_t)g_desc[11] << 8)),
+           port, speed);
+
+    if (!kbd_control(0x00, 9, 1, 0, 0, 0, 0)) return 0;
+
+    if (!kbd_parse_config(&iface, &dci, &mps, &interval)) {
+        printk("[KBD] port %u is not a boot keyboard\n", port);
+        return 0;
+    }
+
+    g_kbd_dci = dci;
+    g_kbd_mps = mps;
+    g_kbd_interval = interval;
+
+    if (!kbd_configure(slot, port, speed, dci, mps, interval)) return 0;
+
+    /* 切到启动协议；SET_IDLE(0) 让设备只在状态变化时上报 */
+    kbd_control(0x21, 0x0B, 0, iface, 0, 0, 0);
+    kbd_control(0x21, 0x0A, 0, iface, 0, 0, 0);
+
+    g_kbd_pending = 0;
+    kbd_arm();
+
+    g_kbd_port = port;
+    printk("[KBD] boot keyboard ready: port=%u dci=%u mps=%u\n",
+           port, dci, mps);
+    return 1;
+}
+
+int usb_kbd_init(void) {
+    uint32_t p;
+
+    if (g_kbd_ready) return 1;
+
+    if (!g_ctrl_ready) {
+        if (!find_xhci()) return 0;
+        if (!controller_init()) return 0;
+        g_ctrl_ready = 1;
+    }
+
+    if (g_kbd_tried &&
+        (u_rdtsc() - g_kbd_last_try) < 5000000000ull) {
+        return 0;
+    }
+    g_kbd_tried = 1;
+    g_kbd_last_try = u_rdtsc();
+
+    for (p = 1; p <= g_max_ports; p++) {
+        uint32_t v;
+
+        if (p == g_msc_port) continue;              /* 已被 U 盘占用 */
+        if (p < 32u && (g_kbd_fail_mask & (1u << p))) continue;  /* 非键盘口 */
+        v = rd32(g_op + OP_PORTS + (p - 1u) * 0x10u);
+        if (!(v & 1u)) continue;
+
+        if (kbd_try_port(p)) {
+            g_kbd_ready = 1;
+            return 1;
+        }
+        if (p < 32u) g_kbd_fail_mask |= (1u << p);
+    }
+    return 0;
+}
+
+int usb_kbd_poll_report(uint8_t *out8) {
+    int got = 0;
+    int i;
+    int k;
+
+    if (!g_kbd_ready) {
+        if (!usb_kbd_init()) return 0;
+    }
+
+    for (i = 0; i < 16; i++) {
+        uint32_t type = 0, ep = 0, dw2 = 0, dw3 = 0;
+        uint32_t epid, ep16, cc;
+
+        if (!event_poll_one(&type, &ep, &dw2, &dw3)) break;
+        if (type != TRB_EVT_TRANSFER) continue;
+
+        epid = (dw3 >> 24) & 0xFFu;
+        ep16 = (dw3 >> 16) & 0xFFu;
+        if (epid != g_kbd_dci && ep16 != g_kbd_dci) continue;
+
+        g_kbd_pending = 0;
+        cache_flush_range(g_kbd_report, 8);
+        cc = (dw2 >> 24) & 0xFFu;
+        if ((cc == 1u || cc == 13u) && out8 && !got) {
+            for (k = 0; k < 8; k++) out8[k] = g_kbd_report[k];
+            got = 1;
+        }
+    }
+
+    if (!g_kbd_pending) kbd_arm();
+    return got;
+}
+
+int usb_kbd_present(void) {
+    return g_kbd_ready;
 }
 
 int usb_msc_init(void) {
@@ -1152,13 +1511,16 @@ int usb_msc_init(void) {
     }
     g_state = 2;
 
-    if (!find_xhci()) {
-        printk("[USB] no xHCI controller\n");
-        return 0;
-    }
-    if (!controller_init()) {
-        printk("[USB] xHCI init failed\n");
-        return 0;
+    if (!g_ctrl_ready) {
+        if (!find_xhci()) {
+            printk("[USB] no xHCI controller\n");
+            return 0;
+        }
+        if (!controller_init()) {
+            printk("[USB] xHCI init failed\n");
+            return 0;
+        }
+        g_ctrl_ready = 1;
     }
     if (!usb_enumerate()) {
         printk("[USB] no usable mass-storage device\n");

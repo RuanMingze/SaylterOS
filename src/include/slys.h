@@ -26,6 +26,9 @@
 #define SLYS_MAGIC6 'V'
 #define SLYS_MAGIC7 0x00
 
+/* .slys 容器格式版本：只随 64 字节头布局变化而递增。
+ * 它与 struct SlysKernelApi 的 version 字段是两套独立版本号：
+ * 后者表示函数指针表的长度/语义，追加字段时才递增。 */
 #define SLYS_VERSION      1
 #define SLYS_HEADER_SIZE  64
 
@@ -110,6 +113,19 @@ struct SlysKernelApi {
     uint32_t (*win_height)(void);
     void (*win_invalidate)(void);   /* 请求窗口系统重绘本窗口 */
     void (*win_close)(void);        /* 请求关闭本窗口 */
+
+    /* ---- POSIX 段（版本 2 追加，供 musl libc 使用）----
+     * 返回值一律遵循 POSIX：>=0 成功，负数为 -errno。
+     * fd 的分配、标准流语义由模块侧的 port 层与这里共同维护。 */
+    int (*posix_write)(int fd, const void *buf, int len);
+    int (*posix_read)(int fd, void *buf, int len);
+    int (*posix_open)(const char *path, int flags);
+    int (*posix_close)(int fd);
+    int64_t (*posix_lseek)(int fd, int64_t offset, int whence);
+    int (*posix_fstat)(int fd, void *st);
+    uint64_t (*posix_time_ms)(void);
+    void *(*posix_map)(uint64_t len);
+    void (*posix_unmap)(void *ptr, uint64_t len);
 };
 
 /* ============================================================

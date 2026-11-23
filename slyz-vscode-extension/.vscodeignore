@@ -1,0 +1,10 @@
+# 发布包只需要运行期文件：入口脚本、语言配置、语法、片段与许可证。
+# 源码、TypeScript 配置和包管理器锁文件留在仓库里，不进 vsix。
+src/**
+tsconfig.json
+pnpm-lock.yaml
+pnpm-workspace.yaml
+node_modules/**
+**/*.map
+.vscode/**
+local-*.ps1

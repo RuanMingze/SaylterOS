@@ -1,63 +1,32 @@
 {
-  "$schema": "https://raw.githubusercontent.com/microsoft/vscode-tmgrammar-test/master/syntaxes/README.md",
   "name": "SLYZ",
   "scopeName": "source.slyz",
   "patterns": [
-    { "include": "#gui-marker" },
     { "include": "#comments" },
     { "include": "#strings" },
-    { "include": "#gui-directives" },
-    { "include": "#actions" },
-    { "include": "#placeholders" },
-    { "include": "#keywords" },
     { "include": "#numbers" },
-    { "include": "#commands" }
+    { "include": "#declarations" },
+    { "include": "#keywords" },
+    { "include": "#literals" },
+    { "include": "#modules" },
+    { "include": "#builtins" },
+    { "include": "#operators" },
+    { "include": "#functions" }
   ],
   "repository": {
-    "gui-marker": {
-      "patterns": [
-        {
-          "match": "^\\s*(#gui)\\b",
-          "name": "keyword.other.gui-marker.slyz",
-          "captures": {
-            "1": { "name": "entity.name.tag.slyz-gui" }
-          }
-        }
-      ]
-    },
-    "gui-directives": {
-      "patterns": [
-        {
-          "match": "^\\s*(title|size|label|input|button|space|hr)\\b",
-          "captures": {
-            "1": { "name": "keyword.other.gui.slyz" }
-          }
-        }
-      ]
-    },
-    "actions": {
-      "patterns": [
-        {
-          "match": "(->)\\s*(close|set:|open:|shell:)",
-          "captures": {
-            "1": { "name": "keyword.operator.arrow.slyz" },
-            "2": { "name": "support.function.action.slyz" }
-          }
-        }
-      ]
-    },
-    "placeholders": {
-      "patterns": [
-        {
-          "match": "\\{[A-Za-z_][A-Za-z0-9_]*\\}",
-          "name": "variable.other.placeholder.slyz"
-        }
-      ]
-    },
     "comments": {
       "patterns": [
         {
-          "match": "#.*$",
+          "begin": "/\\*",
+          "end": "\\*/",
+          "name": "comment.block.slyz"
+        },
+        {
+          "match": "//.*$",
+          "name": "comment.line.double-slash.slyz"
+        },
+        {
+          "match": "^\\s*#.*$",
           "name": "comment.line.number-sign.slyz"
         }
       ]
@@ -65,36 +34,111 @@
     "strings": {
       "patterns": [
         {
-          "match": "\"(?:\\\\.|[^\\\"])*\"",
-          "name": "string.quoted.double.slyz"
-        },
-        {
-          "match": "'(?:\\\\.|[^\\'])*'",
-          "name": "string.quoted.single.slyz"
-        }
-      ]
-    },
-    "keywords": {
-      "patterns": [
-        {
-          "match": "\\b(if|else|endif|yes|no|echo|ask|run|dir|ls|exit|quit|write|read|remove|help|clear|version|uname|whoami|date|mem|reboot|gui|ps)\\b",
-          "name": "keyword.control.slyz"
+          "begin": "\"",
+          "end": "\"",
+          "name": "string.quoted.double.slyz",
+          "patterns": [
+            {
+              "match": "\\\\[nrt\\\\\"0]",
+              "name": "constant.character.escape.slyz"
+            },
+            {
+              "match": "\\\\x[0-9A-Fa-f]{2}",
+              "name": "constant.character.escape.hex.slyz"
+            },
+            {
+              "match": "\\\\u\\{[0-9A-Fa-f]+\\}",
+              "name": "constant.character.escape.unicode.slyz"
+            }
+          ]
         }
       ]
     },
     "numbers": {
       "patterns": [
         {
-          "match": "\\b\\d+\\b",
-          "name": "constant.numeric.slyz"
+          "match": "\\b0x[0-9A-Fa-f_]+\\b",
+          "name": "constant.numeric.hex.slyz"
+        },
+        {
+          "match": "\\b0b[01_]+\\b",
+          "name": "constant.numeric.binary.slyz"
+        },
+        {
+          "match": "\\b\\d[\\d_]*\\b",
+          "name": "constant.numeric.decimal.slyz"
         }
       ]
     },
-    "commands": {
+    "declarations": {
       "patterns": [
         {
-          "match": "^\\s*[A-Za-z_][A-Za-z0-9_]*",
-          "name": "entity.name.function.slyz"
+          "match": "\\b(let|fn)\\b",
+          "name": "storage.type.slyz"
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "match": "\\b(if|else|while|for|in|break|continue|return)\\b",
+          "name": "keyword.control.slyz"
+        }
+      ]
+    },
+    "literals": {
+      "patterns": [
+        {
+          "match": "\\b(true|false|nil)\\b",
+          "name": "constant.language.slyz"
+        },
+        {
+          "match": "\\b(and|or|not)\\b",
+          "name": "keyword.operator.word.slyz"
+        }
+      ]
+    },
+    "modules": {
+      "patterns": [
+        {
+          "match": "\\b(fs|cfg|time|os|win|gfx|event)\\b(?=\\s*\\.)",
+          "name": "support.class.module.slyz"
+        }
+      ]
+    },
+    "builtins": {
+      "patterns": [
+        {
+          "match": "\\b(print|println|eprint|len|str|int|substr|index_of|upper|lower|trim|replace|split|join|abs|min|max|clamp|sign|random|array|push|pop|range|typeof|str_at|ord|chr|hex|bin)\\b(?=\\s*\\()",
+          "name": "support.function.builtin.slyz"
+        },
+        {
+          "match": "\\b(read|write|exists|list|remove|mkdir|get|set|keys|now|ms|text|date|sleep|exec|exit|beep|open|clear|rect|frame|line|circle|flush|poll|wait)\\b(?=\\s*\\()",
+          "name": "support.function.method.slyz"
+        }
+      ]
+    },
+    "operators": {
+      "patterns": [
+        {
+          "match": "(==|!=|<=|>=|&&|\\|\\||\\+=|-=|\\*=|/=|%=|\\+\\+|--|\\.\\.)",
+          "name": "keyword.operator.slyz"
+        },
+        {
+          "match": "(\\+|-|\\*|/|%|=|<|>|!|\\[|\\])",
+          "name": "keyword.operator.slyz"
+        }
+      ]
+    },
+    "functions": {
+      "patterns": [
+        {
+          "match": "\\b([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()",
+          "name": "entity.name.function.call.slyz"
+        },
+        {
+          "match": "\\b([A-Za-z_][A-Za-z0-9_]*)\\b",
+          "name": "variable.other.slyz"
         }
       ]
     }

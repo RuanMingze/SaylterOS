@@ -10,6 +10,8 @@
 
 #include <stdint.h>
 #include "io.h"
+#include "usb_msc.h"
+#include "net.h"
 
 #define KB_HEAD      (*(volatile uint16_t *)0xA000)
 #define KB_TAIL      (*(volatile uint16_t *)0xA002)
@@ -96,8 +98,244 @@ void kb_flush(void) {
     }
 }
 
-static int is_alpha_code(uint8_t code) {
-    return (code >= 0x10 && code <= 0x19) ||
+/* ============================================================
+ * USB HID 启动键盘 → PS/2 Set 1 扫描码注入
+ * ------------------------------------------------------------
+ * 2.4G 无线键盘的 USB 接收器按 HID 启动协议上报 8 字节报告。
+ * 这里把 HID 键码翻译成 PS/2 Set 1 扫描码写进同一个环形缓冲，
+ * 上层的 kb_read_char / 编辑器 / shell 不需要任何改动。
+ * ============================================================ */
+
+static void kb_ring_push(uint8_t sc) {
+    uint64_t flags;
+    uint16_t head;
+    uint16_t tail;
+    uint16_t next;
+
+    __asm__ volatile ("pushfq; popq %0" : "=r"(flags));
+    __asm__ volatile ("cli");
+
+    head = KB_HEAD;
+    tail = KB_TAIL;
+    next = (uint16_t)((head + 1) & KB_BUF_MASK);
+    if (next != tail) {
+        *(volatile uint8_t *)(uintptr_t)(KB_BUF_BASE + (head & KB_BUF_MASK)) = sc;
+        KB_HEAD = next;
+    }
+
+    if (flags & 0x200u) {
+        __asm__ volatile ("sti");
+    }
+}
+
+/* HID Usage ID（Keyboard page 0x07）→ PS/2 Set 1 键码。
+ * 返回 0 表示忽略；*ext = 1 表示需要先发 0xE0 前缀。 */
+static uint8_t hid_usage_to_sc(uint8_t usage, uint8_t *ext) {
+    static const uint8_t letters[26] = {
+        0x1E, 0x30, 0x2E, 0x20, 0x12, 0x21, 0x22, 0x23, 0x17,
+        0x24, 0x25, 0x26, 0x32, 0x31, 0x18, 0x19, 0x10, 0x13,
+        0x1F, 0x14, 0x16, 0x2F, 0x11, 0x2D, 0x15, 0x2C
+    };
+    static const uint8_t digits[10] = {
+        0x0B, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A
+    };
+    static const uint8_t funcs[12] = {
+        0x3B, 0x3C, 0x3D, 0x3E, 0x3F, 0x40,
+        0x41, 0x42, 0x43, 0x44, 0x57, 0x58
+    };
+
+    *ext = 0;
+
+    if (usage >= 0x04 && usage <= 0x1D) return letters[usage - 0x04];
+    if (usage >= 0x1E && usage <= 0x27) return digits[usage - 0x1E];
+    if (usage >= 0x3A && usage <= 0x45) return funcs[usage - 0x3A];
+
+    switch (usage) {
+    case 0x28: return 0x1C;             /* Enter */
+    case 0x29: return 0x01;             /* Esc */
+    case 0x2A: return 0x0E;             /* Backspace */
+    case 0x2B: return 0x0F;             /* Tab */
+    case 0x2C: return 0x39;             /* Space */
+    case 0x2D: return 0x0C;             /* - */
+    case 0x2E: return 0x0D;             /* = */
+    case 0x2F: return 0x1A;             /* [ */
+    case 0x30: return 0x1B;             /* ] */
+    case 0x31: return 0x2B;             /* \ */
+    case 0x32: return 0x2B;             /* 非美式 \| */
+    case 0x33: return 0x27;             /* ; */
+    case 0x34: return 0x28;             /* ' */
+    case 0x35: return 0x29;             /* ` */
+    case 0x36: return 0x33;             /* , */
+    case 0x37: return 0x34;             /* . */
+    case 0x38: return 0x35;             /* / */
+    case 0x39: return 0x3A;             /* Caps Lock */
+    case 0x46: *ext = 1; return 0x37;   /* Print Screen */
+    case 0x49: *ext = 1; return 0x52;   /* Insert */
+    case 0x4A: *ext = 1; return 0x47;   /* Home */
+    case 0x4B: *ext = 1; return 0x49;   /* Page Up */
+    case 0x4C: *ext = 1; return 0x53;   /* Delete */
+    case 0x4D: *ext = 1; return 0x4F;   /* End */
+    case 0x4E: *ext = 1; return 0x51;   /* Page Down */
+    case 0x4F: *ext = 1; return 0x4D;   /* Right */
+    case 0x50: *ext = 1; return 0x4B;   /* Left */
+    case 0x51: *ext = 1; return 0x50;   /* Down */
+    case 0x52: *ext = 1; return 0x48;   /* Up */
+    case 0x53: return 0x45;             /* Num Lock */
+    case 0x54: *ext = 1; return 0x35;   /* Keypad / */
+    case 0x55: return 0x37;             /* Keypad * */
+    case 0x56: return 0x4A;             /* Keypad - */
+    case 0x57: return 0x4E;             /* Keypad + */
+    case 0x58: *ext = 1; return 0x1C;   /* Keypad Enter */
+    case 0x59: return 0x4F;             /* Keypad 1 */
+    case 0x5A: return 0x50;             /* Keypad 2 */
+    case 0x5B: return 0x51;             /* Keypad 3 */
+    case 0x5C: return 0x4B;             /* Keypad 4 */
+    case 0x5D: return 0x4C;             /* Keypad 5 */
+    case 0x5E: return 0x4D;             /* Keypad 6 */
+    case 0x5F: return 0x47;             /* Keypad 7 */
+    case 0x60: return 0x48;             /* Keypad 8 */
+    case 0x61: return 0x49;             /* Keypad 9 */
+    case 0x62: return 0x52;             /* Keypad 0 */
+    case 0x63: return 0x53;             /* Keypad . */
+    case 0x64: return 0x56;             /* 非美式 <> */
+    default: return 0;
+    }
+}
+
+static void usb_emit_key(uint8_t usage, int down) {
+    uint8_t ext = 0;
+    uint8_t sc = hid_usage_to_sc(usage, &ext);
+
+    if (!sc) return;
+    if (ext) kb_ring_push(0xE0);
+    kb_ring_push(down ? sc : (uint8_t)(sc | 0x80u));
+}
+
+static uint8_t usb_prev[8];
+static uint8_t usb_shift;
+static uint8_t usb_ctrl;
+static uint8_t usb_alt;
+static uint32_t usb_last_ms;
+static uint32_t usb_repeat_ms;
+static uint8_t usb_repeat_usage;
+static uint8_t usb_repeat_on;
+
+static void usb_emit_mods(uint8_t mods) {
+    uint8_t shift = (mods & 0x22u) ? 1u : 0u;
+    uint8_t ctrl = (mods & 0x11u) ? 1u : 0u;
+    uint8_t alt = (mods & 0x44u) ? 1u : 0u;
+
+    if (shift != usb_shift) {
+        kb_ring_push(shift ? 0x2A : 0xAA);
+        usb_shift = shift;
+    }
+    if (ctrl != usb_ctrl) {
+        kb_ring_push(ctrl ? 0x1D : 0x9D);
+        usb_ctrl = ctrl;
+    }
+    if (alt != usb_alt) {
+        kb_ring_push(alt ? 0x38 : 0xB8);
+        usb_alt = alt;
+    }
+}
+
+static void usb_process_report(const uint8_t *rep) {
+    uint8_t keys[6];
+    int nk = 0;
+    int i, j;
+    int changed = 0;
+    uint32_t now;
+
+    for (i = 0; i < 6; i++) {
+        if (rep[2 + i]) keys[nk++] = rep[2 + i];
+    }
+
+    usb_emit_mods(rep[0]);
+
+    /* 先释放旧键，再按下新键 */
+    for (i = 0; i < 6; i++) {
+        uint8_t k = usb_prev[2 + i];
+        int found = 0;
+
+        if (!k) continue;
+        for (j = 0; j < nk; j++) {
+            if (keys[j] == k) { found = 1; break; }
+        }
+        if (!found) {
+            usb_emit_key(k, 0);
+            changed = 1;
+        }
+    }
+
+    for (j = 0; j < nk; j++) {
+        uint8_t k = keys[j];
+        int found = 0;
+
+        for (i = 0; i < 6; i++) {
+            if (usb_prev[2 + i] == k) { found = 1; break; }
+        }
+        if (!found) {
+            usb_emit_key(k, 1);
+            changed = 1;
+            if (k != 0x39 && k != 0x53) {   /* Caps/Num Lock 不做重复 */
+                usb_repeat_usage = k;
+                usb_repeat_on = 1;
+            }
+        }
+    }
+
+    for (i = 0; i < 8; i++) usb_prev[i] = rep[i];
+
+    /* 重复键必须仍在按下的键里；否则换一个仍按住的键 */
+    {
+        int still = 0;
+        for (j = 0; j < nk; j++) {
+            if (keys[j] == usb_repeat_usage) still = 1;
+        }
+        if (!still) {
+            usb_repeat_usage = 0;
+            for (j = nk - 1; j >= 0; j--) {
+                if (keys[j] != 0x39 && keys[j] != 0x53) {
+                    usb_repeat_usage = keys[j];
+                    break;
+                }
+            }
+            usb_repeat_on = (usb_repeat_usage != 0);
+        }
+    }
+
+    if (changed || nk == 0) {
+        now = net_now_ms();
+        usb_last_ms = now;
+        usb_repeat_ms = now;
+        if (nk == 0) usb_repeat_on = 0;
+    }
+}
+
+/* 软件重复：启动协议只在状态变化时上报，按住键需要自己补发 */
+static void usb_repeat_tick(void) {
+    uint32_t now;
+
+    if (!usb_repeat_on || !usb_repeat_usage) return;
+    now = net_now_ms();
+    if ((uint32_t)(now - usb_last_ms) < 500u) return;
+    if ((uint32_t)(now - usb_repeat_ms) < 40u) return;
+    usb_repeat_ms = now;
+    usb_emit_key(usb_repeat_usage, 1);
+}
+
+/* 把 USB 键盘的待处理报告搬进环形缓冲 */
+static void kb_usb_pump(void) {
+    uint8_t rep[8];
+    int n = 0;
+
+    while (n++ < 4 && usb_kbd_poll_report(rep)) {
+        usb_process_report(rep);
+    }
+    usb_repeat_tick();
+}
+
+static int is_alpha_code(uint8_t code) {    return (code >= 0x10 && code <= 0x19) ||
            (code >= 0x1E && code <= 0x26) ||
            (code >= 0x2C && code <= 0x32);
 }
@@ -171,7 +409,13 @@ static const char shift_map[128] = {
 
 char kb_read_char(void) {
     uint16_t tail = KB_TAIL;
-    if (tail == KB_HEAD) return 0;
+
+    if (tail == KB_HEAD) {
+        /* 环形缓冲为空时顺带轮询 USB 键盘，把 HID 报告转成扫描码 */
+        kb_usb_pump();
+        tail = KB_TAIL;
+        if (tail == KB_HEAD) return 0;
+    }
 
     uint8_t sc = *(volatile uint8_t *)(uintptr_t)(KB_BUF_BASE + (tail & KB_BUF_MASK));
     KB_TAIL = (uint16_t)((tail + 1) & KB_BUF_MASK);
@@ -198,6 +442,7 @@ char kb_read_char(void) {
             case 0x4F: return (char)0xF4; /* end */
             case 0x49: return (char)0xF8; /* page up */
             case 0x51: return (char)0xF9; /* page down */
+            case 0x37: return (char)0xFB; /* Print Screen (E0 37) */
             default:   return 0;
         }
     }
@@ -307,6 +552,7 @@ char scancode_to_char(uint8_t sc) {
             case 0x4F: return (char)0xF4;
             case 0x49: return (char)0xF8;
             case 0x51: return (char)0xF9;
+            case 0x37: return (char)0xFB; /* Print Screen */
             default:   return 0;
         }
     }
