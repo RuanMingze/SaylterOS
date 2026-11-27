@@ -30,7 +30,7 @@ SaylterOS v0.3 Beta2 已推出！此版本带来了 SlyzFS v2、NVMe 支持，�
 | ACPI S5 关机 + 电源键识别 | 可用 |
 | 8042 硬件重启 | 可用 |
 | 动态提示符 + TTY 底部安全区 | 可用 |
-| SLYZ 二进制字节码（SLYZBIN v1） | 可用，同时兼容旧文本脚本 |
+| Slyz v3 可执行应用及编程语言 | 可用，系统同时兼容 Slyz v2 程序 |
 | E1000 有线网络（ARP/IPv4/ICMP/UDP/DNS/TCP/HTTP） | 可用 |
 
 ---
