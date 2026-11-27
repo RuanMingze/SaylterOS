@@ -3,7 +3,9 @@
 SaylterOS 是一个运行在 x86_64（64 位长模式）上的裸金属操作系统：没有宿主系统、没有标准库、没有现成文件系统，从 MBR 开始全部自己实现。引导链由汇编完成，先进入 32 位保护模式完成内核搬运与页表建立，再切入 64 位长模式交给 C/C++ 内核，提供完整图形桌面、SMP 多核、4KB 分页与 swap、自研 SlyzFS 文件系统、E1000 网络栈以及 ACPI S5 关机与电源键支持。
 
 SaylterOS v0.3 Beta2 已推出！此版本带来了 SlyzFS v2、NVMe 支持，播放音乐支持等多项功能，建议升级。我们预计会在下一个版本推出 SaylterOS v0.3 RC 版本更新。
-当前版本：**v0.3 Beta2**（代码内版本号 `v0.3 Beta2`）。
+
+当前版本：**v0.3 Beta2**。
+
 ⚠️警告：此版本未进行实机验证，并且 SlyzFS 的代码里存在危险行为，会在挂载失败时自动格式化目标分区。谨慎实机运行！我不为冒着风险尝试实体机运行导致丢数据承担责任。
 
 ---
@@ -60,9 +62,8 @@ powershell -NoProfile -File build.ps1
 
 | 文件 | 说明 |
 |---|---|
-| `build/saylter.img` | VBE 版软盘镜像 |
-| `build/saylter-tty.img` | TTY 版软盘镜像 |
-| `build/saylter-ide.img` | 32 MB IDE 硬盘镜像，SlyzFS 位于 LBA 8192 |
+| `build/saylter-ide.img` | IDE 版完整镜像（磁盘启动） |
+| `build/saylter-installer.img` | IDE 版完整镜像（磁盘启动） |
 
 每次构建都会**重新创建** `saylter-ide.img`，其中已写入的用户、文件会丢失。
 
@@ -142,6 +143,8 @@ root 的 hash 为空表示无密码。普通用户读取 `\etc\shadow` 会被文
 | `gui` | 进入 VBE Logo 界面（仅 VBE 版） |
 | `exit` / `quit` | 退出 Shell |
 
+更多命令请在系统里输入 "help"。
+
 编辑器快捷键：方向键、Home/End、PageUp/PageDown 移动，Backspace/Delete 删除，Tab 插入 4 空格。
 
 `app` 加载的 `.slys` 既可以是驱动，也可以是 musl 静态链接的用户程序
@@ -208,6 +211,8 @@ SaylterOS/
 ---
 
 ## 架构说明
+
+> 由于人力不足，此项的所有内容已停止维护且过时。请自行查看代码。
 
 ### 引导链与镜像布局
 
@@ -370,6 +375,7 @@ Shell 提示符始终绘制在屏幕底部的保留区，命令输出只滚动�
 
 | 版本 | 主要内容 |
 |---|---|
+| v0.3 Beta2 | GUI 优化、SlyzFS 文件系统 V2、Slyz 二进制可执行及 Slyzcode 编程语言 V3、丰富系统软件和 UI 交互 |
 | v0.3 Beta1 | 完整 GUI（窗口管理、任务管理器、计算器、鼠标滚轮与终端滚动条、桌面右键）、SMP 多核并行工作池、4KB 分页与 swap 文件、E1000 网络栈、ACPI 电源管理、致命缺页接入蓝屏 |
 | v0.0.3-Alpha3 | SlyzFS 接入 Shell、用户账户与权限、nano 编辑器、ACPI S5 与电源键、动态提示符与安全区 |
 | v0.0.3-Alpha2 | VBE 图形界面、字体渲染、鼠标支持 |
@@ -379,4 +385,12 @@ Shell 提示符始终绘制在屏幕底部的保留区，命令输出只滚动�
 
 ## 许可
 
-字模数据与生成脚本的授权说明见 [fonts/LICENSE](fonts/LICENSE)。
+此项目为混合许可证，具体内容见下表。
+
+| 项目名称 | 许可证 |
+|---|---|
+| SaylterOS 本体 | GPL-3.0-Only |
+| ACPICA | BSD-3-Clause OR GPL-2.0-only |
+| musl libc | MIT |
+| 字模数据 | Bitstream Vera / DejaVu |
+| Slyz VS Code 扩展 | GPL-3.0-Only |
